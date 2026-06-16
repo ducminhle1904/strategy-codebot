@@ -1,0 +1,28 @@
+{
+  "target_platform": "pine_v6",
+  "script_type": "strategy",
+  "market": "crypto",
+  "symbol": "BTCUSDT",
+  "timeframe": "1h",
+  "entry_rules": [
+    "Enter long when the 9-period SMA crosses above the 21-period SMA after bar close"
+  ],
+  "exit_rules": [
+    "Exit when the 9-period SMA crosses below the 21-period SMA after bar close"
+  ],
+  "risk_rules": [
+    "Use fixed fractional risk and always attach a stop-loss and take-profit"
+  ],
+  "position_sizing": "Risk 1% of equity per trade",
+  "stop_loss": "2% below average entry price",
+  "take_profit": "4% above average entry price",
+  "assumptions": [
+    "Commission and slippage are modeled in the strategy declaration",
+    "Signals are confirmed only after bar close"
+  ],
+  "constraints": [
+    "No live trading automation",
+    "No profitability claims"
+  ],
+  "user_notes": "Phase 1 dry-run fixture"
+}

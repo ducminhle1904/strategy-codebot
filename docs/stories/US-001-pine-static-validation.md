@@ -16,7 +16,12 @@ Implement a first-pass Pine Script v6 static validator.
 - Flags missing strategy risk assumptions.
 - Produces `validation-report.schema.json`.
 
+## Verify Command
+
+```bash
+uv run pytest tests/test_pine.py tests/test_cli.py
+```
+
 ## Phase
 
 Phase 1
-

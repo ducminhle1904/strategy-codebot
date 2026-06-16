@@ -1,0 +1,26 @@
+{
+  "target_platform": "both",
+  "script_type": "strategy",
+  "market": "forex",
+  "symbol": "EURUSD",
+  "timeframe": "H1",
+  "entry_rules": [
+    "Enter long when the fast moving average crosses above the slow moving average"
+  ],
+  "exit_rules": [
+    "Exit long when the fast moving average crosses below the slow moving average"
+  ],
+  "risk_rules": [
+    "Use a fixed stop-loss and take-profit before any live trading consideration"
+  ],
+  "position_sizing": "Risk 1% of equity per trade",
+  "stop_loss": "2% below average entry price",
+  "take_profit": "4% above average entry price",
+  "assumptions": [
+    "MQL5 compile and Strategy Tester execution are future runner work"
+  ],
+  "constraints": [
+    "No broker integration in Phase 1"
+  ],
+  "user_notes": "Combined Pine and MQL5 Phase 1 fixture"
+}

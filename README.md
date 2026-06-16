@@ -24,6 +24,20 @@ Phase 0 creates the design contracts for future implementation:
 - Model and source registry examples.
 - Initial durable decisions and Phase 1 stories.
 
+## Phase 1 CLI MVP
+
+Install and run with `uv`:
+
+```bash
+uv run strategy-codebot run --spec examples/specs/ma-crossover-pine.json --mode dry-run --out runs/example --no-record-harness
+uv run strategy-codebot validate-pine --file runs/example/pine/strategy.pine --spec examples/specs/ma-crossover-pine.json --out reports/pine-report.json
+uv run strategy-codebot knowledge check --offline --out reports/source-check.json
+```
+
+Dry-run mode does not require API keys. Live mode uses LiteLLM-compatible provider configuration from `configs/model-registry.example.yaml` and reads provider credentials from the environment.
+
+When `scripts/bin/harness-cli` exists, `strategy-codebot run` records a local repository-harness trace by default. Use `--no-record-harness` for tests and disposable local runs.
+
 ## Non-Goals
 
 - No live trading.
@@ -31,4 +45,3 @@ Phase 0 creates the design contracts for future implementation:
 - No profitability claims.
 - No generated strategy execution.
 - No Pine or MQL5 runtime validation yet.
-

@@ -15,7 +15,12 @@ Implement a source-registry-driven ingestion pipeline for official Pine, MQL5, M
 - Supports official and internal sources.
 - Produces update proposals instead of silently changing canonical docs.
 
+## Verify Command
+
+```bash
+uv run pytest tests/test_knowledge.py
+```
+
 ## Phase
 
 Phase 1
-

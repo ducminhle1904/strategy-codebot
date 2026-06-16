@@ -14,6 +14,12 @@ __pycache__/
 .ruff_cache/
 node_modules/
 
+# Python MVP
+.venv/
+runs/
+reports/
+*.pyc
+
 # Harness durable layer
 harness.db
 harness.db-wal

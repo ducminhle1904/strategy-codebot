@@ -15,7 +15,12 @@ Design the Windows runner interface for compiling MQL5 and running MetaTrader 5 
 - Defines normalized report fields.
 - Documents missing environment behavior.
 
+## Verify Command
+
+```bash
+uv run pytest tests/test_runner.py
+```
+
 ## Phase
 
 Phase 1
-
