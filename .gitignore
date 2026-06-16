@@ -13,3 +13,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 node_modules/
+
+# Harness durable layer
+harness.db
+harness.db-wal
+harness.db-shm
+scripts/bin/harness-cli
+scripts/bin/harness-cli.exe

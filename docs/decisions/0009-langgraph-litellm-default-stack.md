@@ -1,4 +1,4 @@
-# 0002 - LangGraph And LiteLLM Default Stack
+# 0009 - LangGraph And LiteLLM Default Stack
 
 ## Status
 
@@ -17,4 +17,3 @@ Use Python LangGraph as the default orchestration runtime and LiteLLM-compatible
 - Agent roles are designed as graph nodes or bounded callable workers.
 - Model choices stay outside business logic.
 - Future implementation can route OpenAI, Anthropic, Google, local, or other providers through one registry.
-

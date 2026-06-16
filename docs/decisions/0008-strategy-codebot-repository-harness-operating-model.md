@@ -1,4 +1,4 @@
-# 0001 - Repository Harness Operating Model
+# 0008 - Strategy Codebot Repository Harness Operating Model
 
 ## Status
 
@@ -17,4 +17,3 @@ Use the `repository-harness` operating model as the repo-level scaffold.
 - `AGENTS.md` remains a short map.
 - Detailed knowledge lives under `docs/`.
 - Stories, decisions, traces, and validation proof are first-class artifacts.
-
