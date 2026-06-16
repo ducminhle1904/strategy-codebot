@@ -1,0 +1,62 @@
+gateway: litellm
+defaults:
+  temperature: 0.2
+  max_retries: 2
+  require_structured_output: true
+
+agents:
+  orchestrator:
+    primary: openai/gpt-5.1
+    fallbacks:
+      - anthropic/claude-sonnet
+    capabilities:
+      - reasoning
+      - structured_output
+  intake:
+    primary: openai/gpt-5.1-mini
+    capabilities:
+      - structured_output
+  trading_analyst:
+    primary: openai/gpt-5.1
+    capabilities:
+      - reasoning
+  pine_specialist:
+    primary: anthropic/claude-sonnet
+    fallbacks:
+      - openai/gpt-5.1
+    capabilities:
+      - code
+      - pine_v6
+  mql5_specialist:
+    primary: anthropic/claude-sonnet
+    fallbacks:
+      - openai/gpt-5.1
+    capabilities:
+      - code
+      - mql5
+  risk_reviewer:
+    primary: openai/gpt-5.1
+    capabilities:
+      - reasoning
+      - policy
+  validator:
+    primary: openai/gpt-5.1-mini
+    capabilities:
+      - tool_use
+      - structured_output
+  critic:
+    primary: google/gemini-pro
+    policy: different_provider_than_generator
+    capabilities:
+      - critique
+      - reasoning
+  knowledge_curator:
+    primary: openai/gpt-5.1-mini
+    capabilities:
+      - retrieval
+      - summarization
+  harness_auditor:
+    primary: openai/gpt-5.1-mini
+    capabilities:
+      - structured_output
+      - audit

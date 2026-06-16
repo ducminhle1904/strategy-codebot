@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.serena/
+harness.db
+*.sqlite
+*.sqlite3
+dist/
+build/
+target/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+node_modules/

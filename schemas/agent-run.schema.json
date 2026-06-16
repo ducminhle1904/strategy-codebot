@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/agent-run.schema.json",
+  "title": "AgentRun",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "created_at",
+    "agent_role",
+    "provider",
+    "model",
+    "input_refs",
+    "output_refs",
+    "status"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "agent_role": {
+      "type": "string",
+      "enum": [
+        "intake",
+        "trading_analyst",
+        "pine_specialist",
+        "mql5_specialist",
+        "risk_reviewer",
+        "validator",
+        "critic",
+        "knowledge_curator",
+        "harness_auditor"
+      ]
+    },
+    "provider": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "prompt_version": { "type": "string" },
+    "input_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "retrieved_sources": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "tool_calls": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "output_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "validation_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "fail", "manual_required", "skipped"]
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    }
+  }
+}

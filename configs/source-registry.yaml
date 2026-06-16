@@ -1,0 +1,55 @@
+sources:
+  - id: tradingview-pine-welcome
+    platform: pine_v6
+    type: official
+    trust_level: high
+    url: https://www.tradingview.com/pine-script-docs/welcome/
+    freshness_ttl_days: 30
+  - id: tradingview-pine-reference-v6
+    platform: pine_v6
+    type: official
+    trust_level: high
+    url: https://www.tradingview.com/pine-script-reference/v6/
+    freshness_ttl_days: 30
+  - id: tradingview-pine-strategies
+    platform: pine_v6
+    type: official
+    trust_level: high
+    url: https://www.tradingview.com/pine-script-docs/concepts/strategies/
+    freshness_ttl_days: 30
+  - id: tradingview-pine-limitations
+    platform: pine_v6
+    type: official
+    trust_level: high
+    url: https://www.tradingview.com/pine-script-docs/writing/limitations/
+    freshness_ttl_days: 30
+  - id: mql5-reference
+    platform: mql5
+    type: official
+    trust_level: high
+    url: https://www.mql5.com/en/docs
+    freshness_ttl_days: 30
+  - id: metaeditor-compilation
+    platform: mql5
+    type: official
+    trust_level: high
+    url: https://www.metatrader5.com/en/metaeditor/help/development/compile
+    freshness_ttl_days: 30
+  - id: mt5-strategy-tester
+    platform: mql5
+    type: official
+    trust_level: high
+    url: https://www.metatrader5.com/en/terminal/help/algotrading/testing
+    freshness_ttl_days: 30
+  - id: internal-risk-policy
+    platform: general
+    type: internal
+    trust_level: high
+    path: docs/trading/risk-policy.md
+    freshness_ttl_days: 90
+  - id: internal-anti-overfit-checklist
+    platform: general
+    type: internal
+    trust_level: high
+    path: docs/trading/anti-overfit-checklist.md
+    freshness_ttl_days: 90
