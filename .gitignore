@@ -18,6 +18,10 @@ node_modules/
 .venv/
 runs/
 reports/
+knowledge/snapshots/*
+knowledge/proposals/*
+!knowledge/snapshots/.gitkeep
+!knowledge/proposals/.gitkeep
 *.pyc
 
 # Harness durable layer

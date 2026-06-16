@@ -57,6 +57,18 @@
 | Runtime trace opt-out | `uv run pytest tests/test_runner.py::test_no_runtime_trace_preserves_phase_2_artifact_shape` verifies `--no-runtime-trace` behavior | planned |
 | Standalone review trace | `uv run pytest tests/test_cli.py::test_cli_review_does_not_overwrite_run_runtime_trace` verifies review trace isolation | planned |
 
+## Phase 4 Matrix
+
+| Artifact | Proof | Status |
+| --- | --- | --- |
+| Knowledge snapshot schema | `uv run pytest tests/test_knowledge_loop.py::test_source_snapshot_schema_validates_offline_snapshot` validates offline snapshots | planned |
+| Deterministic source hashing | `uv run pytest tests/test_knowledge_loop.py::test_snapshot_hashing_is_deterministic_for_internal_docs_and_offline_urls` verifies stable hashes | planned |
+| Knowledge diff | `uv run pytest tests/test_knowledge_loop.py::test_diff_reports_changed_added_removed_and_unchanged` verifies changed, added, removed, and unchanged sources | planned |
+| Knowledge audit | `uv run pytest tests/test_knowledge_loop.py::test_audit_extracts_warnings_and_failed_tools` verifies run evidence extraction | planned |
+| Knowledge proposal | `uv run pytest tests/test_knowledge_loop.py::test_proposal_combines_diff_and_audit_without_editing_docs` verifies proposal evidence and no canonical-doc mutation | planned |
+| Knowledge CLI chain | `uv run pytest tests/test_cli.py::test_cli_knowledge_snapshot_diff_audit_and_propose` verifies snapshot, diff, audit, and propose commands | planned |
+| Tool registry extension | `uv run strategy-codebot tools check --out reports/tool-check.json` validates Phase 4 tool contracts | planned |
+
 ## Evidence Rules
 
 - Do not mark Pine strategy backtests as passed without TradingView evidence.
@@ -64,3 +76,4 @@
 - Do not treat multi-agent agreement as a substitute for deterministic validation.
 - Do not treat `review-report.json` as a replacement for `validation-report.json`.
 - Do not treat runtime traces as TradingView or MetaTrader execution proof.
+- Do not auto-promote knowledge proposals into canonical docs without human review.

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/knowledge-proposal.schema.json",
+  "title": "KnowledgeProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["proposal_id", "created_at", "status", "risk_level", "affected_sources", "affected_docs", "evidence_refs", "recommendations", "next_actions"],
+  "properties": {
+    "proposal_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "status": { "type": "string", "enum": ["draft", "needs_review", "rejected", "accepted"] },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+    "affected_sources": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "affected_docs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recommendations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

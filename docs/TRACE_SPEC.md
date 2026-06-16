@@ -35,3 +35,15 @@ Phase 3 adds local runtime traces:
 - `review-runtime-trace.jsonl` and `review-runtime-summary.json`: standalone review command traces, kept separate so review does not overwrite the original run trace.
 
 Runtime traces do not replace `agent-run.json`, `validation-report.json`, or `review-report.json`; they explain how those artifacts were produced.
+
+## Knowledge Improvement Evidence
+
+Phase 4 knowledge proposals may reference:
+
+- `knowledge/snapshots/*.json`
+- `reports/knowledge-diff.json`
+- `reports/knowledge-audit.json`
+- `knowledge/proposals/*.json`
+- run-level `validation-report.json`, `review-report.json`, `runtime-summary.json`, and runtime JSONL traces
+
+Knowledge proposals are evidence artifacts. They do not prove TradingView or MetaTrader execution, and they do not authorize automatic edits to canonical docs.

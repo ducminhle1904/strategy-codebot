@@ -174,3 +174,70 @@ def test_cli_knowledge_check_writes_report(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert load_json(out_path)["status"] == "pass"
+
+
+def test_cli_knowledge_snapshot_diff_audit_and_propose(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "snapshot.json"
+    snapshot_result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "snapshot",
+            "--offline",
+            "--out",
+            str(snapshot_path),
+        ],
+    )
+    assert snapshot_result.exit_code == 0, snapshot_result.output
+    assert load_json(snapshot_path)["fetch_mode"] == "offline"
+
+    diff_path = tmp_path / "knowledge-diff.json"
+    diff_result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "diff",
+            "--baseline",
+            "examples/knowledge/baseline-snapshot.json",
+            "--current",
+            str(snapshot_path),
+            "--out",
+            str(diff_path),
+        ],
+    )
+    assert diff_result.exit_code == 0, diff_result.output
+    assert load_json(diff_path)["status"] == "manual_required"
+
+    run_dir = tmp_path / "knowledge-run"
+    run_cli_dry_run(run_dir, "--review", "parallel")
+    audit_path = tmp_path / "knowledge-audit.json"
+    audit_result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "audit",
+            "--runs",
+            str(run_dir),
+            "--out",
+            str(audit_path),
+        ],
+    )
+    assert audit_result.exit_code == 0, audit_result.output
+    assert load_json(audit_path)["run_id"] == run_dir.name
+
+    proposal_path = tmp_path / "proposal.json"
+    proposal_result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "propose",
+            "--diff",
+            str(diff_path),
+            "--audit",
+            str(audit_path),
+            "--out",
+            str(proposal_path),
+        ],
+    )
+    assert proposal_result.exit_code == 0, proposal_result.output
+    assert load_json(proposal_path)["status"] == "needs_review"

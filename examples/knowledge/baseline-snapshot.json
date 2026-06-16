@@ -1,0 +1,30 @@
+{
+  "snapshot_id": "example-baseline",
+  "created_at": "2026-01-01T00:00:00+00:00",
+  "fetch_mode": "offline",
+  "registry_ref": "configs/source-registry.yaml",
+  "sources": [
+    {
+      "id": "tradingview-pine-welcome",
+      "platform": "pine_v6",
+      "type": "official",
+      "trust_level": "high",
+      "locator": "https://www.tradingview.com/pine-script-docs/welcome/",
+      "freshness_ttl_days": 30,
+      "content_hash": "example-old-pine-welcome-hash",
+      "checked_at": "2026-01-01T00:00:00+00:00",
+      "fetch_mode": "offline"
+    },
+    {
+      "id": "internal-risk-policy",
+      "platform": "general",
+      "type": "internal",
+      "trust_level": "high",
+      "locator": "docs/trading/risk-policy.md",
+      "freshness_ttl_days": 90,
+      "content_hash": "example-old-risk-policy-hash",
+      "checked_at": "2026-01-01T00:00:00+00:00",
+      "fetch_mode": "offline"
+    }
+  ]
+}

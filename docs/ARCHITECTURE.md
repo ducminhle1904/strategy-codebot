@@ -63,6 +63,21 @@ flowchart TD
 
 The runtime harness is local and Python-native. It records ordered tool events and policy mode, while `repository-harness` remains the repo-level operating model.
 
+## Phase 4 Knowledge Loop
+
+```mermaid
+flowchart TD
+  S["Source registry"] --> N["Knowledge snapshot"]
+  N --> D["Snapshot diff"]
+  R["Run artifacts"] --> A["Knowledge audit"]
+  D --> P["Knowledge proposal"]
+  A --> P
+  P --> H["Human review"]
+  H --> C["Future canonical docs change"]
+```
+
+The knowledge loop is proposal-first. It can detect stale or changed sources and recurring run evidence, but it does not edit canonical docs without a separate human-approved change.
+
 ## Platform Boundary
 
 Pine Script and MQL5 are not interchangeable:

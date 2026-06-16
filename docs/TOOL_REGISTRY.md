@@ -1,6 +1,6 @@
 # Tool Registry
 
-The tool registry records runtime tools that the CLI may call. Phase 3 keeps this registry machine-readable in `configs/tool-registry.yaml`.
+The tool registry records runtime tools that the CLI may call. Phase 3 introduced the machine-readable registry in `configs/tool-registry.yaml`; Phase 4 extends it with knowledge snapshot, diff, audit, and proposal tools.
 
 ## Capability Vocabulary
 
@@ -9,6 +9,10 @@ The tool registry records runtime tools that the CLI may call. Phase 3 keeps thi
 - `mql5-compile`: compile `.mq5` files with MetaEditor.
 - `mt5-backtest`: run MetaTrader 5 Strategy Tester from a config.
 - `knowledge-refresh`: fetch and diff trusted source docs.
+- `knowledge-snapshot`: record source metadata and content hashes.
+- `knowledge-diff`: compare two knowledge snapshots.
+- `knowledge-run-audit`: inspect validation, review, and runtime evidence from a run directory.
+- `knowledge-improvement-proposal`: produce proposal artifacts for human review.
 - `strategy-risk-review`: review strategy assumptions and safety boundaries.
 - `harness-trace`: record run evidence into the repository harness.
 
@@ -40,3 +44,14 @@ Each tool contract includes:
 - `phase_status`
 
 The runtime harness records each tool invocation as ordered JSONL events. Missing future tools must degrade cleanly; implemented Phase 3 tools must pass `strategy-codebot tools check`.
+
+## Phase 4 Knowledge Contracts
+
+Knowledge tools produce local evidence artifacts:
+
+- `knowledge_snapshot` writes `knowledge-snapshot.schema.json` payloads.
+- `knowledge_diff` writes `knowledge-diff.schema.json` payloads.
+- `knowledge_audit` reads run evidence and writes an audit report.
+- `knowledge_proposal` writes `knowledge-proposal.schema.json` payloads.
+
+These tools may recommend doc updates, but they must not edit canonical docs. Generated snapshots and proposals are ignored by default unless copied into examples or fixtures intentionally.

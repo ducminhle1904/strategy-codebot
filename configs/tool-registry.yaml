@@ -55,6 +55,38 @@ tools:
     evidence_required:
       - source-check.json
     phase_status: implemented
+  - id: knowledge_snapshot
+    capability: knowledge-snapshot
+    risk_tier: read
+    input_schema_ref: configs/source-registry.yaml
+    output_schema_ref: schemas/knowledge-snapshot.schema.json
+    evidence_required:
+      - knowledge/snapshots/*.json
+    phase_status: implemented
+  - id: knowledge_diff
+    capability: knowledge-diff
+    risk_tier: read
+    input_schema_ref: schemas/knowledge-snapshot.schema.json
+    output_schema_ref: schemas/knowledge-diff.schema.json
+    evidence_required:
+      - reports/knowledge-diff.json
+    phase_status: implemented
+  - id: knowledge_audit
+    capability: knowledge-run-audit
+    risk_tier: read
+    input_schema_ref: runs/*/
+    output_schema_ref: reports/knowledge-audit.json
+    evidence_required:
+      - reports/knowledge-audit.json
+    phase_status: implemented
+  - id: knowledge_proposal
+    capability: knowledge-improvement-proposal
+    risk_tier: documentation
+    input_schema_ref: schemas/knowledge-diff.schema.json
+    output_schema_ref: schemas/knowledge-proposal.schema.json
+    evidence_required:
+      - knowledge/proposals/*.json
+    phase_status: implemented
   - id: record_harness_trace
     capability: harness-trace
     risk_tier: repo_write

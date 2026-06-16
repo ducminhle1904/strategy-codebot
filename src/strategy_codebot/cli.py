@@ -5,7 +5,7 @@ from typing import Optional
 
 import typer
 
-from strategy_codebot.knowledge import check_registry
+from strategy_codebot.knowledge import audit_run, check_registry, create_proposal, create_snapshot, diff_snapshots
 from strategy_codebot.review import REVIEW_MODE_NONE, review_run_directory
 from strategy_codebot.runner import run_strategy, validate_pine_file
 from strategy_codebot.schemas import validate_payload, write_json
@@ -66,6 +66,53 @@ def knowledge_check(
     validate_payload(report, "validation-report.schema.json")
     write_json(out, report)
     typer.echo(f"status={report['status']} out={out}")
+
+
+@knowledge_app.command("snapshot")
+def knowledge_snapshot(
+    registry: Path = typer.Option(Path("configs/source-registry.yaml"), "--registry", help="Source registry YAML path."),
+    offline: bool = typer.Option(True, "--offline/--fetch", help="Use deterministic offline metadata instead of fetching external URLs."),
+    out: Path = typer.Option(Path("knowledge/snapshots/current.json"), "--out", help="Snapshot output path."),
+) -> None:
+    snapshot = create_snapshot(registry, offline=offline)
+    validate_payload(snapshot, "knowledge-snapshot.schema.json")
+    write_json(out, snapshot)
+    typer.echo(f"sources={len(snapshot['sources'])} fetch_mode={snapshot['fetch_mode']} out={out}")
+
+
+@knowledge_app.command("diff")
+def knowledge_diff(
+    baseline: Path = typer.Option(..., "--baseline", help="Baseline knowledge snapshot JSON path."),
+    current: Path = typer.Option(..., "--current", help="Current knowledge snapshot JSON path."),
+    out: Path = typer.Option(Path("reports/knowledge-diff.json"), "--out", help="Diff report output path."),
+) -> None:
+    report = diff_snapshots(baseline, current)
+    validate_payload(report, "knowledge-diff.schema.json")
+    write_json(out, report)
+    typer.echo(f"status={report['status']} out={out}")
+
+
+@knowledge_app.command("audit")
+def knowledge_audit(
+    runs: Path = typer.Option(..., "--runs", help="Run directory containing validation/review/runtime artifacts."),
+    out: Path = typer.Option(Path("reports/knowledge-audit.json"), "--out", help="Audit report output path."),
+) -> None:
+    report = audit_run(runs)
+    write_json(out, report)
+    typer.echo(f"status={report['status']} out={out}")
+
+
+@knowledge_app.command("propose")
+def knowledge_propose(
+    diff: Path = typer.Option(..., "--diff", help="Knowledge diff report path."),
+    audit: Optional[Path] = typer.Option(None, "--audit", help="Knowledge audit report path."),
+    runs: Optional[Path] = typer.Option(None, "--runs", help="Run directory to audit inline when --audit is omitted."),
+    out: Path = typer.Option(Path("knowledge/proposals/proposal.json"), "--out", help="Knowledge proposal output path."),
+) -> None:
+    proposal = create_proposal(diff, audit_path=audit, runs_path=runs)
+    validate_payload(proposal, "knowledge-proposal.schema.json")
+    write_json(out, proposal)
+    typer.echo(f"status={proposal['status']} risk={proposal['risk_level']} out={out}")
 
 
 @tools_app.command("list")

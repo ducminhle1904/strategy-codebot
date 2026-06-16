@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/knowledge-snapshot.schema.json",
+  "title": "KnowledgeSnapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["snapshot_id", "created_at", "fetch_mode", "registry_ref", "sources"],
+  "properties": {
+    "snapshot_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "fetch_mode": { "type": "string", "enum": ["offline", "fetch"] },
+    "registry_ref": { "type": "string", "minLength": 1 },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "platform", "type", "trust_level", "locator", "freshness_ttl_days", "content_hash", "checked_at", "fetch_mode"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "platform": { "type": "string", "minLength": 1 },
+          "type": { "type": "string", "minLength": 1 },
+          "trust_level": { "type": "string", "minLength": 1 },
+          "locator": { "type": "string", "minLength": 1 },
+          "freshness_ttl_days": { "type": "integer", "minimum": 0 },
+          "content_hash": { "type": "string", "minLength": 1 },
+          "checked_at": { "type": "string", "format": "date-time" },
+          "fetch_mode": { "type": "string", "enum": ["offline", "fetch"] }
+        }
+      }
+    }
+  }
+}

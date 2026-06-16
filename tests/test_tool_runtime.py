@@ -12,7 +12,15 @@ from strategy_codebot.tool_runtime import POLICY_ENFORCE, ToolBlockedError, Tool
 def test_tool_registry_contracts_are_valid() -> None:
     registry = load_tool_registry(Path("configs/tool-registry.yaml"))
 
-    assert {tool["id"] for tool in registry["tools"]} >= {"load_strategy_spec", "run_parallel_review", "record_harness_trace"}
+    assert {tool["id"] for tool in registry["tools"]} >= {
+        "load_strategy_spec",
+        "run_parallel_review",
+        "knowledge_snapshot",
+        "knowledge_diff",
+        "knowledge_audit",
+        "knowledge_proposal",
+        "record_harness_trace",
+    }
     for tool in registry["tools"]:
         validate_payload(tool, "tool-contract.schema.json")
 

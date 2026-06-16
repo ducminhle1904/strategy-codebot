@@ -2,7 +2,7 @@
 
 Harness-first AI agent scaffold for generating and reviewing trading strategy code for Pine Script v6 and MQL5.
 
-This repository is currently in **Phase 3: Tool/Runtime Harness**. It contains a CLI MVP for deterministic Pine generation, static validation, knowledge-source checks, parallel review reports, and local runtime tool traces. It does not yet include Pine compiler automation, MQL5 compile/test automation, broker integration, or live-trading automation.
+This repository is currently in **Phase 4: Self-Improving Knowledge**. It contains a CLI MVP for deterministic Pine generation, static validation, knowledge-source checks, parallel review reports, local runtime tool traces, and proposal-first knowledge improvement artifacts. It does not yet include Pine compiler automation, MQL5 compile/test automation, broker integration, live-trading automation, or automatic promotion of knowledge proposals into canonical docs.
 
 ## Start Here
 
@@ -75,6 +75,19 @@ uv run strategy-codebot run --spec examples/specs/ma-crossover-pine.json --mode 
 
 Phase 3 writes `runtime-trace.jsonl` and `runtime-summary.json` by default for `run`. Standalone `review` writes `review-runtime-trace.jsonl` and `review-runtime-summary.json` so it does not overwrite the original run trace. Runtime traces explain ordered tool calls; repository-level planning and durable evidence remain in `repository-harness`.
 
+## Phase 4 Self-Improving Knowledge
+
+Create an offline source snapshot, compare it against a baseline, audit run evidence, and produce a proposal:
+
+```bash
+uv run strategy-codebot knowledge snapshot --registry configs/source-registry.yaml --offline --out knowledge/snapshots/offline-current.json
+uv run strategy-codebot knowledge diff --baseline examples/knowledge/baseline-snapshot.json --current knowledge/snapshots/offline-current.json --out reports/knowledge-diff.json
+uv run strategy-codebot knowledge audit --runs runs/phase3-example --out reports/knowledge-audit.json
+uv run strategy-codebot knowledge propose --diff reports/knowledge-diff.json --audit reports/knowledge-audit.json --out knowledge/proposals/phase4-proposal.json
+```
+
+Phase 4 creates evidence and recommendations only. Generated snapshots and proposals are ignored by default, and commands must not edit canonical docs such as `docs/trading/*.md`.
+
 ## Non-Goals
 
 - No live trading.
@@ -82,3 +95,4 @@ Phase 3 writes `runtime-trace.jsonl` and `runtime-summary.json` by default for `
 - No profitability claims.
 - No generated strategy execution.
 - No TradingView or MetaTrader runtime validation yet.
+- No automatic mutation of canonical knowledge docs from proposals.
