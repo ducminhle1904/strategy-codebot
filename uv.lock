@@ -1889,27 +1889,38 @@ name = "strategy-codebot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "httpx" },
     { name = "jsonschema" },
-    { name = "langgraph" },
-    { name = "litellm" },
     { name = "pydantic" },
-    { name = "pytest" },
     { name = "pyyaml" },
     { name = "typer" },
 ]
 
+[package.optional-dependencies]
+live = [
+    { name = "httpx" },
+    { name = "langgraph" },
+    { name = "litellm" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "httpx", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'live'", specifier = ">=0.27" },
     { name = "jsonschema", specifier = ">=4.22" },
-    { name = "langgraph", specifier = ">=0.2" },
-    { name = "litellm", specifier = ">=1.50" },
+    { name = "langgraph", marker = "extra == 'live'", specifier = ">=0.2" },
+    { name = "litellm", marker = "extra == 'live'", specifier = ">=1.50" },
     { name = "pydantic", specifier = ">=2.8" },
-    { name = "pytest", specifier = ">=8.2" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "typer", specifier = ">=0.12" },
 ]
+provides-extras = ["live"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.2" }]
 
 [[package]]
 name = "tenacity"

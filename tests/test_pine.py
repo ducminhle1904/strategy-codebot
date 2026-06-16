@@ -55,3 +55,36 @@ def test_validator_flags_repaint_hazards_and_missing_risk_controls() -> None:
     failing = {check["name"] for check in report["checks"] if check["status"] == "fail"}
     assert "repaint_hazards" in failing
     assert "risk_assumptions" in failing
+
+
+def test_validator_surfaces_manual_required_status() -> None:
+    spec = {
+        "target_platform": "pine_v6",
+        "script_type": "expert_advisor",
+        "market": "forex",
+        "timeframe": "H1",
+        "entry_rules": ["entry"],
+        "exit_rules": ["exit"],
+        "risk_rules": ["risk"],
+    }
+
+    report = validate_pine("//@version=6\nstrategy(\"EA\", overlay=true)", spec)
+
+    assert report["status"] == "manual_required"
+
+
+def test_indicator_with_skipped_risk_check_can_pass() -> None:
+    spec = {
+        "target_platform": "pine_v6",
+        "script_type": "indicator",
+        "market": "crypto",
+        "timeframe": "1h",
+        "entry_rules": ["entry"],
+        "exit_rules": ["exit"],
+        "risk_rules": ["risk"],
+    }
+    code = generate_pine(spec)
+
+    report = validate_pine(code, spec)
+
+    assert report["status"] == "pass"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -7,6 +8,7 @@ from urllib.parse import urlparse
 import yaml
 
 from strategy_codebot.paths import repo_root
+from strategy_codebot.reporting import validation_check
 
 
 REQUIRED_KEYS = {"id", "platform", "type", "trust_level", "freshness_ttl_days"}
@@ -19,33 +21,42 @@ def check_registry(registry_path: Path, offline: bool = True) -> dict[str, Any]:
     warnings: list[str] = []
 
     if not sources:
-        checks.append(_check("sources_present", False, "Registry must contain a non-empty sources list."))
+        checks.append(validation_check("sources_present", False, "Registry must contain a non-empty sources list."))
     else:
-        checks.append(_check("sources_present", True, f"Found {len(sources)} sources."))
+        checks.append(validation_check("sources_present", True, f"Found {len(sources)} sources."))
 
     seen_ids: set[str] = set()
-    for source in sources:
+    for index, source in enumerate(sources):
+        if not isinstance(source, Mapping):
+            checks.append(
+                {
+                    "name": f"source_{index}:mapping",
+                    "status": "fail",
+                    "details": "Each source entry must be a mapping.",
+                }
+            )
+            continue
         source_id = str(source.get("id", "<missing>"))
         missing = sorted(key for key in REQUIRED_KEYS if key not in source)
-        checks.append(_check(f"{source_id}:required_metadata", not missing, f"Missing keys: {', '.join(missing)}" if missing else "Required metadata present."))
+        checks.append(validation_check(f"{source_id}:required_metadata", not missing, f"Missing keys: {', '.join(missing)}" if missing else "Required metadata present."))
 
         duplicate = source_id in seen_ids
-        checks.append(_check(f"{source_id}:unique_id", not duplicate, "Duplicate source id." if duplicate else "Source id is unique."))
+        checks.append(validation_check(f"{source_id}:unique_id", not duplicate, "Duplicate source id." if duplicate else "Source id is unique."))
         seen_ids.add(source_id)
 
         has_url = "url" in source
         has_path = "path" in source
-        checks.append(_check(f"{source_id}:locator", has_url ^ has_path, "Exactly one of url or path is required."))
+        checks.append(validation_check(f"{source_id}:locator", has_url ^ has_path, "Exactly one of url or path is required."))
 
         if has_url:
             parsed = urlparse(str(source["url"]))
-            checks.append(_check(f"{source_id}:url", parsed.scheme in {"http", "https"} and bool(parsed.netloc), "External URL must be absolute HTTP(S)."))
+            checks.append(validation_check(f"{source_id}:url", parsed.scheme in {"http", "https"} and bool(parsed.netloc), "External URL must be absolute HTTP(S)."))
             if offline:
                 warnings.append(f"{source_id}: external URL shape checked only; network fetch skipped.")
 
         if has_path:
             local = repo_root() / str(source["path"])
-            checks.append(_check(f"{source_id}:path", local.exists(), f"Internal path must exist: {source['path']}"))
+            checks.append(validation_check(f"{source_id}:path", local.exists(), f"Internal path must exist: {source['path']}"))
 
     status = "fail" if any(check["status"] == "fail" for check in checks) else "pass"
     return {
@@ -56,8 +67,4 @@ def check_registry(registry_path: Path, offline: bool = True) -> dict[str, Any]:
         "warnings": warnings,
         "next_actions": [] if status == "pass" else ["Fix source registry metadata before ingestion."],
     }
-
-
-def _check(name: str, condition: bool, details: str) -> dict[str, str]:
-    return {"name": name, "status": "pass" if condition else "fail", "details": details}
 

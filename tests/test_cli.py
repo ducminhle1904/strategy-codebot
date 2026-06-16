@@ -1,9 +1,9 @@
-import json
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from strategy_codebot.cli import app
+from strategy_codebot.schemas import load_json
 
 
 runner = CliRunner()
@@ -60,7 +60,7 @@ def test_cli_validate_pine_writes_report(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(report_path.read_text())["status"] == "pass"
+    assert load_json(report_path)["status"] == "pass"
 
 
 def test_cli_knowledge_check_writes_report(tmp_path: Path) -> None:
@@ -77,5 +77,4 @@ def test_cli_knowledge_check_writes_report(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert json.loads(out_path.read_text())["status"] == "pass"
-
+    assert load_json(out_path)["status"] == "pass"

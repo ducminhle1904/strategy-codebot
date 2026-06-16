@@ -8,7 +8,10 @@ import yaml
 
 
 def generate_live(prompt: str, model_registry: Path) -> tuple[dict[str, Any], str]:
-    import litellm
+    try:
+        import litellm
+    except ImportError as exc:
+        raise RuntimeError("Live mode requires the optional live dependencies. Run with `uv run --extra live strategy-codebot ...`.") from exc
 
     registry = yaml.safe_load(model_registry.read_text(encoding="utf-8"))
     model = registry["agents"]["pine_specialist"]["primary"]
@@ -30,4 +33,3 @@ def generate_live(prompt: str, model_registry: Path) -> tuple[dict[str, Any], st
     content = response.choices[0].message.content
     payload = json.loads(content)
     return payload["strategy_spec"], payload["pine_code"]
-

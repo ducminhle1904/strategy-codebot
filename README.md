@@ -34,7 +34,11 @@ uv run strategy-codebot validate-pine --file runs/example/pine/strategy.pine --s
 uv run strategy-codebot knowledge check --offline --out reports/source-check.json
 ```
 
-Dry-run mode does not require API keys. Live mode uses LiteLLM-compatible provider configuration from `configs/model-registry.example.yaml` and reads provider credentials from the environment.
+Dry-run mode does not require API keys. Live mode uses LiteLLM-compatible provider configuration from `configs/model-registry.example.yaml`, reads provider credentials from the environment, and should be run with the live extra:
+
+```bash
+uv run --extra live strategy-codebot run --prompt "Create a Pine v6 moving average crossover strategy" --mode live --out runs/live-example
+```
 
 When `scripts/bin/harness-cli` exists, `strategy-codebot run` records a local repository-harness trace by default. Use `--no-record-harness` for tests and disposable local runs.
 

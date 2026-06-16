@@ -9,8 +9,9 @@ from strategy_codebot import __version__
 from strategy_codebot.harness import build_trace_command, harness_outcome, record_trace, should_record_harness
 from strategy_codebot.live import generate_live
 from strategy_codebot.mql5 import runner_design, validation_report as mql5_validation_report
-from strategy_codebot.paths import ensure_dir, ensure_parent, repo_root
+from strategy_codebot.paths import ensure_dir, repo_root
 from strategy_codebot.pine import generate_pine, manual_checklist, validate_pine
+from strategy_codebot.reporting import aggregate_status
 from strategy_codebot.schemas import load_strategy_spec, validate_payload, write_json
 
 
@@ -22,9 +23,6 @@ def run_strategy(
     out_dir: Path,
     record_harness: bool | None,
 ) -> dict[str, Any]:
-    ensure_dir(out_dir)
-    run_id = out_dir.name if out_dir.name else f"run-{uuid4().hex[:8]}"
-
     if mode == "dry-run":
         if spec_path is None:
             raise ValueError("--spec is required when --mode dry-run")
@@ -38,25 +36,32 @@ def run_strategy(
     else:
         raise ValueError("mode must be dry-run or live")
 
-    write_json(out_dir / "strategy-spec.json", spec)
+    ensure_dir(out_dir)
+    run_id = out_dir.name if out_dir.name else f"run-{uuid4().hex[:8]}"
+    artifacts: list[str] = []
+
+    def write_text_artifact(relative_path: str, content: str) -> None:
+        target = out_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        artifacts.append(relative_path)
+
+    def write_json_artifact(relative_path: str, payload: dict[str, Any]) -> None:
+        write_json(out_dir / relative_path, payload)
+        artifacts.append(relative_path)
+
+    write_json_artifact("strategy-spec.json", spec)
 
     validation = None
-    changed = ["strategy-spec.json", "agent-run.json"]
     if pine_code:
-        pine_dir = out_dir / "pine"
-        ensure_dir(pine_dir)
-        (pine_dir / "strategy.pine").write_text(pine_code, encoding="utf-8")
+        write_text_artifact("pine/strategy.pine", pine_code)
         validation = validate_pine(pine_code, spec)
-        (out_dir / "manual-tradingview-checklist.md").write_text(manual_checklist(spec), encoding="utf-8")
-        changed.extend(["pine/strategy.pine", "manual-tradingview-checklist.md"])
+        write_text_artifact("manual-tradingview-checklist.md", manual_checklist(spec))
 
     if spec["target_platform"] in {"mql5", "both"}:
-        mql5_dir = out_dir / "mql5"
-        ensure_dir(mql5_dir)
-        (mql5_dir / "runner-design.md").write_text(runner_design(spec), encoding="utf-8")
+        write_text_artifact("mql5/runner-design.md", runner_design(spec))
         mql5_report = mql5_validation_report()
         validation = _combine_validation(validation, mql5_report) if validation else mql5_report
-        changed.append("mql5/runner-design.md")
 
     if validation is None:
         validation = {
@@ -69,8 +74,7 @@ def run_strategy(
         }
 
     validate_payload(validation, "validation-report.schema.json")
-    write_json(out_dir / "validation-report.json", validation)
-    changed.append("validation-report.json")
+    write_json_artifact("validation-report.json", validation)
 
     agent_run = {
         "run_id": run_id,
@@ -82,13 +86,13 @@ def run_strategy(
         "input_refs": [str(spec_path)] if spec_path else ["prompt"],
         "retrieved_sources": ["configs/source-registry.yaml"],
         "tool_calls": ["pine-static-validator"] if pine_code else [],
-        "output_refs": changed,
+        "output_refs": [*artifacts, "agent-run.json"],
         "validation_refs": ["validation-report.json"],
         "status": validation["status"],
         "warnings": validation["warnings"],
     }
     validate_payload(agent_run, "agent-run.schema.json")
-    write_json(out_dir / "agent-run.json", agent_run)
+    write_json_artifact("agent-run.json", agent_run)
 
     if should_record_harness(record_harness):
         command = build_trace_command(
@@ -96,7 +100,7 @@ def run_strategy(
             story=None,
             agent=agent_run["agent_role"],
             outcome=harness_outcome(validation["status"]),
-            changed=[str(out_dir / item) for item in changed],
+            changed=[str(out_dir / item) for item in artifacts],
             notes="strategy-codebot CLI run; story reference is kept in docs until harness story rows are seeded",
         )
         record_trace(command)
@@ -108,7 +112,6 @@ def validate_pine_file(file_path: Path, spec_path: Path, out_path: Path) -> dict
     spec = load_strategy_spec(spec_path)
     report = validate_pine(file_path.read_text(encoding="utf-8"), spec)
     validate_payload(report, "validation-report.schema.json")
-    ensure_parent(out_path)
     write_json(out_path, report)
     return report
 
@@ -116,13 +119,7 @@ def validate_pine_file(file_path: Path, spec_path: Path, out_path: Path) -> dict
 def _combine_validation(pine_report: dict[str, Any] | None, mql5_report: dict[str, Any]) -> dict[str, Any]:
     if pine_report is None:
         return mql5_report
-    statuses = {pine_report["status"], mql5_report["status"]}
-    if "fail" in statuses:
-        status = "fail"
-    elif "manual_required" in statuses:
-        status = "manual_required"
-    else:
-        status = "pass"
+    status = aggregate_status({pine_report["status"], mql5_report["status"]})
     return {
         "platform": "both",
         "status": status,

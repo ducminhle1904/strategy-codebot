@@ -6,7 +6,6 @@ from typing import Optional
 import typer
 
 from strategy_codebot.knowledge import check_registry
-from strategy_codebot.paths import ensure_parent
 from strategy_codebot.runner import run_strategy, validate_pine_file
 from strategy_codebot.schemas import validate_payload, write_json
 
@@ -45,11 +44,9 @@ def knowledge_check(
 ) -> None:
     report = check_registry(registry, offline=offline)
     validate_payload(report, "validation-report.schema.json")
-    ensure_parent(out)
     write_json(out, report)
     typer.echo(f"status={report['status']} out={out}")
 
 
 def main() -> None:
     app()
-
