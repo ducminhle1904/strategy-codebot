@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/review-report.schema.json",
+  "title": "ReviewReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "created_at",
+    "run_status",
+    "decision",
+    "reviewers",
+    "findings",
+    "conflicts",
+    "warnings",
+    "next_actions"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "run_status": {
+      "type": "string",
+      "enum": ["completed", "partial", "failed", "skipped"]
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["approve", "changes_requested", "manual_required", "blocked"]
+    },
+    "reviewers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "provider", "model", "status", "findings", "evidence_refs", "warnings"],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": ["trading_analyst", "pine_specialist", "risk_reviewer", "critic"]
+          },
+          "provider": { "type": "string", "minLength": 1 },
+          "model": { "type": "string", "minLength": 1 },
+          "status": {
+            "type": "string",
+            "enum": ["pass", "fail", "manual_required", "skipped", "error"]
+          },
+          "findings": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/finding" }
+          },
+          "evidence_refs": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "warnings": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewer", "severity", "category", "message", "evidence_refs"],
+      "properties": {
+        "reviewer": {
+          "type": "string",
+          "enum": ["trading_analyst", "pine_specialist", "risk_reviewer", "critic"]
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "blocker"]
+        },
+        "category": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "evidence_refs": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "recommendation": { "type": "string" }
+      }
+    }
+  }
+}

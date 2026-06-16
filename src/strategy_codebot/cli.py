@@ -6,10 +6,11 @@ from typing import Optional
 import typer
 
 from strategy_codebot.knowledge import check_registry
+from strategy_codebot.review import REVIEW_MODE_NONE, review_run_directory
 from strategy_codebot.runner import run_strategy, validate_pine_file
 from strategy_codebot.schemas import validate_payload, write_json
 
-app = typer.Typer(help="Strategy Codebot Phase 1 CLI.")
+app = typer.Typer(help="Strategy Codebot CLI.")
 knowledge_app = typer.Typer(help="Knowledge source registry commands.")
 app.add_typer(knowledge_app, name="knowledge")
 
@@ -20,10 +21,22 @@ def run(
     prompt: Optional[str] = typer.Option(None, "--prompt", help="Prompt for live LLM mode."),
     mode: str = typer.Option("dry-run", "--mode", help="dry-run or live."),
     out: Path = typer.Option(Path("runs/latest"), "--out", help="Output run directory."),
+    review: str = typer.Option(REVIEW_MODE_NONE, "--review", help="none or parallel."),
     record_harness: Optional[bool] = typer.Option(None, "--record-harness/--no-record-harness", help="Record a repository-harness trace."),
 ) -> None:
-    result = run_strategy(spec_path=spec, prompt=prompt, mode=mode, out_dir=out, record_harness=record_harness)
+    result = run_strategy(spec_path=spec, prompt=prompt, mode=mode, out_dir=out, review=review, record_harness=record_harness)
     typer.echo(f"run_id={result['run_id']} status={result['status']} out={result['out_dir']}")
+
+
+@app.command()
+def review(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Existing run directory to review."),
+    mode: str = typer.Option("dry-run", "--mode", help="dry-run or live."),
+    out: Path = typer.Option(..., "--out", help="Review report output path."),
+    record_harness: Optional[bool] = typer.Option(None, "--record-harness/--no-record-harness", help="Record a repository-harness trace."),
+) -> None:
+    report = review_run_directory(run_dir=run_dir, mode=mode, out_path=out, record_harness=record_harness)
+    typer.echo(f"run_id={report['run_id']} run_status={report['run_status']} decision={report['decision']} out={out}")
 
 
 @app.command("validate-pine")

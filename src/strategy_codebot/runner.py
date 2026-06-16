@@ -12,6 +12,7 @@ from strategy_codebot.mql5 import runner_design, validation_report as mql5_valid
 from strategy_codebot.paths import ensure_dir, repo_root
 from strategy_codebot.pine import generate_pine, manual_checklist, validate_pine
 from strategy_codebot.reporting import aggregate_status
+from strategy_codebot.review import REVIEW_MODE_NONE, REVIEW_MODE_PARALLEL, REVIEW_REPORT_PATH, write_review_report
 from strategy_codebot.schemas import load_strategy_spec, validate_payload, write_json
 
 
@@ -21,8 +22,12 @@ def run_strategy(
     prompt: str | None,
     mode: str,
     out_dir: Path,
-    record_harness: bool | None,
+    review: str = REVIEW_MODE_NONE,
+    record_harness: bool | None = None,
 ) -> dict[str, Any]:
+    if review not in {REVIEW_MODE_NONE, REVIEW_MODE_PARALLEL}:
+        raise ValueError("review must be none or parallel")
+
     if mode == "dry-run":
         if spec_path is None:
             raise ValueError("--spec is required when --mode dry-run")
@@ -53,13 +58,15 @@ def run_strategy(
     write_json_artifact("strategy-spec.json", spec)
 
     validation = None
+    mql5_design = None
     if pine_code:
         write_text_artifact("pine/strategy.pine", pine_code)
         validation = validate_pine(pine_code, spec)
         write_text_artifact("manual-tradingview-checklist.md", manual_checklist(spec))
 
     if spec["target_platform"] in {"mql5", "both"}:
-        write_text_artifact("mql5/runner-design.md", runner_design(spec))
+        mql5_design = runner_design(spec)
+        write_text_artifact("mql5/runner-design.md", mql5_design)
         mql5_report = mql5_validation_report()
         validation = _combine_validation(validation, mql5_report) if validation else mql5_report
 
@@ -76,6 +83,21 @@ def run_strategy(
     validate_payload(validation, "validation-report.schema.json")
     write_json_artifact("validation-report.json", validation)
 
+    if review == REVIEW_MODE_PARALLEL:
+        review_report = write_review_report(
+            run_id=run_id,
+            spec=spec,
+            validation=validation,
+            pine_code=pine_code,
+            mql5_runner_design=mql5_design,
+            mode=mode,
+            out_path=out_dir / REVIEW_REPORT_PATH,
+            record_harness=record_harness,
+        )
+        artifacts.append(REVIEW_REPORT_PATH)
+    else:
+        review_report = None
+
     agent_run = {
         "run_id": run_id,
         "created_at": datetime.now(UTC).isoformat(),
@@ -85,11 +107,11 @@ def run_strategy(
         "prompt_version": __version__,
         "input_refs": [str(spec_path)] if spec_path else ["prompt"],
         "retrieved_sources": ["configs/source-registry.yaml"],
-        "tool_calls": ["pine-static-validator"] if pine_code else [],
+        "tool_calls": [*(["pine-static-validator"] if pine_code else []), *(["parallel-review"] if review_report else [])],
         "output_refs": [*artifacts, "agent-run.json"],
-        "validation_refs": ["validation-report.json"],
+        "validation_refs": ["validation-report.json", *([REVIEW_REPORT_PATH] if review_report else [])],
         "status": validation["status"],
-        "warnings": validation["warnings"],
+        "warnings": [*validation["warnings"], *(review_report["warnings"] if review_report else [])],
     }
     validate_payload(agent_run, "agent-run.schema.json")
     write_json_artifact("agent-run.json", agent_run)

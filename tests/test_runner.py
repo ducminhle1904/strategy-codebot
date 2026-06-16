@@ -23,6 +23,7 @@ def test_dry_run_creates_pine_artifacts(tmp_path: Path) -> None:
     assert (out_dir / "manual-tradingview-checklist.md").exists()
     assert load_json(out_dir / "validation-report.json")["platform"] == "pine_v6"
     assert load_json(out_dir / "agent-run.json")["status"] == "pass"
+    assert not (out_dir / "review-report.json").exists()
 
 
 def test_combined_target_creates_mql5_runner_design(tmp_path: Path) -> None:
@@ -52,6 +53,41 @@ def test_invalid_mode_does_not_create_output_directory(tmp_path: Path) -> None:
             prompt=None,
             mode="bad",
             out_dir=out_dir,
+            record_harness=False,
+        )
+
+    assert not out_dir.exists()
+
+
+def test_integrated_parallel_review_creates_review_artifact(tmp_path: Path) -> None:
+    out_dir = tmp_path / "review-run"
+
+    result = run_strategy(
+        spec_path=Path("examples/specs/ma-crossover-pine.json"),
+        prompt=None,
+        mode="dry-run",
+        out_dir=out_dir,
+        review="parallel",
+        record_harness=False,
+    )
+
+    agent_run = load_json(out_dir / "agent-run.json")
+    assert result["status"] == "pass"
+    assert load_json(out_dir / "review-report.json")["run_status"] == "completed"
+    assert "review-report.json" in agent_run["output_refs"]
+    assert "parallel-review" in agent_run["tool_calls"]
+
+
+def test_invalid_review_mode_does_not_create_output_directory(tmp_path: Path) -> None:
+    out_dir = tmp_path / "bad-review"
+
+    with pytest.raises(ValueError):
+        run_strategy(
+            spec_path=Path("examples/specs/ma-crossover-pine.json"),
+            prompt=None,
+            mode="dry-run",
+            out_dir=out_dir,
+            review="serial",
             record_harness=False,
         )
 

@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from jsonschema import ValidationError
 
-from strategy_codebot.schemas import load_strategy_spec, validate_payload
+from strategy_codebot.schemas import load_json, load_strategy_spec, validate_payload
 
 
 def test_strategy_spec_example_is_valid() -> None:
@@ -18,3 +18,8 @@ def test_strategy_spec_rejects_missing_required_fields() -> None:
     with pytest.raises(ValidationError):
         validate_payload({"target_platform": "pine_v6"}, "strategy-spec.schema.json")
 
+
+def test_review_report_schema_file_is_valid_json_schema() -> None:
+    schema = load_json(Path("schemas/review-report.schema.json"))
+
+    assert schema["title"] == "ReviewReport"

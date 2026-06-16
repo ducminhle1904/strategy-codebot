@@ -33,8 +33,21 @@
 | Knowledge source check | `uv run strategy-codebot knowledge check --offline --out reports/source-check.json` validates registry metadata | planned |
 | Harness trace wrapper | `uv run pytest tests/test_harness.py` verifies trace command construction without mutating harness state | planned |
 
+## Phase 2 Matrix
+
+| Artifact | Proof | Status |
+| --- | --- | --- |
+| Review report schema | `uv run pytest tests/test_review.py::test_review_report_schema_accepts_valid_report` validates `review-report.json` | planned |
+| Parallel dry-run reviewers | `uv run pytest tests/test_review.py::test_dry_run_parallel_review_returns_four_reviewers` verifies four reviewer roles | planned |
+| Reviewer failure isolation | `uv run pytest tests/test_review.py::test_reviewer_exception_yields_partial_report` verifies fail-soft behavior | planned |
+| Risk policy review | `uv run pytest tests/test_review.py::test_risk_reviewer_blocks_profit_and_live_trading_claims` verifies blocked claims | planned |
+| MQL5 boundary review | `uv run pytest tests/test_review.py::test_mql5_target_keeps_manual_required_boundary` verifies manual-required status | planned |
+| Review CLI | `uv run pytest tests/test_cli.py::test_cli_review_existing_run_writes_report` verifies standalone review command | planned |
+| Integrated review run | `uv run pytest tests/test_runner.py::test_integrated_parallel_review_creates_review_artifact` verifies `run --review parallel` | planned |
+
 ## Evidence Rules
 
 - Do not mark Pine strategy backtests as passed without TradingView evidence.
 - Do not mark MQL5 compile/test as passed without MetaEditor/MetaTrader evidence.
 - Do not treat multi-agent agreement as a substitute for deterministic validation.
+- Do not treat `review-report.json` as a replacement for `validation-report.json`.

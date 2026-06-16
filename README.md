@@ -2,7 +2,7 @@
 
 Harness-first AI agent scaffold for generating and reviewing trading strategy code for Pine Script v6 and MQL5.
 
-This repository is currently in **Phase 0: Design Scaffold**. It contains contracts, schemas, operating docs, and planning records. It does not yet include a runnable agent runtime, Pine compiler automation, MQL5 runner, broker integration, or live-trading automation.
+This repository is currently in **Phase 2: Multi-Agent Parallel Review**. It contains a CLI MVP for deterministic Pine generation, static validation, knowledge-source checks, and parallel review reports. It does not yet include Pine compiler automation, MQL5 compile/test automation, broker integration, or live-trading automation.
 
 ## Start Here
 
@@ -41,6 +41,22 @@ uv run --extra live strategy-codebot run --prompt "Create a Pine v6 moving avera
 ```
 
 When `scripts/bin/harness-cli` exists, `strategy-codebot run` records a local repository-harness trace by default. Use `--no-record-harness` for tests and disposable local runs.
+
+## Phase 2 Parallel Review
+
+Review an existing run with deterministic offline reviewers:
+
+```bash
+uv run strategy-codebot review --run-dir runs/example --mode dry-run --out runs/example/review-report.json --no-record-harness
+```
+
+Or create the review report during a run:
+
+```bash
+uv run strategy-codebot run --spec examples/specs/ma-crossover-pine.json --mode dry-run --out runs/phase2-example --review parallel --no-record-harness
+```
+
+Phase 2 reviewers run in parallel and write `review-report.json`. The report is critique evidence only; `validation-report.json` remains the deterministic validation artifact, and manual TradingView/MT5 proof is still required before claiming platform execution.
 
 ## Non-Goals
 

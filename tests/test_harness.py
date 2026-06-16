@@ -25,3 +25,18 @@ def test_harness_outcome_maps_validation_status() -> None:
     assert harness_outcome("pass") == "completed"
     assert harness_outcome("fail") == "failed"
     assert harness_outcome("manual_required") == "partial"
+
+
+def test_harness_trace_command_shape_for_review() -> None:
+    command = build_trace_command(
+        summary="Phase 2 parallel review test",
+        story=None,
+        agent="critic",
+        outcome="completed",
+        changed=["runs/test/review-report.json"],
+        notes="parallel-review",
+    )
+
+    assert "--agent" in command
+    assert "critic" in command
+    assert "runs/test/review-report.json" in ",".join(command)
