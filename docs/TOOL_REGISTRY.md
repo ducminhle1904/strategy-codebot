@@ -13,6 +13,7 @@ The tool registry records runtime tools that the CLI may call. Phase 3 introduce
 - `knowledge-diff`: compare two knowledge snapshots.
 - `knowledge-run-audit`: inspect validation, review, and runtime evidence from a run directory.
 - `knowledge-improvement-proposal`: produce proposal artifacts for human review.
+- `product-doctor`: inspect local product readiness for release and source installs.
 - `strategy-risk-review`: review strategy assumptions and safety boundaries.
 - `harness-trace`: record run evidence into the repository harness.
 
@@ -55,3 +56,7 @@ Knowledge tools produce local evidence artifacts:
 - `knowledge_proposal` writes `knowledge-proposal.schema.json` payloads.
 
 These tools may recommend doc updates, but they must not edit canonical docs. Generated snapshots and proposals are ignored by default unless copied into examples or fixtures intentionally.
+
+## Phase 5 Product Contract
+
+`doctor_check` records the product-readiness contract for source installs and GitHub artifact releases. It checks required files, schemas, source registry, tool registry, Python version, package import, and optional `repository-harness` CLI presence.

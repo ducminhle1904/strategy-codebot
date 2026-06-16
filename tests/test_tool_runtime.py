@@ -19,6 +19,7 @@ def test_tool_registry_contracts_are_valid() -> None:
         "knowledge_diff",
         "knowledge_audit",
         "knowledge_proposal",
+        "doctor_check",
         "record_harness_trace",
     }
     for tool in registry["tools"]:

@@ -47,3 +47,16 @@ Phase 4 knowledge proposals may reference:
 - run-level `validation-report.json`, `review-report.json`, `runtime-summary.json`, and runtime JSONL traces
 
 Knowledge proposals are evidence artifacts. They do not prove TradingView or MetaTrader execution, and they do not authorize automatic edits to canonical docs.
+
+## Productization Evidence
+
+Phase 5 release readiness evidence includes:
+
+- `reports/doctor.json`
+- `reports/tool-check.json`
+- `reports/source-check.json`
+- `runs/phase5-smoke/`
+- `dist/*.whl`
+- `dist/*.tar.gz`
+
+GitHub artifact builds are packaging evidence only. They do not imply live trading support, platform runtime validation, or PyPI publication.

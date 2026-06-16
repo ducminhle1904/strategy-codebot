@@ -5,7 +5,10 @@ from typing import Optional
 
 import typer
 
+from strategy_codebot import __version__
+from strategy_codebot.doctor import doctor_report
 from strategy_codebot.knowledge import audit_run, check_registry, create_proposal, create_snapshot, diff_snapshots
+from strategy_codebot.paths import repo_root
 from strategy_codebot.review import REVIEW_MODE_NONE, review_run_directory
 from strategy_codebot.runner import run_strategy, validate_pine_file
 from strategy_codebot.schemas import validate_payload, write_json
@@ -16,6 +19,30 @@ knowledge_app = typer.Typer(help="Knowledge source registry commands.")
 tools_app = typer.Typer(help="Runtime tool registry commands.")
 app.add_typer(knowledge_app, name="knowledge")
 app.add_typer(tools_app, name="tools")
+
+
+def _resolve_input_path(path: Path) -> Path:
+    if path.exists() or path.is_absolute():
+        return path
+    packaged_path = repo_root() / path
+    return packaged_path if packaged_path.exists() else path
+
+
+@app.command()
+def version() -> None:
+    typer.echo(__version__)
+
+
+@app.command()
+def doctor(
+    out: Optional[Path] = typer.Option(None, "--out", help="Optional doctor report JSON output path."),
+) -> None:
+    report = doctor_report()
+    if out:
+        write_json(out, report)
+    typer.echo(f"status={report['status']} version={report['environment']['package_version']} checks={len(report['checks'])}")
+    if report["status"] != "pass":
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -62,7 +89,7 @@ def knowledge_check(
     offline: bool = typer.Option(True, "--offline/--fetch", help="Only validate metadata and URL shape."),
     out: Path = typer.Option(Path("reports/source-check.json"), "--out", help="Report output path."),
 ) -> None:
-    report = check_registry(registry, offline=offline)
+    report = check_registry(_resolve_input_path(registry), offline=offline)
     validate_payload(report, "validation-report.schema.json")
     write_json(out, report)
     typer.echo(f"status={report['status']} out={out}")
@@ -74,7 +101,7 @@ def knowledge_snapshot(
     offline: bool = typer.Option(True, "--offline/--fetch", help="Use deterministic offline metadata instead of fetching external URLs."),
     out: Path = typer.Option(Path("knowledge/snapshots/current.json"), "--out", help="Snapshot output path."),
 ) -> None:
-    snapshot = create_snapshot(registry, offline=offline)
+    snapshot = create_snapshot(_resolve_input_path(registry), offline=offline)
     validate_payload(snapshot, "knowledge-snapshot.schema.json")
     write_json(out, snapshot)
     typer.echo(f"sources={len(snapshot['sources'])} fetch_mode={snapshot['fetch_mode']} out={out}")
@@ -119,7 +146,7 @@ def knowledge_propose(
 def tools_list(
     registry: Path = typer.Option(Path("configs/tool-registry.yaml"), "--registry", help="Tool registry YAML path."),
 ) -> None:
-    for tool_id in tool_ids(registry):
+    for tool_id in tool_ids(_resolve_input_path(registry)):
         typer.echo(tool_id)
 
 
@@ -128,7 +155,7 @@ def tools_check(
     registry: Path = typer.Option(Path("configs/tool-registry.yaml"), "--registry", help="Tool registry YAML path."),
     out: Path = typer.Option(Path("reports/tool-check.json"), "--out", help="Tool registry check output path."),
 ) -> None:
-    report = check_tool_registry(registry)
+    report = check_tool_registry(_resolve_input_path(registry))
     validate_payload(report, "validation-report.schema.json")
     write_json(out, report)
     typer.echo(f"status={report['status']} out={out}")

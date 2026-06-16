@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests
+        run: uv run pytest
+
+      - name: Compile Python
+        run: uv run python -m compileall src tests
+
+      - name: Parse JSON and YAML
+        run: |
+          uv run python - <<'PY'
+          import json
+          from pathlib import Path
+          import yaml
+
+          for path in Path("schemas").glob("*.json"):
+              json.loads(path.read_text(encoding="utf-8"))
+          yaml_paths = [
+              Path("configs/source-registry.yaml"),
+              Path("configs/tool-registry.yaml"),
+              Path("configs/model-registry.example.yaml"),
+              *Path(".github/workflows").glob("*.yml"),
+          ]
+          for path in yaml_paths:
+              yaml.safe_load(path.read_text(encoding="utf-8"))
+          PY
+
+      - name: Doctor
+        run: uv run strategy-codebot doctor --out reports/doctor.json
+
+      - name: Tool registry check
+        run: uv run strategy-codebot tools check --out reports/tool-check.json
+
+      - name: Knowledge source check
+        run: uv run strategy-codebot knowledge check --offline --out reports/source-check.json
+
+      - name: Dry-run smoke
+        run: uv run strategy-codebot run --spec examples/specs/ma-crossover-pine.json --mode dry-run --out runs/ci-smoke --review parallel --runtime-trace --policy observe --no-record-harness

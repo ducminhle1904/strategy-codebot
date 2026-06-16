@@ -87,6 +87,14 @@ tools:
     evidence_required:
       - knowledge/proposals/*.json
     phase_status: implemented
+  - id: doctor_check
+    capability: product-doctor
+    risk_tier: read
+    input_schema_ref: pyproject.toml
+    output_schema_ref: reports/doctor.json
+    evidence_required:
+      - reports/doctor.json
+    phase_status: implemented
   - id: record_harness_trace
     capability: harness-trace
     risk_tier: repo_write

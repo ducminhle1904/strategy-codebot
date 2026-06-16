@@ -1,9 +1,33 @@
 [project]
 name = "strategy-codebot"
 version = "0.1.0"
-description = "Harness-first CLI for trading strategy codebot MVP."
+description = "Harness-first CLI for generating, validating, reviewing, and improving trading strategy code artifacts."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Duc Minh Le" },
+]
+keywords = [
+  "ai-agent",
+  "trading",
+  "pine-script",
+  "mql5",
+  "cli",
+  "harness",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Code Generators",
+  "Topic :: Utilities",
+]
 dependencies = [
   "jsonschema>=4.22",
   "pydantic>=2.8",
@@ -26,6 +50,11 @@ live = [
 [project.scripts]
 strategy-codebot = "strategy_codebot.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/ducminhle1904/strategy-codebot"
+Repository = "https://github.com/ducminhle1904/strategy-codebot"
+Issues = "https://github.com/ducminhle1904/strategy-codebot/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -35,3 +64,16 @@ testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/strategy_codebot"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"CHANGELOG.md" = "CHANGELOG.md"
+"CONTRIBUTING.md" = "CONTRIBUTING.md"
+"LICENSE" = "LICENSE"
+"README.md" = "README.md"
+"SECURITY.md" = "SECURITY.md"
+".github/workflows" = ".github/workflows"
+"configs" = "configs"
+"docs" = "docs"
+"examples" = "examples"
+"pyproject.toml" = "pyproject.toml"
+"schemas" = "schemas"

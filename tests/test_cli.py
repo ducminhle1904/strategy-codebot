@@ -2,6 +2,8 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from strategy_codebot import __version__
+from strategy_codebot import cli as cli_module
 from strategy_codebot.cli import app
 from strategy_codebot.schemas import load_json
 
@@ -26,6 +28,46 @@ def run_cli_dry_run(out_dir: Path, *extra_args: str):
     )
     assert result.exit_code == 0, result.output
     return result
+
+
+def test_cli_version_prints_package_version() -> None:
+    result = runner.invoke(app, ["version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == __version__
+
+
+def test_cli_doctor_writes_report(tmp_path: Path) -> None:
+    out_path = tmp_path / "doctor.json"
+    result = runner.invoke(app, ["doctor", "--out", str(out_path)])
+
+    assert result.exit_code == 0, result.output
+    report = load_json(out_path)
+    assert report["status"] == "pass"
+    assert report["environment"]["package_version"] == __version__
+    assert any(check["name"] == "optional_harness_cli" for check in report["checks"])
+    if report["environment"]["harness_cli"]["status"] == "missing_optional":
+        assert report["warnings"]
+
+
+def test_cli_doctor_exits_nonzero_on_failed_report(monkeypatch, tmp_path: Path) -> None:
+    out_path = tmp_path / "doctor.json"
+
+    def failed_report():
+        return {
+            "status": "fail",
+            "checks": [{"name": "bad", "status": "fail", "details": "broken"}],
+            "warnings": [],
+            "next_actions": ["Fix failed doctor checks before release."],
+            "environment": {"package_version": __version__},
+        }
+
+    monkeypatch.setattr(cli_module, "doctor_report", failed_report)
+
+    result = runner.invoke(app, ["doctor", "--out", str(out_path)])
+
+    assert result.exit_code == 1
+    assert load_json(out_path)["status"] == "fail"
 
 
 def test_cli_run_dry_run_creates_artifacts(tmp_path: Path) -> None:
@@ -157,6 +199,20 @@ def test_cli_tools_list_and_check(tmp_path: Path) -> None:
     assert "load_strategy_spec" in list_result.output
     assert check_result.exit_code == 0, check_result.output
     assert load_json(out_path)["status"] == "pass"
+
+
+def test_cli_registry_defaults_work_outside_repo_cwd(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    tool_report = tmp_path / "tool-check.json"
+    source_report = tmp_path / "source-check.json"
+
+    tool_result = runner.invoke(app, ["tools", "check", "--out", str(tool_report)])
+    source_result = runner.invoke(app, ["knowledge", "check", "--offline", "--out", str(source_report)])
+
+    assert tool_result.exit_code == 0, tool_result.output
+    assert source_result.exit_code == 0, source_result.output
+    assert load_json(tool_report)["status"] == "pass"
+    assert load_json(source_report)["status"] == "pass"
 
 
 def test_cli_knowledge_check_writes_report(tmp_path: Path) -> None:

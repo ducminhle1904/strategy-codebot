@@ -2,7 +2,7 @@
 
 Harness-first AI agent scaffold for generating and reviewing trading strategy code for Pine Script v6 and MQL5.
 
-This repository is currently in **Phase 4: Self-Improving Knowledge**. It contains a CLI MVP for deterministic Pine generation, static validation, knowledge-source checks, parallel review reports, local runtime tool traces, and proposal-first knowledge improvement artifacts. It does not yet include Pine compiler automation, MQL5 compile/test automation, broker integration, live-trading automation, or automatic promotion of knowledge proposals into canonical docs.
+This repository is currently in **Phase 5: Productization**. It contains a CLI product for deterministic Pine generation, static validation, knowledge-source checks, parallel review reports, local runtime tool traces, proposal-first knowledge improvement artifacts, doctor checks, and GitHub artifact builds. It does not include Pine compiler automation, MQL5 compile/test automation, broker integration, live-trading automation, or automatic promotion of knowledge proposals into canonical docs.
 
 ## Start Here
 
@@ -12,6 +12,24 @@ This repository is currently in **Phase 4: Self-Improving Knowledge**. It contai
 - Architecture: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - Validation expectations: [docs/TEST_MATRIX.md](docs/TEST_MATRIX.md)
 - Strategy request schema: [schemas/strategy-spec.schema.json](schemas/strategy-spec.schema.json)
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+- Security policy: [SECURITY.md](SECURITY.md)
+
+## Install From Source
+
+```bash
+git clone https://github.com/ducminhle1904/strategy-codebot.git
+cd strategy-codebot
+uv sync
+uv run strategy-codebot version
+uv run strategy-codebot doctor
+```
+
+Build local release artifacts:
+
+```bash
+uv build --out-dir dist
+```
 
 ## Phase 0 Scope
 
@@ -87,6 +105,20 @@ uv run strategy-codebot knowledge propose --diff reports/knowledge-diff.json --a
 ```
 
 Phase 4 creates evidence and recommendations only. Generated snapshots and proposals are ignored by default, and commands must not edit canonical docs such as `docs/trading/*.md`.
+
+## Phase 5 Productization
+
+Check product readiness and build installable distributions:
+
+```bash
+uv run strategy-codebot version
+uv run strategy-codebot doctor --out reports/doctor.json
+uv run strategy-codebot tools check --out reports/tool-check.json
+uv run strategy-codebot knowledge check --offline --out reports/source-check.json
+uv build --out-dir dist
+```
+
+GitHub Actions runs CI on `main` and pull requests. The release-artifacts workflow runs on `workflow_dispatch` or `v*` tags and uploads `dist/*.whl` plus `dist/*.tar.gz` as GitHub artifacts. Phase 5 does not publish to PyPI.
 
 ## Non-Goals
 

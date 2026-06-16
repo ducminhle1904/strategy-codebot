@@ -78,6 +78,20 @@ flowchart TD
 
 The knowledge loop is proposal-first. It can detect stale or changed sources and recurring run evidence, but it does not edit canonical docs without a separate human-approved change.
 
+## Phase 5 Productization Flow
+
+```mermaid
+flowchart TD
+  C["CLI commands"] --> D["Doctor checks"]
+  C --> S["Dry-run smoke"]
+  D --> CI["GitHub Actions CI"]
+  S --> CI
+  CI --> B["uv build"]
+  B --> A["GitHub artifacts"]
+```
+
+Phase 5 hardens the CLI for source installs, repeatable checks, and GitHub artifact builds. It does not add API, web UI, PyPI publishing, or trading execution capability.
+
 ## Platform Boundary
 
 Pine Script and MQL5 are not interchangeable:

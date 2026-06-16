@@ -69,6 +69,17 @@
 | Knowledge CLI chain | `uv run pytest tests/test_cli.py::test_cli_knowledge_snapshot_diff_audit_and_propose` verifies snapshot, diff, audit, and propose commands | planned |
 | Tool registry extension | `uv run strategy-codebot tools check --out reports/tool-check.json` validates Phase 4 tool contracts | planned |
 
+## Phase 5 Matrix
+
+| Artifact | Proof | Status |
+| --- | --- | --- |
+| CLI version | `uv run pytest tests/test_cli.py::test_cli_version_prints_package_version` verifies version output | planned |
+| Doctor report | `uv run strategy-codebot doctor --out reports/doctor.json` writes product readiness checks | planned |
+| Package metadata | `uv run pytest tests/test_schema.py::test_package_metadata_is_product_ready` verifies license, authors, URLs, and classifiers | planned |
+| CI workflow | `.github/workflows/ci.yml` runs tests, compileall, parse checks, doctor, registry checks, and dry-run smoke | planned |
+| Release artifacts workflow | `.github/workflows/release-artifacts.yml` builds and uploads wheel plus sdist artifacts | planned |
+| Local package build | `uv build --out-dir dist` creates installable distributions | planned |
+
 ## Evidence Rules
 
 - Do not mark Pine strategy backtests as passed without TradingView evidence.
@@ -77,3 +88,4 @@
 - Do not treat `review-report.json` as a replacement for `validation-report.json`.
 - Do not treat runtime traces as TradingView or MetaTrader execution proof.
 - Do not auto-promote knowledge proposals into canonical docs without human review.
+- Do not treat GitHub artifacts as PyPI publication or trading-runtime proof.
