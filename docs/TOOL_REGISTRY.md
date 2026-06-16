@@ -1,6 +1,6 @@
 # Tool Registry
 
-The tool registry records optional capabilities that future agents may use. Missing tools should degrade cleanly instead of failing unrelated work.
+The tool registry records runtime tools that the CLI may call. Phase 3 keeps this registry machine-readable in `configs/tool-registry.yaml`.
 
 ## Capability Vocabulary
 
@@ -27,3 +27,16 @@ Future tool records should include:
 
 Phase 0 only documents capabilities. It does not require installed validators.
 
+## Phase 3 Contract Fields
+
+Each tool contract includes:
+
+- `id`
+- `capability`
+- `risk_tier`
+- `input_schema_ref`
+- `output_schema_ref`
+- `evidence_required`
+- `phase_status`
+
+The runtime harness records each tool invocation as ordered JSONL events. Missing future tools must degrade cleanly; implemented Phase 3 tools must pass `strategy-codebot tools check`.

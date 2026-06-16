@@ -14,12 +14,15 @@ import yaml
 from strategy_codebot.harness import build_trace_command, harness_outcome, record_trace, should_record_harness
 from strategy_codebot.paths import repo_root
 from strategy_codebot.schemas import load_json, validate_payload, write_json
+from strategy_codebot.tool_runtime import POLICY_MODES, POLICY_OBSERVE, ToolHarness, call_tool
 
 
 REVIEW_ROLES = ("trading_analyst", "pine_specialist", "risk_reviewer", "critic")
 REVIEW_MODE_NONE = "none"
 REVIEW_MODE_PARALLEL = "parallel"
 REVIEW_REPORT_PATH = "review-report.json"
+REVIEW_RUNTIME_TRACE_PATH = "review-runtime-trace.jsonl"
+REVIEW_RUNTIME_SUMMARY_PATH = "review-runtime-summary.json"
 REVIEW_STATUSES = {"pass", "fail", "manual_required", "skipped", "error"}
 FINDING_SEVERITIES = {"info", "warning", "blocker"}
 ReviewerFn = Callable[["ReviewContext"], dict[str, Any] | Awaitable[dict[str, Any]]]
@@ -42,7 +45,11 @@ def review_run_directory(
     mode: str,
     out_path: Path,
     record_harness: bool | None,
+    runtime_trace: bool = True,
+    policy: str = POLICY_OBSERVE,
 ) -> dict[str, Any]:
+    if policy not in POLICY_MODES:
+        raise ValueError("policy must be observe or enforce")
     spec = load_json(run_dir / "strategy-spec.json")
     validation = load_json(run_dir / "validation-report.json")
     return write_review_report(
@@ -54,6 +61,8 @@ def review_run_directory(
         mode=mode,
         out_path=out_path,
         record_harness=record_harness,
+        runtime_trace=runtime_trace,
+        policy=policy,
     )
 
 
@@ -67,16 +76,26 @@ def write_review_report(
     mode: str,
     out_path: Path,
     record_harness: bool | None,
+    runtime_trace: bool = True,
+    policy: str = POLICY_OBSERVE,
+    tool_harness: ToolHarness | None = None,
 ) -> dict[str, Any]:
-    report = asyncio.run(
-        run_parallel_review(
-            run_id=run_id,
-            spec=spec,
-            validation=validation,
-            pine_code=pine_code,
-            mql5_runner_design=mql5_runner_design,
-            mode=mode,
-        )
+    if policy not in POLICY_MODES:
+        raise ValueError("policy must be observe or enforce")
+    local_harness = tool_harness or (ToolHarness(run_id=run_id, policy_mode=policy) if runtime_trace else None)
+    report = call_tool(
+        local_harness,
+        "run_parallel_review",
+        _run_parallel_review_sync,
+        run_id,
+        spec,
+        validation,
+        pine_code,
+        mql5_runner_design,
+        mode,
+        input_refs=["strategy-spec.json", "validation-report.json"],
+        output_refs=[REVIEW_REPORT_PATH],
+        policy_text=json.dumps(spec, ensure_ascii=False),
     )
     validate_payload(report, "review-report.schema.json")
     write_json(out_path, report)
@@ -90,9 +109,39 @@ def write_review_report(
             changed=[str(out_path)],
             notes="strategy-codebot parallel review; deterministic validation remains the proof source",
         )
-        record_trace(command)
+        if local_harness:
+            call_tool(local_harness, "record_harness_trace", record_trace, command, input_refs=[REVIEW_REPORT_PATH], output_refs=["repository-harness trace"])
+        else:
+            record_trace(command)
+
+    if local_harness and tool_harness is None:
+        local_harness.write_trace(
+            out_path.parent / REVIEW_RUNTIME_TRACE_PATH,
+            out_path.parent / REVIEW_RUNTIME_SUMMARY_PATH,
+            [REVIEW_REPORT_PATH, REVIEW_RUNTIME_TRACE_PATH, REVIEW_RUNTIME_SUMMARY_PATH],
+        )
 
     return report
+
+
+def _run_parallel_review_sync(
+    run_id: str,
+    spec: dict[str, Any],
+    validation: dict[str, Any],
+    pine_code: str | None,
+    mql5_runner_design: str | None,
+    mode: str,
+) -> dict[str, Any]:
+    return asyncio.run(
+        run_parallel_review(
+            run_id=run_id,
+            spec=spec,
+            validation=validation,
+            pine_code=pine_code,
+            mql5_runner_design=mql5_runner_design,
+            mode=mode,
+        )
+    )
 
 
 async def run_parallel_review(

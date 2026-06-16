@@ -48,6 +48,21 @@ flowchart TD
 
 Parallel review is fail-soft: one reviewer error produces a partial review report instead of crashing the run. Review reports do not replace static validation or platform proof.
 
+## Phase 3 Tool Runtime Flow
+
+```mermaid
+flowchart TD
+  C["CLI command"] --> H["Python ToolHarness"]
+  H --> T["Contracted tool call"]
+  T --> E["runtime-trace.jsonl"]
+  T --> A["Generated artifacts"]
+  E --> S["runtime-summary.json"]
+  A --> R["agent-run / validation / review reports"]
+  R --> RH["repository-harness trace"]
+```
+
+The runtime harness is local and Python-native. It records ordered tool events and policy mode, while `repository-harness` remains the repo-level operating model.
+
 ## Platform Boundary
 
 Pine Script and MQL5 are not interchangeable:

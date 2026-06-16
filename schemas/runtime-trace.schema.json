@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/runtime-trace.schema.json",
+  "title": "RuntimeSummary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "created_at",
+    "policy_mode",
+    "trace_ref",
+    "event_count",
+    "completed_tools",
+    "failed_tools",
+    "blocked_tools",
+    "output_refs"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "policy_mode": {
+      "type": "string",
+      "enum": ["observe", "enforce"]
+    },
+    "trace_ref": { "type": "string", "minLength": 1 },
+    "event_count": { "type": "integer", "minimum": 0 },
+    "completed_tools": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "failed_tools": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "blocked_tools": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "output_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

@@ -23,6 +23,8 @@ def test_dry_run_creates_pine_artifacts(tmp_path: Path) -> None:
     assert (out_dir / "manual-tradingview-checklist.md").exists()
     assert load_json(out_dir / "validation-report.json")["platform"] == "pine_v6"
     assert load_json(out_dir / "agent-run.json")["status"] == "pass"
+    assert (out_dir / "runtime-trace.jsonl").exists()
+    assert load_json(out_dir / "runtime-summary.json")["policy_mode"] == "observe"
     assert not (out_dir / "review-report.json").exists()
 
 
@@ -59,6 +61,21 @@ def test_invalid_mode_does_not_create_output_directory(tmp_path: Path) -> None:
     assert not out_dir.exists()
 
 
+def test_missing_spec_does_not_create_output_directory(tmp_path: Path) -> None:
+    out_dir = tmp_path / "missing-spec"
+
+    with pytest.raises(FileNotFoundError):
+        run_strategy(
+            spec_path=tmp_path / "missing.json",
+            prompt=None,
+            mode="dry-run",
+            out_dir=out_dir,
+            record_harness=False,
+        )
+
+    assert not out_dir.exists()
+
+
 def test_integrated_parallel_review_creates_review_artifact(tmp_path: Path) -> None:
     out_dir = tmp_path / "review-run"
 
@@ -75,7 +92,43 @@ def test_integrated_parallel_review_creates_review_artifact(tmp_path: Path) -> N
     assert result["status"] == "pass"
     assert load_json(out_dir / "review-report.json")["run_status"] == "completed"
     assert "review-report.json" in agent_run["output_refs"]
+    assert "runtime-trace.jsonl" in agent_run["output_refs"]
     assert "parallel-review" in agent_run["tool_calls"]
+
+
+def test_no_runtime_trace_preserves_phase_2_artifact_shape(tmp_path: Path) -> None:
+    out_dir = tmp_path / "no-runtime-trace"
+
+    run_strategy(
+        spec_path=Path("examples/specs/ma-crossover-pine.json"),
+        prompt=None,
+        mode="dry-run",
+        out_dir=out_dir,
+        review="parallel",
+        runtime_trace=False,
+        record_harness=False,
+    )
+
+    agent_run = load_json(out_dir / "agent-run.json")
+    assert not (out_dir / "runtime-trace.jsonl").exists()
+    assert not (out_dir / "runtime-summary.json").exists()
+    assert "runtime-trace.jsonl" not in agent_run["output_refs"]
+
+
+def test_enforce_policy_allows_negative_live_trading_constraints(tmp_path: Path) -> None:
+    out_dir = tmp_path / "enforce-run"
+
+    result = run_strategy(
+        spec_path=Path("examples/specs/ma-crossover-pine.json"),
+        prompt=None,
+        mode="dry-run",
+        out_dir=out_dir,
+        policy="enforce",
+        record_harness=False,
+    )
+
+    assert result["status"] == "pass"
+    assert load_json(out_dir / "runtime-summary.json")["policy_mode"] == "enforce"
 
 
 def test_invalid_review_mode_does_not_create_output_directory(tmp_path: Path) -> None:

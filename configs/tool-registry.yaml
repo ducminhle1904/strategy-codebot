@@ -1,0 +1,65 @@
+tools:
+  - id: load_strategy_spec
+    capability: strategy-spec-load
+    risk_tier: read
+    input_schema_ref: schemas/strategy-spec.schema.json
+    output_schema_ref: schemas/strategy-spec.schema.json
+    evidence_required:
+      - strategy-spec.json
+    phase_status: implemented
+  - id: generate_pine
+    capability: pine-code-generation
+    risk_tier: code_generation
+    input_schema_ref: schemas/strategy-spec.schema.json
+    output_schema_ref: pine/strategy.pine
+    evidence_required:
+      - pine/strategy.pine
+    phase_status: implemented
+  - id: validate_pine_static
+    capability: pine-static-validation
+    risk_tier: validation
+    input_schema_ref: pine/strategy.pine
+    output_schema_ref: schemas/validation-report.schema.json
+    evidence_required:
+      - validation-report.json
+    phase_status: implemented
+  - id: write_manual_checklist
+    capability: pine-manual-checklist
+    risk_tier: documentation
+    input_schema_ref: schemas/strategy-spec.schema.json
+    output_schema_ref: manual-tradingview-checklist.md
+    evidence_required:
+      - manual-tradingview-checklist.md
+    phase_status: implemented
+  - id: create_mql5_runner_design
+    capability: mql5-runner-design
+    risk_tier: documentation
+    input_schema_ref: schemas/strategy-spec.schema.json
+    output_schema_ref: mql5/runner-design.md
+    evidence_required:
+      - mql5/runner-design.md
+    phase_status: implemented
+  - id: run_parallel_review
+    capability: strategy-risk-review
+    risk_tier: review
+    input_schema_ref: schemas/review-report.schema.json
+    output_schema_ref: schemas/review-report.schema.json
+    evidence_required:
+      - review-report.json
+    phase_status: implemented
+  - id: knowledge_registry_check
+    capability: knowledge-refresh
+    risk_tier: read
+    input_schema_ref: configs/source-registry.yaml
+    output_schema_ref: schemas/validation-report.schema.json
+    evidence_required:
+      - source-check.json
+    phase_status: implemented
+  - id: record_harness_trace
+    capability: harness-trace
+    risk_tier: repo_write
+    input_schema_ref: docs/TRACE_SPEC.md
+    output_schema_ref: harness.db
+    evidence_required:
+      - repository-harness trace
+    phase_status: implemented

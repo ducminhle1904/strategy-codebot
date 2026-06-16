@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/tool-event.schema.json",
+  "title": "ToolEvent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sequence", "created_at", "run_id", "event_type", "tool_id", "policy_mode", "risk_tier"],
+  "properties": {
+    "sequence": { "type": "integer", "minimum": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "event_type": {
+      "type": "string",
+      "enum": ["tool.started", "tool.completed", "tool.failed", "tool.blocked"]
+    },
+    "tool_id": { "type": "string", "minLength": 1 },
+    "policy_mode": {
+      "type": "string",
+      "enum": ["observe", "enforce"]
+    },
+    "risk_tier": { "type": "string", "minLength": 1 },
+    "input_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "output_refs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

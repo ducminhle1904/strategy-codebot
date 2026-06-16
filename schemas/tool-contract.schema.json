@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/tool-contract.schema.json",
+  "title": "ToolContract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "capability",
+    "risk_tier",
+    "input_schema_ref",
+    "output_schema_ref",
+    "evidence_required",
+    "phase_status"
+  ],
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "capability": { "type": "string", "minLength": 1 },
+    "risk_tier": {
+      "type": "string",
+      "enum": ["read", "documentation", "code_generation", "validation", "review", "repo_write", "broker_write", "destructive"]
+    },
+    "input_schema_ref": { "type": "string", "minLength": 1 },
+    "output_schema_ref": { "type": "string", "minLength": 1 },
+    "evidence_required": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "phase_status": {
+      "type": "string",
+      "enum": ["implemented", "planned", "manual_required", "skipped"]
+    }
+  }
+}

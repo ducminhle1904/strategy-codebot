@@ -45,9 +45,22 @@
 | Review CLI | `uv run pytest tests/test_cli.py::test_cli_review_existing_run_writes_report` verifies standalone review command | planned |
 | Integrated review run | `uv run pytest tests/test_runner.py::test_integrated_parallel_review_creates_review_artifact` verifies `run --review parallel` | planned |
 
+## Phase 3 Matrix
+
+| Artifact | Proof | Status |
+| --- | --- | --- |
+| Tool registry | `uv run strategy-codebot tools check --out reports/tool-check.json` validates tool contracts | planned |
+| Tool contract schema | `uv run pytest tests/test_tool_runtime.py::test_tool_registry_contracts_are_valid` validates each registry entry | planned |
+| Runtime event trace | `uv run pytest tests/test_tool_runtime.py::test_runtime_trace_jsonl_and_summary_validate` validates JSONL events and summary | planned |
+| Runtime policy blocking | `uv run pytest tests/test_tool_runtime.py::test_tool_harness_enforce_blocks_prohibited_risk_tier` verifies enforce-mode block events | planned |
+| Runtime run artifacts | `uv run pytest tests/test_runner.py::test_dry_run_creates_pine_artifacts` verifies trace and summary files | planned |
+| Runtime trace opt-out | `uv run pytest tests/test_runner.py::test_no_runtime_trace_preserves_phase_2_artifact_shape` verifies `--no-runtime-trace` behavior | planned |
+| Standalone review trace | `uv run pytest tests/test_cli.py::test_cli_review_does_not_overwrite_run_runtime_trace` verifies review trace isolation | planned |
+
 ## Evidence Rules
 
 - Do not mark Pine strategy backtests as passed without TradingView evidence.
 - Do not mark MQL5 compile/test as passed without MetaEditor/MetaTrader evidence.
 - Do not treat multi-agent agreement as a substitute for deterministic validation.
 - Do not treat `review-report.json` as a replacement for `validation-report.json`.
+- Do not treat runtime traces as TradingView or MetaTrader execution proof.
