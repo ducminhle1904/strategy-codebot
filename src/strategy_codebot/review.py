@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import inspect
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Awaitable, Callable
 
 import yaml
 
-from strategy_codebot.harness import build_trace_command, harness_outcome, record_trace, should_record_harness
-from strategy_codebot.paths import repo_root
+from strategy_codebot.harness import NO_ERROR_TRACE_ARG, build_trace_command, harness_outcome, record_trace, record_trace_intake, should_record_harness
+from strategy_codebot.live import (
+    STAGE_BALANCED_REVIEW,
+    STAGE_PINE_CODE_GENERATION,
+    STAGE_STRATEGY_REASONING,
+    LiveRunOptions,
+    _models_for_stage,
+)
+from strategy_codebot.paths import repo_root, resolve_repo_path
 from strategy_codebot.schemas import load_json, validate_payload, write_json
 from strategy_codebot.tool_runtime import POLICY_MODES, POLICY_OBSERVE, ToolHarness, call_tool
 
@@ -37,6 +48,7 @@ class ReviewContext:
     mql5_runner_design: str | None
     mode: str
     model_registry: dict[str, Any]
+    live_options: LiveRunOptions | None = None
 
 
 def review_run_directory(
@@ -79,7 +91,11 @@ def write_review_report(
     runtime_trace: bool = True,
     policy: str = POLICY_OBSERVE,
     tool_harness: ToolHarness | None = None,
+    model_registry: Path | None = None,
+    live_options: LiveRunOptions | None = None,
+    intake_id: int | None = None,
 ) -> dict[str, Any]:
+    started_at = perf_counter()
     if policy not in POLICY_MODES:
         raise ValueError("policy must be observe or enforce")
     local_harness = tool_harness or (ToolHarness(run_id=run_id, policy_mode=policy) if runtime_trace else None)
@@ -93,6 +109,8 @@ def write_review_report(
         pine_code,
         mql5_runner_design,
         mode,
+        model_registry,
+        live_options,
         input_refs=["strategy-spec.json", "validation-report.json"],
         output_refs=[REVIEW_REPORT_PATH],
         policy_text=json.dumps(spec, ensure_ascii=False),
@@ -100,14 +118,42 @@ def write_review_report(
     validate_payload(report, "review-report.schema.json")
     write_json(out_path, report)
 
-    if should_record_harness(record_harness):
+    repository_trace_enabled = should_record_harness(record_harness)
+    if repository_trace_enabled and intake_id is None:
+        intake_id = record_trace_intake(
+            summary=f"Parallel review {report['run_id']}",
+            input_type="maintenance request",
+            docs=_review_trace_reads(local_harness, model_registry),
+            notes="auto-created for strategy-codebot parallel review trace",
+        )
+
+    if repository_trace_enabled:
         command = build_trace_command(
             summary=f"Phase 2 parallel review {report['run_id']}",
+            intake=intake_id,
             story=None,
             agent="critic",
             outcome=harness_outcome(_decision_as_validation_status(report["decision"])),
             changed=[str(out_path)],
-            notes="strategy-codebot parallel review; deterministic validation remains the proof source",
+            actions=_review_trace_actions(local_harness),
+            read=_review_trace_reads(local_harness, model_registry),
+            errors=_review_trace_errors(local_harness),
+            friction=_review_trace_friction(local_harness),
+            duration=max(0, int(perf_counter() - started_at)),
+            tokens=0,
+            decisions=_review_trace_decisions(
+                mode=mode,
+                spec=spec,
+                validation=validation,
+                report=report,
+                policy=policy,
+                runtime_trace=runtime_trace,
+                live_options=live_options,
+            ),
+            notes=(
+                "strategy-codebot parallel review; deterministic validation remains the proof source; "
+                f"validation_status={validation['status']}; review_decision={report['decision']}"
+            ),
         )
         if local_harness:
             call_tool(local_harness, "record_harness_trace", record_trace, command, input_refs=[REVIEW_REPORT_PATH], output_refs=["repository-harness trace"])
@@ -124,6 +170,87 @@ def write_review_report(
     return report
 
 
+def _review_trace_actions(tool_harness: ToolHarness | None) -> list[str]:
+    if tool_harness is None:
+        return ["runtime_trace_disabled"]
+    actions: list[str] = []
+    for event in tool_harness.events:
+        tool_id = event.get("tool_id")
+        if not tool_id or tool_id == "record_harness_trace":
+            continue
+        if event.get("event_type") in {"tool.completed", "tool.failed", "tool.blocked"}:
+            actions.append(f"{tool_id}:{event.get('status', 'unknown')}")
+    return actions or ["parallel_review_recorded"]
+
+
+def _review_trace_reads(tool_harness: ToolHarness | None, model_registry: Path | None) -> list[str]:
+    reads = ["strategy-spec.json", "validation-report.json"]
+    if model_registry:
+        _append_unique(reads, model_registry)
+    if tool_harness:
+        for event in tool_harness.events:
+            for ref in event.get("input_refs", []):
+                _append_unique(reads, ref)
+    return reads
+
+
+def _review_trace_errors(tool_harness: ToolHarness | None) -> str:
+    if tool_harness is None:
+        return NO_ERROR_TRACE_ARG
+    errors = []
+    for event in _review_error_events(tool_harness):
+        errors.append(
+            {
+                "tool_id": event.get("tool_id"),
+                "event_type": event.get("event_type"),
+                "status": event.get("status"),
+                "failure_class": event.get("failure_class"),
+                "error": event.get("error"),
+            }
+        )
+    return json.dumps(errors, ensure_ascii=False)
+
+
+def _review_trace_friction(tool_harness: ToolHarness | None) -> str:
+    if tool_harness is None:
+        return "runtime trace disabled"
+    return "runtime tool failures or policy blocks recorded" if _review_error_events(tool_harness) else "none"
+
+
+def _review_trace_decisions(
+    *,
+    mode: str,
+    spec: dict[str, Any],
+    validation: dict[str, Any],
+    report: dict[str, Any],
+    policy: str,
+    runtime_trace: bool,
+    live_options: LiveRunOptions | None,
+) -> list[str]:
+    decisions = [
+        f"mode={mode}",
+        f"target_platform={spec['target_platform']}",
+        "review=parallel",
+        f"policy={policy}",
+        f"runtime_trace={str(runtime_trace).lower()}",
+        f"validation_status={validation['status']}",
+        f"review_decision={report['decision']}",
+    ]
+    if live_options:
+        decisions.extend([f"workflow={live_options.workflow}", f"cost_profile={live_options.cost_profile}"])
+    return decisions
+
+
+def _review_error_events(tool_harness: ToolHarness) -> list[dict[str, Any]]:
+    return [event for event in tool_harness.events if event.get("event_type") in {"tool.failed", "tool.blocked"}]
+
+
+def _append_unique(items: list[str], value: Any) -> None:
+    text = str(value)
+    if text and text not in items:
+        items.append(text)
+
+
 def _run_parallel_review_sync(
     run_id: str,
     spec: dict[str, Any],
@@ -131,6 +258,8 @@ def _run_parallel_review_sync(
     pine_code: str | None,
     mql5_runner_design: str | None,
     mode: str,
+    model_registry: Path | None = None,
+    live_options: LiveRunOptions | None = None,
 ) -> dict[str, Any]:
     return asyncio.run(
         run_parallel_review(
@@ -140,6 +269,8 @@ def _run_parallel_review_sync(
             pine_code=pine_code,
             mql5_runner_design=mql5_runner_design,
             mode=mode,
+            model_registry=model_registry,
+            live_options=live_options,
         )
     )
 
@@ -152,12 +283,14 @@ async def run_parallel_review(
     pine_code: str | None,
     mql5_runner_design: str | None,
     mode: str,
+    model_registry: Path | None = None,
+    live_options: LiveRunOptions | None = None,
     reviewer_functions: dict[str, ReviewerFn] | None = None,
 ) -> dict[str, Any]:
     if mode not in {"dry-run", "live"}:
         raise ValueError("mode must be dry-run or live")
 
-    registry = _load_model_registry() if mode == "live" else {}
+    registry = _load_model_registry(model_registry) if mode == "live" else {}
     context = ReviewContext(
         run_id=run_id,
         spec=spec,
@@ -166,6 +299,7 @@ async def run_parallel_review(
         mql5_runner_design=mql5_runner_design,
         mode=mode,
         model_registry=registry,
+        live_options=live_options,
     )
     functions = _dry_run_reviewers() if mode == "dry-run" else _live_reviewers()
     if reviewer_functions:
@@ -196,15 +330,41 @@ async def _run_reviewer(role: str, reviewer: ReviewerFn, context: ReviewContext)
 
 
 def _normalize_reviewer_result(role: str, result: dict[str, Any]) -> dict[str, Any]:
-    return {
+    status = str(result.get("status") or "pass")
+    status = {
+        "approve": "pass",
+        "approved": "pass",
+        "accepted": "pass",
+        "changes_requested": "fail",
+        "needs_changes": "fail",
+    }.get(status, status)
+    normalized = {
         "role": role,
         "provider": result.get("provider") or "dry-run",
         "model": result.get("model") or "deterministic-reviewer",
-        "status": result.get("status") or "pass",
-        "findings": result.get("findings", []),
+        "status": status,
+        "findings": _normalize_findings(result.get("findings", [])),
         "evidence_refs": result.get("evidence_refs", []),
         "warnings": result.get("warnings", []),
     }
+    if result.get("provider_warnings"):
+        normalized["provider_warnings"] = result["provider_warnings"]
+    return normalized
+
+
+def _normalize_findings(findings: Any) -> Any:
+    if not isinstance(findings, list):
+        return findings
+    normalized: list[Any] = []
+    for finding in findings:
+        if isinstance(finding, dict):
+            item = dict(finding)
+            if item.get("recommendation") is None:
+                item.pop("recommendation", None)
+            normalized.append(item)
+        else:
+            normalized.append(finding)
+    return normalized
 
 
 def _validate_reviewer_result(result: dict[str, Any]) -> None:
@@ -391,8 +551,7 @@ def _run_live_reviewer(role: str, context: ReviewContext) -> dict[str, Any]:
     except ImportError as exc:
         raise RuntimeError("Live review requires optional live dependencies. Run with `uv run --extra live strategy-codebot ...`.") from exc
 
-    agent_config = context.model_registry["agents"][role]
-    model = agent_config["primary"]
+    model = _review_model(role, context)
     prompt = {
         "role": role,
         "strategy_spec": context.spec,
@@ -400,9 +559,9 @@ def _run_live_reviewer(role: str, context: ReviewContext) -> dict[str, Any]:
         "has_pine_code": context.pine_code is not None,
         "has_mql5_runner_design": context.mql5_runner_design is not None,
     }
-    response = litellm.completion(
-        model=model,
-        messages=[
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": [
             {
                 "role": "system",
                 "content": (
@@ -413,12 +572,89 @@ def _run_live_reviewer(role: str, context: ReviewContext) -> dict[str, Any]:
             },
             {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
         ],
-        temperature=context.model_registry.get("defaults", {}).get("temperature", 0.2),
-    )
+        "temperature": context.model_registry.get("defaults", {}).get("temperature", 0.2),
+        "response_format": _reviewer_response_format(),
+    }
+    if model.startswith("openrouter/") and os.getenv("OPENROUTER_API_BASE"):
+        kwargs["base_url"] = os.getenv("OPENROUTER_API_BASE")
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+        response = litellm.completion(**kwargs)
     payload = json.loads(response.choices[0].message.content)
-    payload["provider"] = "litellm"
+    provider_warnings = _captured_provider_warnings(stdout_buffer.getvalue(), stderr_buffer.getvalue())
+    if provider_warnings:
+        payload["provider_warnings"] = provider_warnings
+    payload["provider"] = model.split("/", 1)[0] if "/" in model else "litellm"
     payload["model"] = model
     return payload
+
+
+def _captured_provider_warnings(stdout_text: str, stderr_text: str) -> list[str]:
+    warnings = []
+    for label, text in (("stdout", stdout_text), ("stderr", stderr_text)):
+        normalized = text.strip()
+        if normalized:
+            warnings.append(f"provider {label}: {normalized}")
+    return warnings
+
+
+def _review_model(role: str, context: ReviewContext) -> str:
+    options = context.live_options
+    if options:
+        stage = _review_stage(role)
+        return _models_for_stage(
+            context.model_registry,
+            stage,
+            model_stage_overrides=options.model_stage_overrides,
+            cost_profile=options.cost_profile,
+        )[0]
+    agent_config = context.model_registry["agents"][role]
+    return agent_config["primary"]
+
+
+def _review_stage(role: str) -> str:
+    if role == "trading_analyst":
+        return STAGE_STRATEGY_REASONING
+    if role == "pine_specialist":
+        return STAGE_PINE_CODE_GENERATION
+    return STAGE_BALANCED_REVIEW
+
+
+def _reviewer_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "strategy_codebot_reviewer_result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "status": {"type": "string", "enum": ["pass", "fail", "manual_required", "skipped", "error", "approve", "approved", "changes_requested"]},
+                    "findings": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "reviewer": {"type": "string"},
+                                "severity": {"type": "string", "enum": ["info", "warning", "blocker"]},
+                                "category": {"type": "string"},
+                                "message": {"type": "string"},
+                                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                                "recommendation": {"type": ["string", "null"]},
+                            },
+                            "required": ["reviewer", "severity", "category", "message", "evidence_refs", "recommendation"],
+                        },
+                    },
+                    "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                    "warnings": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["status", "findings", "evidence_refs", "warnings"],
+            },
+        },
+    }
 
 
 def _skipped_reviewer(role: str) -> ReviewerFn:
@@ -524,7 +760,7 @@ def _decision_as_validation_status(decision: str) -> str:
 
 
 def _blocked_risk_claims(text: str) -> list[str]:
-    blocked_terms = ("guaranteed profit", "guaranteed returns", "risk-free", "live trading", "broker integration", "autonomous live")
+    blocked_terms = ("guarantee profit", "guarantee returns", "guarantees profit", "guarantees returns", "guaranteed profit", "guaranteed returns", "risk-free", "cannot lose money", "live ready", "live-ready", "live immediately", "broker deployment", "broker integration", "autonomous live")
     blockers: list[str] = []
     for term in blocked_terms:
         for match in re.finditer(re.escape(term), text):
@@ -543,5 +779,6 @@ def _read_optional_text(path: Path) -> str | None:
         return None
 
 
-def _load_model_registry() -> dict[str, Any]:
-    return yaml.safe_load((repo_root() / "configs" / "model-registry.example.yaml").read_text(encoding="utf-8"))
+def _load_model_registry(path: Path | None = None) -> dict[str, Any]:
+    registry_path = resolve_repo_path(path or repo_root() / "configs" / "model-registry.example.yaml")
+    return yaml.safe_load(registry_path.read_text(encoding="utf-8"))

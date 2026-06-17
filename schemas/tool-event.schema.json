@@ -4,14 +4,65 @@
   "title": "ToolEvent",
   "type": "object",
   "additionalProperties": false,
-  "required": ["sequence", "created_at", "run_id", "event_type", "tool_id", "policy_mode", "risk_tier"],
+  "required": ["sequence", "created_at", "run_id", "event_type", "policy_mode"],
   "properties": {
     "sequence": { "type": "integer", "minimum": 1 },
+    "event_id": { "type": "string" },
     "created_at": { "type": "string", "format": "date-time" },
     "run_id": { "type": "string", "minLength": 1 },
     "event_type": {
       "type": "string",
-      "enum": ["tool.started", "tool.completed", "tool.failed", "tool.blocked"]
+      "enum": [
+        "agent.started",
+        "agent.handoff",
+        "llm.started",
+        "llm.completed",
+        "tool.started",
+        "tool.completed",
+        "tool.failed",
+        "tool.blocked",
+        "guardrail.blocked",
+        "repair.started",
+        "repair.completed",
+        "agent.completed"
+      ]
+    },
+    "case_id": { "type": "string" },
+    "workflow": { "type": "string" },
+    "cost_profile": { "type": "string" },
+    "stage": { "type": "string" },
+    "agent_role": { "type": "string" },
+    "model": { "type": "string" },
+    "provider": { "type": "string" },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "parent_event_id": { "type": "string" },
+    "latency_ms": { "type": "integer", "minimum": 0 },
+    "usage": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "status": {
+      "type": "string",
+      "enum": ["started", "pass", "fail", "blocked", "skipped"]
+    },
+    "failure_class": {
+      "type": "string",
+      "enum": [
+        "missing_credential",
+        "provider_rate_limited",
+        "provider_timeout",
+        "provider_not_found",
+        "malformed_response",
+        "schema_invalid",
+        "policy_violation",
+        "static_validation_failed",
+        "review_failed",
+        "review_validation_disagreement",
+        "artifact_missing",
+        "tool_error",
+        "provider_error",
+        "unknown"
+      ]
     },
     "tool_id": { "type": "string", "minLength": 1 },
     "policy_mode": {

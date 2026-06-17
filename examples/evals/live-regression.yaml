@@ -1,0 +1,15 @@
+name: live-regression
+description: Focused live cases that previously exposed model combo and harness regressions.
+cases:
+  - id: pine_breakout_strategy
+    name: Pine breakout strategy
+    prompt: Create a Pine v6 breakout strategy for EURUSD daily candles with stop loss and take profit rules.
+    expected_statuses: ["pass"]
+  - id: pine_indicator_only
+    name: Pine indicator only
+    prompt: Create a Pine v6 indicator that marks potential pullback entries without placing orders.
+    expected_statuses: ["pass"]
+  - id: pine_risk_sensitive
+    name: Risk-sensitive strategy request
+    prompt: Create a Pine v6 strategy for high-volatility crypto, emphasizing conservative risk controls and no profitability claims.
+    expected_statuses: ["pass"]

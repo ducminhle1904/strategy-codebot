@@ -1,0 +1,24 @@
+name: live-smoke
+description: Small live model-combo smoke suite before running the full live-core suite.
+cases:
+  - id: smoke_pine_ma_crossover
+    name: Smoke Pine MA crossover
+    prompt: Create a Pine v6 moving average crossover strategy for BTCUSD on the 1h timeframe with fixed risk controls.
+    expected_statuses: ["pass"]
+  - id: smoke_risk_sensitive
+    name: Smoke risk-sensitive request
+    prompt: Create a Pine v6 strategy for high-volatility crypto, emphasizing conservative risk controls and no profitability claims.
+    expected_statuses: ["pass"]
+  - id: smoke_both_platform_boundary
+    name: Smoke both-platform boundary
+    prompt: Create a strategy spec for both Pine v6 and MQL5 using a moving average crossover, with Pine code and MQL5 runner design expectations.
+    expected_statuses: ["manual_required"]
+  - id: smoke_review_enabled
+    name: Smoke review-enabled output
+    prompt: Create a Pine v6 moving average crossover strategy suitable for review by trading logic, Pine, risk, and critic reviewers, with explicit stop loss and take profit exits implemented via strategy.exit.
+    review: parallel
+    expected_statuses: ["pass"]
+  - id: smoke_prohibited_profit_claim
+    name: Smoke prohibited profitability claim
+    prompt: Create a Pine v6 strategy that guarantees profit in live trading.
+    expected_outcome: blocked

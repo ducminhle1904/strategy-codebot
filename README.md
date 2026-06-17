@@ -52,11 +52,39 @@ uv run strategy-codebot validate-pine --file runs/example/pine/strategy.pine --s
 uv run strategy-codebot knowledge check --offline --out reports/source-check.json
 ```
 
-Dry-run mode does not require API keys. Live mode uses LiteLLM-compatible provider configuration from `configs/model-registry.example.yaml`, reads provider credentials from the environment, and should be run with the live extra:
+Dry-run mode does not require API keys. Live mode uses a multi-model LiteLLM workflow by default, reads provider credentials from the environment, requests strict JSON Schema output at each stage, and should be run with the live extra:
 
 ```bash
-uv run --extra live strategy-codebot run --prompt "Create a Pine v6 moving average crossover strategy" --mode live --out runs/live-example
+export OPENAI_API_KEY=...
+uv run --extra live strategy-codebot run --prompt "Create a Pine v6 moving average crossover strategy" --mode live --out runs/live-example --policy enforce --save-raw-provider
+uv run --extra live strategy-codebot eval live --suite examples/evals/live-core.yaml --out runs/evals/live-openai --policy enforce --save-raw-provider
 ```
+
+The live workflow stages are `strategy_reasoning`, `strategy_coding`, `pine_code_generation`, `balanced_review`, and `repair`. Use `--model-stage stage=model` to override one stage. Use `--workflow single --model ...` only for single-model debugging. Live runs inject curated local trading/Pine/risk knowledge by default and write `knowledge-context.json`; use `--knowledge-context off` for prompt-only debugging. Live eval runs default to `--concurrency 2` and are capped at `8`; lower this to `--concurrency 1` when testing rate-limit-sensitive provider keys. Each live eval case has a hard timeout via `--case-timeout-seconds` so stalled provider calls still produce failure artifacts.
+
+OpenRouter is also supported for cheap profile runs and explicit stage overrides:
+
+```bash
+export OPENROUTER_API_KEY=...
+uv run --extra live strategy-codebot run --prompt "Create a Pine v6 moving average crossover strategy" --mode live --cost-profile cheap --out runs/live-openrouter-cheap --policy enforce
+uv run --extra live strategy-codebot run --prompt "Create a Pine v6 moving average crossover strategy" --mode live --model-stage pine_code_generation=openrouter/moonshotai/kimi-k2.5 --out runs/live-openrouter-stage --policy enforce
+```
+
+Use the model-combo matrix before changing cheap-profile defaults. It runs a small smoke suite first; add `--run-full` only when you want full `live-core` gating for combos that passed smoke:
+
+```bash
+uv run --extra live strategy-codebot eval matrix --out runs/evals/model-matrix --policy enforce --concurrency 1
+uv run --extra live strategy-codebot eval matrix --out runs/evals/model-matrix-full --policy enforce --concurrency 1 --run-full
+uv run --extra live strategy-codebot eval matrix --combo baseline_gemini_all --combo hybrid_gemini_reasoning_review --out runs/evals/model-matrix-subset --policy enforce --concurrency 1
+```
+
+The matrix report is written to `model-matrix-report.json`; stage/model health is written to `model-health.json`. A combo is accepted only when it clears pass-rate, static validation, deterministic quality, knowledge-context, repair-count, blocking-failure, timeout/stall, and artifact-completeness gates. Live runs also write `quality-report.json` with deterministic trading-quality findings; blockers fail the production gate while warnings remain observability signals. `quality_profile` is skipped unless one of the configured provider credentials is present.
+
+Cheap-quality model mappings are recorded in `configs/model-registry.example.yaml`. Useful overrides:
+
+| Provider | Strategy reasoning | Pine/code probe | Long-context worker |
+| --- | --- | --- | --- |
+| OpenRouter | `openrouter/moonshotai/kimi-k2.5` | `openrouter/moonshotai/kimi-k2.5` | `openrouter/minimax/minimax-m3` |
 
 When `scripts/bin/harness-cli` exists, `strategy-codebot run` records a local repository-harness trace by default. Use `--no-record-harness` for tests and disposable local runs.
 
@@ -92,6 +120,15 @@ uv run strategy-codebot run --spec examples/specs/ma-crossover-pine.json --mode 
 ```
 
 Phase 3 writes `runtime-trace.jsonl` and `runtime-summary.json` by default for `run`. Standalone `review` writes `review-runtime-trace.jsonl` and `review-runtime-summary.json` so it does not overwrite the original run trace. Runtime traces explain ordered tool calls; repository-level planning and durable evidence remain in `repository-harness`.
+
+Inspect a completed run and export vendor-neutral local telemetry:
+
+```bash
+uv run strategy-codebot harness inspect --run-dir runs/phase3-example --out runs/phase3-example/agent-harness-report.json
+uv run strategy-codebot run --spec examples/specs/ma-crossover-pine.json --mode dry-run --out runs/otel-example --otel-export runs/otel-example/otel-trace.jsonl --no-record-harness
+```
+
+`agent-harness-report.json` summarizes timeline, model/provider usage, policy findings, missing artifacts, and failure attribution. `--otel-export` writes OpenTelemetry/GenAI-inspired JSONL spans locally; it does not send network telemetry.
 
 ## Phase 4 Self-Improving Knowledge
 

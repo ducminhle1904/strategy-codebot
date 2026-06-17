@@ -55,6 +55,10 @@
           "warnings": {
             "type": "array",
             "items": { "type": "string" }
+          },
+          "provider_warnings": {
+            "type": "array",
+            "items": { "type": "string" }
           }
         }
       }

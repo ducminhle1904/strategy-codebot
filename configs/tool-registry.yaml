@@ -15,6 +15,17 @@ tools:
     evidence_required:
       - pine/strategy.pine
     phase_status: implemented
+  - id: generate_live_strategy
+    capability: live-llm-strategy-generation
+    risk_tier: code_generation
+    input_schema_ref: prompt
+    output_schema_ref: schemas/strategy-spec.schema.json
+    evidence_required:
+      - strategy-spec.json
+      - pine/strategy.pine
+      - live-metadata.json
+      - live-workflow-trace.json
+    phase_status: implemented
   - id: validate_pine_static
     capability: pine-static-validation
     risk_tier: validation
@@ -102,4 +113,12 @@ tools:
     output_schema_ref: harness.db
     evidence_required:
       - repository-harness trace
+    phase_status: implemented
+  - id: harness_inspect
+    capability: agent-harness-inspection
+    risk_tier: read
+    input_schema_ref: runs/*/
+    output_schema_ref: agent-harness-report.json
+    evidence_required:
+      - agent-harness-report.json
     phase_status: implemented

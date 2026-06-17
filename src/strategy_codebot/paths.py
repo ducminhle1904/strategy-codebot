@@ -16,3 +16,10 @@ def ensure_parent(path: Path) -> None:
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_repo_path(path: Path) -> Path:
+    if path.exists() or path.is_absolute():
+        return path
+    packaged_path = repo_root() / path
+    return packaged_path if packaged_path.exists() else path

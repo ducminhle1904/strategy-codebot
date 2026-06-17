@@ -6,7 +6,14 @@ import yaml
 from jsonschema import ValidationError
 
 from strategy_codebot.schemas import validate_payload
-from strategy_codebot.tool_runtime import POLICY_ENFORCE, ToolBlockedError, ToolHarness, check_tool_registry, load_tool_registry
+from strategy_codebot.tool_runtime import (
+    POLICY_ENFORCE,
+    ToolBlockedError,
+    ToolHarness,
+    check_tool_registry,
+    find_blocked_claims,
+    load_tool_registry,
+)
 
 
 def test_tool_registry_contracts_are_valid() -> None:
@@ -41,6 +48,14 @@ def test_tool_contract_schema_rejects_missing_risk_metadata() -> None:
         )
 
 
+def test_policy_allows_explicit_avoid_profitability_claim_language() -> None:
+    findings = find_blocked_claims(
+        "The goal is to demonstrate a risk-managed approach rather than claiming specific profitability."
+    )
+
+    assert findings == []
+
+
 def test_tool_registry_check_reports_valid_registry() -> None:
     report = check_tool_registry(Path("configs/tool-registry.yaml"))
 
@@ -56,6 +71,39 @@ def test_tool_harness_records_started_and_completed_events() -> None:
     assert result == {"ok": True}
     assert [event["event_type"] for event in harness.events] == ["tool.started", "tool.completed"]
     assert [event["sequence"] for event in harness.events] == [1, 2]
+
+
+def test_tool_harness_records_agent_lifecycle_event() -> None:
+    harness = ToolHarness(run_id="agent-pass")
+
+    event = harness.record_event(
+        "agent.started",
+        workflow="multi-agent",
+        stage="strategy_reasoning",
+        agent_role="trading_analyst",
+        model="openai/test-model",
+        provider="openai",
+        status="started",
+    )
+
+    validate_payload(event, "tool-event.schema.json")
+    assert event["event_type"] == "agent.started"
+    assert event["agent_role"] == "trading_analyst"
+
+
+def test_tool_event_schema_rejects_unknown_status_and_failure_class() -> None:
+    event = {
+        "sequence": 1,
+        "created_at": "2026-06-16T00:00:00+00:00",
+        "run_id": "bad-event",
+        "event_type": "llm.completed",
+        "policy_mode": "observe",
+        "status": "retrying",
+        "failure_class": "rate_limit",
+    }
+
+    with pytest.raises(ValidationError):
+        validate_payload(event, "tool-event.schema.json")
 
 
 def test_tool_harness_records_failed_event() -> None:

@@ -1,0 +1,643 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+import json
+import multiprocessing as mp
+from pathlib import Path
+import time
+from typing import Any
+
+import yaml
+
+from strategy_codebot import __version__
+from strategy_codebot.agent_harness import failure_from_attempt, inspect_run, write_combined_otel_export
+from strategy_codebot.harness_types import FAILURE_ARTIFACT_MISSING, FAILURE_POLICY_VIOLATION, FAILURE_PROVIDER_TIMEOUT, FAILURE_TOOL_ERROR, STATUS_FAIL, STATUS_PASS, STATUS_SKIPPED
+from strategy_codebot.knowledge_context import KNOWLEDGE_CONTEXT_AUTO, KNOWLEDGE_CONTEXT_PATH, build_knowledge_context, knowledge_metadata
+from strategy_codebot.live import COST_PROFILE_QUALITY, LIVE_ERROR_PATH, LIVE_WORKFLOW_TRACE_PATH, WORKFLOW_MULTI_AGENT, LiveError, LiveRunOptions, live_error_report, normalize_live_options
+from strategy_codebot.paths import ensure_dir, repo_root, resolve_repo_path
+from strategy_codebot.quality import QUALITY_REPORT_PATH, quality_metadata
+from strategy_codebot.review import REVIEW_MODE_NONE
+from strategy_codebot.runner import run_strategy
+from strategy_codebot.schemas import load_json, write_json
+from strategy_codebot.tool_runtime import RUNTIME_SUMMARY_PATH, RUNTIME_TRACE_PATH, ToolBlockedError, find_blocked_claims
+
+
+EVAL_REPORT_PATH = "eval-report.json"
+MAX_LIVE_EVAL_CONCURRENCY = 8
+
+
+def run_live_eval(
+    *,
+    suite_path: Path,
+    out_dir: Path,
+    policy: str,
+    live_options: LiveRunOptions | None = None,
+    model_registry: Path | None = None,
+    model_override: str | None = None,
+    model_stage_overrides: dict[str, str] | None = None,
+    workflow: str = WORKFLOW_MULTI_AGENT,
+    cost_profile: str = COST_PROFILE_QUALITY,
+    save_raw_provider: bool = True,
+    knowledge_context: str = "auto",
+    otel_export: Path | None = None,
+    concurrency: int = 2,
+    case_timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    if concurrency < 1:
+        raise ValueError("concurrency must be at least 1")
+    if concurrency > MAX_LIVE_EVAL_CONCURRENCY:
+        raise ValueError(f"concurrency must be at most {MAX_LIVE_EVAL_CONCURRENCY}")
+    if case_timeout_seconds is not None and case_timeout_seconds < 1:
+        raise ValueError("case_timeout_seconds must be at least 1")
+    options = live_options or normalize_live_options(
+        model_override=model_override,
+        model_stage_overrides=model_stage_overrides,
+        workflow=workflow,
+        cost_profile=cost_profile,
+        save_raw_provider=save_raw_provider,
+        knowledge_context=knowledge_context,
+    )
+    suite_path = resolve_repo_path(suite_path)
+    registry_path = resolve_repo_path(model_registry or repo_root() / "configs" / "model-registry.example.yaml")
+    suite = yaml.safe_load(suite_path.read_text(encoding="utf-8"))
+    cases = suite.get("cases", []) if isinstance(suite, dict) else []
+    if not cases:
+        raise ValueError("Eval suite must contain at least one case.")
+
+    ensure_dir(out_dir)
+    case_inputs = [
+        {
+            "case": case,
+            "out_dir": out_dir / "cases" / _case_id(case),
+            "policy": policy,
+            "model_registry": registry_path,
+            "live_options": options,
+        }
+        for case in cases
+    ]
+    if case_timeout_seconds is not None:
+        case_reports = _run_cases_with_timeout(case_inputs, concurrency=concurrency, case_timeout_seconds=case_timeout_seconds)
+    elif concurrency == 1:
+        case_reports = [_run_case(**case_input) for case_input in case_inputs]
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            case_reports = list(executor.map(lambda case_input: _run_case(**case_input), case_inputs))
+    failed = [case for case in case_reports if case["status"] != STATUS_PASS]
+    safety_cases = [case for case in case_reports if _is_expected_blocked(case)]
+    artifact_cases = [case for case in case_reports if not _is_expected_blocked(case)]
+    safety_failed = [case for case in safety_cases if _gate_status(case, "safety_gate") != STATUS_PASS]
+    generation_failed = [case for case in artifact_cases if _gate_status(case, "generation_gate", fallback=case.get("status")) != STATUS_PASS]
+    production_failed = [case for case in artifact_cases if _gate_status(case, "production_gate") != STATUS_PASS]
+    report = {
+        "suite": suite.get("name", suite_path.stem),
+        "suite_path": str(suite_path),
+        "created_at": datetime.now(UTC).isoformat(),
+        "status": STATUS_FAIL if failed else STATUS_PASS,
+        "policy": policy,
+        "model_registry": str(registry_path),
+        "model_override": options.model_override,
+        "model_stage_overrides": options.model_stage_overrides,
+        "workflow": options.workflow,
+        "cost_profile": options.cost_profile,
+        "case_timeout_seconds": case_timeout_seconds,
+        "case_count": len(case_reports),
+        "passed": len(case_reports) - len(failed),
+        "failed": len(failed),
+        "safety_case_count": len(safety_cases),
+        "safety_passed": len(safety_cases) - len(safety_failed),
+        "safety_failed": len(safety_failed),
+        "generation_case_count": len(artifact_cases),
+        "generation_passed": len(artifact_cases) - len(generation_failed),
+        "generation_failed": len(generation_failed),
+        "production_case_count": len(artifact_cases),
+        "production_passed": len(artifact_cases) - len(production_failed),
+        "production_failed": len(production_failed),
+        "cases": case_reports,
+    }
+    if otel_export:
+        write_combined_otel_export([Path(case["run_dir"]) for case in case_reports], otel_export)
+        report["otel_export_ref"] = str(otel_export)
+    write_json(out_dir / EVAL_REPORT_PATH, report)
+    return report
+
+
+def _run_cases_with_timeout(case_inputs: list[dict[str, Any]], *, concurrency: int, case_timeout_seconds: int) -> list[dict[str, Any]]:
+    reports: list[dict[str, Any] | None] = [None] * len(case_inputs)
+    pending = list(enumerate(case_inputs))
+    active: list[dict[str, Any]] = []
+    context = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+    while pending or active:
+        while pending and len(active) < concurrency:
+            index, case_input = pending.pop(0)
+            queue = context.Queue(maxsize=1)
+            process = context.Process(target=_run_case_worker, args=(queue, case_input))
+            process.start()
+            active.append({"index": index, "input": case_input, "queue": queue, "process": process, "started": time.perf_counter()})
+        for item in list(active):
+            process = item["process"]
+            queue = item["queue"]
+            if not queue.empty():
+                kind, payload = queue.get()
+                process.join(timeout=1)
+                reports[item["index"]] = payload if kind == "ok" else _case_process_error_report(item["input"], payload)
+                active.remove(item)
+            elif not process.is_alive():
+                process.join(timeout=1)
+                reports[item["index"]] = _case_process_error_report(item["input"], {"type": "ProcessExit", "message": f"case worker exited with code {process.exitcode}"})
+                active.remove(item)
+            elif time.perf_counter() - item["started"] > case_timeout_seconds:
+                process.terminate()
+                process.join(timeout=5)
+                reports[item["index"]] = _write_timeout_case_artifacts(item["input"], case_timeout_seconds=case_timeout_seconds)
+                active.remove(item)
+        if pending or active:
+            time.sleep(0.05)
+    return [report for report in reports if report is not None]
+
+
+def _run_case_worker(queue: Any, case_input: dict[str, Any]) -> None:
+    try:
+        queue.put(("ok", _run_case(**case_input)))
+    except BaseException as exc:
+        queue.put(("error", {"type": type(exc).__name__, "message": str(exc)}))
+
+
+def _case_process_error_report(case_input: dict[str, Any], error: dict[str, Any]) -> dict[str, Any]:
+    report = _base_failed_case_report(case_input, outcome="error", failure_class=FAILURE_TOOL_ERROR, failure_reason=error.get("message", "case worker failed"))
+    report["error_type"] = error.get("type")
+    _finish_case_report(report, time.perf_counter())
+    write_json(Path(report["run_dir"]) / "case-eval.json", report)
+    return report
+
+
+def _write_timeout_case_artifacts(case_input: dict[str, Any], *, case_timeout_seconds: int) -> dict[str, Any]:
+    report = _base_failed_case_report(
+        case_input,
+        outcome="timeout",
+        failure_class=FAILURE_PROVIDER_TIMEOUT,
+        failure_reason=f"case exceeded timeout of {case_timeout_seconds} seconds",
+    )
+    out_dir = Path(report["run_dir"])
+    ensure_dir(out_dir)
+    now = datetime.now(UTC).isoformat()
+    run_id = out_dir.name
+    knowledge_context = build_knowledge_context(case_input["case"]["prompt"]) if case_input["live_options"].knowledge_context == KNOWLEDGE_CONTEXT_AUTO else {}
+    knowledge_info = knowledge_metadata(knowledge_context)
+    attempt = {"stage": "case_timeout", "status": STATUS_FAIL, "failure_class": FAILURE_PROVIDER_TIMEOUT, "error": report["failure_reason"]}
+    metadata = {
+        "status": STATUS_FAIL,
+        "workflow": case_input["live_options"].workflow,
+        "attempts": [attempt],
+        "stages": [],
+        "repair_count": 0,
+        "usage": {},
+        "total_usage": {},
+        **knowledge_info,
+    }
+    workflow_trace = {
+        "run_id": run_id,
+        "workflow": case_input["live_options"].workflow,
+        "attempts": [attempt],
+        "stages": [],
+        "final_decision": {"status": STATUS_FAIL, "failure_class": FAILURE_PROVIDER_TIMEOUT, "failure_stage": "case_timeout"},
+        "lifecycle_events": [
+            {
+                "sequence": 1,
+                "created_at": now,
+                "run_id": run_id,
+                "event_type": "tool.failed",
+                "policy_mode": case_input["policy"],
+                "workflow": case_input["live_options"].workflow,
+                "tool_id": "generate_live_strategy",
+                "status": STATUS_FAIL,
+                "failure_class": FAILURE_PROVIDER_TIMEOUT,
+                "error": {"type": "TimeoutError", "message": report["failure_reason"]},
+            }
+        ],
+    }
+    live_error = {
+        "code": FAILURE_PROVIDER_TIMEOUT,
+        "message": report["failure_reason"],
+        "attempts": [attempt],
+        "diagnostics": {"metadata": metadata, "workflow_trace": workflow_trace, "final_decision": workflow_trace["final_decision"], "knowledge_context_artifact": knowledge_context},
+    }
+    timeout_output_refs = [LIVE_ERROR_PATH, "live-metadata.json", "agent-run.json", RUNTIME_TRACE_PATH, RUNTIME_SUMMARY_PATH]
+    if knowledge_context:
+        timeout_output_refs.append(KNOWLEDGE_CONTEXT_PATH)
+    agent_run = {
+        "run_id": run_id,
+        "created_at": now,
+        "agent_role": "pine_specialist",
+        "provider": "litellm",
+        "model": "model-registry",
+        "prompt_version": __version__,
+        "input_refs": ["prompt"],
+        "retrieved_sources": [*[f"doc:{doc_id}" for doc_id in knowledge_info["knowledge_doc_ids"]], *[f"source:{source_id}" for source_id in knowledge_info["external_source_ids"]]] or ["configs/source-registry.yaml"],
+        "tool_calls": ["multi-model-live-generation"],
+        "output_refs": timeout_output_refs,
+        "validation_refs": [LIVE_ERROR_PATH],
+        "status": STATUS_FAIL,
+        "warnings": [report["failure_reason"]],
+    }
+    runtime_summary = {
+        "run_id": run_id,
+        "created_at": now,
+        "policy_mode": case_input["policy"],
+        "trace_ref": RUNTIME_TRACE_PATH,
+        "event_count": 1,
+        "completed_tools": [],
+        "failed_tools": ["generate_live_strategy"],
+        "blocked_tools": [],
+        "output_refs": agent_run["output_refs"],
+    }
+    write_json(out_dir / LIVE_ERROR_PATH, live_error)
+    write_json(out_dir / "live-metadata.json", metadata)
+    write_json(out_dir / LIVE_WORKFLOW_TRACE_PATH, workflow_trace)
+    if knowledge_context:
+        write_json(out_dir / KNOWLEDGE_CONTEXT_PATH, knowledge_context)
+    write_json(out_dir / "agent-run.json", agent_run)
+    (out_dir / RUNTIME_TRACE_PATH).write_text(json.dumps(workflow_trace["lifecycle_events"][0], ensure_ascii=False) + "\n", encoding="utf-8")
+    write_json(out_dir / RUNTIME_SUMMARY_PATH, runtime_summary)
+    report["failure_stage"] = "case_timeout"
+    report["failure_attempts"] = [attempt]
+    report["artifact_refs"] = {
+        LIVE_ERROR_PATH: LIVE_ERROR_PATH,
+        LIVE_WORKFLOW_TRACE_PATH: LIVE_WORKFLOW_TRACE_PATH,
+        "live-metadata.json": "live-metadata.json",
+        "agent-run.json": "agent-run.json",
+        RUNTIME_TRACE_PATH: RUNTIME_TRACE_PATH,
+        RUNTIME_SUMMARY_PATH: RUNTIME_SUMMARY_PATH,
+    }
+    if knowledge_context:
+        report["artifact_refs"][KNOWLEDGE_CONTEXT_PATH] = KNOWLEDGE_CONTEXT_PATH
+    report["knowledge_context_ref"] = knowledge_info["knowledge_context_ref"]
+    report["knowledge_doc_ids"] = knowledge_info["knowledge_doc_ids"]
+    report["external_source_ids"] = knowledge_info["external_source_ids"]
+    report["generation_gate"] = {"status": STATUS_FAIL, "reason": "case_timeout"}
+    report["production_gate"] = {"status": STATUS_FAIL, "reason": "case_timeout"}
+    _finish_case_report(report, time.perf_counter() - case_timeout_seconds)
+    write_json(out_dir / "case-eval.json", report)
+    return report
+
+
+def _base_failed_case_report(case_input: dict[str, Any], *, outcome: str, failure_class: str, failure_reason: str) -> dict[str, Any]:
+    case = case_input["case"]
+    out_dir = case_input["out_dir"]
+    return {
+        "id": _case_id(case),
+        "name": case.get("name", _case_id(case)),
+        "expected_outcome": case.get("expected_outcome", STATUS_PASS),
+        "expected_statuses": case.get("expected_statuses", [STATUS_PASS]),
+        "run_dir": str(out_dir),
+        "status": STATUS_FAIL,
+        "outcome": outcome,
+        "failure_reason": failure_reason,
+        "failure_class": failure_class,
+        "failure_attribution": [{"failure_class": failure_class, "details": failure_reason}],
+        "validation_status": None,
+        "validation_failures": [],
+        "validation_warnings": [],
+        "latest_validation_ref": None,
+        "review_decision": None,
+        "model": None,
+        "provider": None,
+        "latency_ms": None,
+        "usage": {},
+        "workflow": case_input["live_options"].workflow,
+        "stages": [],
+        "repair_count": 0,
+        "total_usage": {},
+        "quality_status": None,
+        "quality_score": None,
+        "quality_blockers": [],
+        "quality_warnings": [],
+        "knowledge_context_ref": None,
+        "knowledge_doc_ids": [],
+        "external_source_ids": [],
+        "raw_provider_response_ref": None,
+        "otel_export_ref": None,
+        "failure_stage": None,
+        "failure_attempts": [],
+        "completed_stages": [],
+        "review_findings": {},
+        "repair_history": [],
+        "artifact_refs": {},
+        "case_started_at": datetime.now(UTC).isoformat(),
+        "case_completed_at": None,
+        "case_duration_ms": None,
+        "safety_gate": {},
+        "generation_gate": {},
+        "production_gate": {},
+    }
+
+
+def _run_case(
+    *,
+    case: dict[str, Any],
+    out_dir: Path,
+    policy: str,
+    model_registry: Path,
+    live_options: LiveRunOptions,
+) -> dict[str, Any]:
+    ensure_dir(out_dir)
+    started_at = datetime.now(UTC)
+    started_timer = time.perf_counter()
+    expected_outcome = case.get("expected_outcome", STATUS_PASS)
+    expected_statuses = case.get("expected_statuses", [STATUS_PASS])
+    prompt = case["prompt"]
+    report: dict[str, Any] = {
+        "id": _case_id(case),
+        "name": case.get("name", _case_id(case)),
+        "expected_outcome": expected_outcome,
+        "expected_statuses": expected_statuses,
+        "run_dir": str(out_dir),
+        "status": STATUS_FAIL,
+        "outcome": "not_run",
+        "failure_reason": None,
+        "validation_status": None,
+        "validation_failures": [],
+        "validation_warnings": [],
+        "latest_validation_ref": None,
+        "review_decision": None,
+        "model": None,
+        "provider": None,
+        "latency_ms": None,
+        "usage": {},
+        "workflow": None,
+        "stages": [],
+        "repair_count": 0,
+        "total_usage": {},
+        "raw_provider_response_ref": None,
+        "otel_export_ref": None,
+        "failure_attribution": [],
+        "failure_stage": None,
+        "failure_class": None,
+        "failure_attempts": [],
+        "completed_stages": [],
+        "review_findings": {},
+        "repair_history": [],
+        "artifact_refs": {},
+        "quality_status": None,
+        "quality_score": None,
+        "quality_blockers": [],
+        "quality_warnings": [],
+        "knowledge_context_ref": None,
+        "knowledge_doc_ids": [],
+        "external_source_ids": [],
+        "case_started_at": started_at.isoformat(),
+        "case_completed_at": None,
+        "case_duration_ms": None,
+        "safety_gate": {},
+        "generation_gate": {},
+        "production_gate": {},
+    }
+    if expected_outcome == "blocked":
+        prompt_findings = find_blocked_claims(prompt)
+        if prompt_findings:
+            report.update(
+                {
+                    "status": STATUS_PASS,
+                    "outcome": "blocked",
+                    "failure_reason": None,
+                    "failure_class": FAILURE_POLICY_VIOLATION,
+                    "safety_gate": {
+                        "status": STATUS_PASS,
+                        "blocked_at": "prompt",
+                        "failure_class": FAILURE_POLICY_VIOLATION,
+                        "policy_findings": prompt_findings,
+                    },
+                    "generation_gate": {"status": STATUS_SKIPPED, "reason": "expected_blocked_case"},
+                    "production_gate": {"status": STATUS_SKIPPED, "reason": "expected_blocked_case"},
+                }
+            )
+            _finish_case_report(report, started_timer)
+            write_json(out_dir / "case-eval.json", report)
+            return report
+    try:
+        case_options = LiveRunOptions(
+            model_override=live_options.model_override or case.get("model"),
+            model_stage_overrides={**live_options.model_stage_overrides, **case.get("model_stages", {})},
+            workflow=case.get("workflow", live_options.workflow),
+            cost_profile=case.get("cost_profile", live_options.cost_profile),
+            save_raw_provider=live_options.save_raw_provider,
+            knowledge_context=case.get("knowledge_context", live_options.knowledge_context),
+        )
+        result = run_strategy(
+            spec_path=None,
+            prompt=prompt,
+            mode="live",
+            out_dir=out_dir,
+            review=case.get("review", REVIEW_MODE_NONE),
+            record_harness=False,
+            policy=policy,
+            model_registry=model_registry,
+            live_options=case_options,
+        )
+        validation = load_json(out_dir / "validation-report.json")
+        metadata = load_json(out_dir / "live-metadata.json")
+        quality_report = load_json(out_dir / QUALITY_REPORT_PATH) if (out_dir / QUALITY_REPORT_PATH).exists() else metadata.get("quality_report", {})
+        report.update(
+            {
+                "outcome": "completed",
+                "validation_status": validation["status"],
+                "validation_failures": _validation_failures(validation),
+                "validation_warnings": validation.get("warnings", []),
+                "latest_validation_ref": "validation-report.json",
+                "model": metadata.get("model"),
+                "provider": metadata.get("provider"),
+                "latency_ms": metadata.get("total_latency_ms", metadata.get("latency_ms")),
+                "usage": metadata.get("usage", {}),
+                "workflow": metadata.get("workflow"),
+                "stages": metadata.get("stages", []),
+                "repair_count": metadata.get("repair_count", 0),
+                "total_usage": metadata.get("total_usage", metadata.get("usage", {})),
+                "knowledge_context_ref": metadata.get("knowledge_context_ref"),
+                "knowledge_doc_ids": metadata.get("knowledge_doc_ids", []),
+                "external_source_ids": metadata.get("external_source_ids", []),
+                **quality_metadata(quality_report),
+                "generation_gate": metadata.get("generation_gate") or _generation_gate_from_validation(validation),
+                "production_gate": metadata.get("production_gate") or _production_gate_from_completed_run(validation, report.get("review_decision")),
+            }
+        )
+        harness_report = inspect_run(out_dir)
+        report["failure_attribution"] = harness_report["failure_attribution"]
+        required_live_artifacts = {"agent-run.json", "validation-report.json", "live-metadata.json"}
+        if metadata.get("workflow") == WORKFLOW_MULTI_AGENT:
+            required_live_artifacts.add("live-workflow-trace.json")
+        if metadata.get("knowledge_context_ref"):
+            required_live_artifacts.add(KNOWLEDGE_CONTEXT_PATH)
+        missing_required = sorted(required_live_artifacts & set(harness_report["missing_artifacts"]))
+        if missing_required:
+            report["failure_attribution"].extend(
+                {"failure_class": FAILURE_ARTIFACT_MISSING, "artifact": artifact, "details": f"Missing required live artifact {artifact}."}
+                for artifact in missing_required
+            )
+        if (out_dir / "live-provider-response.json").exists():
+            report["raw_provider_response_ref"] = "live-provider-response.json"
+        if (out_dir / QUALITY_REPORT_PATH).exists():
+            report["artifact_refs"][QUALITY_REPORT_PATH] = QUALITY_REPORT_PATH
+        if (out_dir / KNOWLEDGE_CONTEXT_PATH).exists():
+            report["artifact_refs"][KNOWLEDGE_CONTEXT_PATH] = KNOWLEDGE_CONTEXT_PATH
+        if (out_dir / "review-report.json").exists():
+            review = load_json(out_dir / "review-report.json")
+            report["review_decision"] = review.get("decision")
+            if not metadata.get("production_gate"):
+                report["production_gate"] = _production_gate_from_completed_run(validation, report["review_decision"])
+            elif _review_decision_blocks_production(report["review_decision"]):
+                report["production_gate"] = {
+                    **report["production_gate"],
+                    "status": STATUS_FAIL,
+                    "review_decision": report["review_decision"],
+                }
+        generation_passed = report.get("generation_gate", {}).get("status") == STATUS_PASS
+        if report["failure_attribution"] and not generation_passed:
+            report["failure_reason"] = "live harness gate failed"
+        elif expected_outcome == STATUS_PASS and (result["status"] in expected_statuses or validation["status"] in expected_statuses or report["generation_gate"].get("status") in expected_statuses):
+            report["status"] = STATUS_PASS
+        elif expected_outcome == "blocked":
+            report["safety_gate"] = {"status": STATUS_FAIL, "reason": "expected policy block but run completed"}
+            report["failure_reason"] = "expected policy block but run completed"
+        else:
+            report["failure_reason"] = f"unexpected run status {result['status']}"
+    except ToolBlockedError as exc:
+        report.update({"outcome": "blocked", "failure_reason": str(exc), "generation_gate": {"status": STATUS_SKIPPED, "reason": "blocked"}, "production_gate": {"status": STATUS_SKIPPED, "reason": "blocked"}})
+        if expected_outcome == "blocked":
+            report["status"] = STATUS_PASS
+            report["failure_reason"] = None
+            report["failure_class"] = FAILURE_POLICY_VIOLATION
+            report["safety_gate"] = {"status": STATUS_PASS, "blocked_at": "tool", "failure_class": FAILURE_POLICY_VIOLATION}
+    except LiveError as exc:
+        error_report = _load_live_error(out_dir) or live_error_report(exc)
+        report.update({"outcome": "live_error", "failure_reason": str(exc), "live_error": error_report})
+        _enrich_failure_report(report, out_dir, error_report)
+        report["failure_attribution"] = [
+            failure_from_attempt(attempt)
+            for attempt in error_report.get("attempts", [])
+            if attempt.get("status") in {STATUS_FAIL, STATUS_SKIPPED}
+        ]
+        if report.get("failure_class") and not report["failure_attribution"]:
+            report["failure_attribution"] = [{"failure_class": report["failure_class"], "stage": report.get("failure_stage"), "details": report["failure_reason"]}]
+        if expected_outcome == "blocked" and report.get("failure_class") == "policy_violation":
+            report["status"] = STATUS_PASS
+            report["failure_reason"] = None
+            report["safety_gate"] = {"status": STATUS_PASS, "blocked_at": report.get("failure_stage") or "live", "failure_class": FAILURE_POLICY_VIOLATION}
+            report["generation_gate"] = {"status": STATUS_SKIPPED, "reason": "expected_blocked_case"}
+            report["production_gate"] = {"status": STATUS_SKIPPED, "reason": "expected_blocked_case"}
+        if expected_outcome == STATUS_PASS and report.get("validation_status") in expected_statuses and report.get("validation_status") != STATUS_PASS:
+            report["status"] = STATUS_PASS
+            report["failure_reason"] = None
+    except Exception as exc:
+        report.update({"outcome": "error", "failure_reason": str(exc), "error_type": type(exc).__name__})
+    _finish_case_report(report, started_timer)
+    write_json(out_dir / "case-eval.json", report)
+    return report
+
+
+def _finish_case_report(report: dict[str, Any], started_timer: float) -> None:
+    report["case_completed_at"] = datetime.now(UTC).isoformat()
+    report["case_duration_ms"] = int((time.perf_counter() - started_timer) * 1000)
+
+
+def _load_live_error(out_dir: Path) -> dict[str, Any] | None:
+    path = out_dir / LIVE_ERROR_PATH
+    if not path.exists():
+        return None
+    payload = load_json(path)
+    return payload if isinstance(payload, dict) else None
+
+
+def _enrich_failure_report(report: dict[str, Any], out_dir: Path, error_report: dict[str, Any]) -> None:
+    diagnostics = error_report.get("diagnostics", {}) if isinstance(error_report.get("diagnostics"), dict) else {}
+    metadata = diagnostics.get("metadata", {}) if isinstance(diagnostics.get("metadata"), dict) else {}
+    workflow_trace = diagnostics.get("workflow_trace", {}) if isinstance(diagnostics.get("workflow_trace"), dict) else {}
+    final_decision = diagnostics.get("final_decision", {}) if isinstance(diagnostics.get("final_decision"), dict) else {}
+    attempts = error_report.get("attempts", [])
+    failed_attempts = [attempt for attempt in attempts if attempt.get("status") in {STATUS_FAIL, STATUS_SKIPPED}]
+    last_failure = failed_attempts[-1] if failed_attempts else {}
+
+    report["failure_stage"] = final_decision.get("failure_stage") or last_failure.get("stage")
+    report["failure_class"] = final_decision.get("failure_class") or last_failure.get("failure_class") or last_failure.get("error_code")
+    report["failure_attempts"] = failed_attempts
+    report["completed_stages"] = [stage.get("stage") for stage in diagnostics.get("stage_records", []) or metadata.get("stages", [])]
+    report["review_findings"] = diagnostics.get("review_findings", {})
+    report["repair_history"] = diagnostics.get("repair_history", workflow_trace.get("repair_history", []))
+    report.update(quality_metadata(diagnostics.get("quality_report") or metadata.get("quality_report")))
+    knowledge_info = knowledge_metadata(diagnostics.get("knowledge_context_artifact") or {})
+    report["knowledge_context_ref"] = metadata.get("knowledge_context_ref") or knowledge_info["knowledge_context_ref"]
+    report["knowledge_doc_ids"] = metadata.get("knowledge_doc_ids", knowledge_info["knowledge_doc_ids"])
+    report["external_source_ids"] = metadata.get("external_source_ids", knowledge_info["external_source_ids"])
+    report["workflow"] = metadata.get("workflow") or diagnostics.get("workflow")
+    report["stages"] = metadata.get("stages", [])
+    report["repair_count"] = metadata.get("repair_count", 0)
+    report["total_usage"] = metadata.get("total_usage", {})
+    report["usage"] = metadata.get("usage", {})
+    report["generation_gate"] = metadata.get("generation_gate") or diagnostics.get("generation_gate", {})
+    report["production_gate"] = metadata.get("production_gate") or diagnostics.get("production_gate", {})
+    validation = diagnostics.get("validation") or metadata.get("validation") or {}
+    report["validation_status"] = validation.get("status") or final_decision.get("validation_status")
+    report["validation_failures"] = diagnostics.get("validation_failures") or metadata.get("validation_failures") or _validation_failures(validation)
+    report["validation_warnings"] = diagnostics.get("validation_warnings") or metadata.get("validation_warnings") or validation.get("warnings", [])
+    report["latest_validation_ref"] = f"{LIVE_ERROR_PATH}#/diagnostics/validation" if validation else None
+    report["latency_ms"] = metadata.get("total_latency_ms", metadata.get("latency_ms"))
+    report["model"] = metadata.get("model")
+    report["provider"] = metadata.get("provider")
+    refs = {
+        name: name
+        for name in (LIVE_ERROR_PATH, LIVE_WORKFLOW_TRACE_PATH, "live-provider-response.json", QUALITY_REPORT_PATH, KNOWLEDGE_CONTEXT_PATH, "runtime-trace.jsonl", "runtime-summary.json")
+        if (out_dir / name).exists()
+    }
+    report["artifact_refs"] = refs
+    if (out_dir / "live-provider-response.json").exists():
+        report["raw_provider_response_ref"] = "live-provider-response.json"
+
+
+def _validation_failures(validation: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"name": check.get("name"), "status": check.get("status"), "details": check.get("details")}
+        for check in validation.get("checks", [])
+        if check.get("status") not in {STATUS_PASS, STATUS_SKIPPED}
+    ]
+
+
+def _generation_gate_from_validation(validation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": STATUS_PASS if _validation_allows_artifact(validation) else STATUS_FAIL,
+        "validation_status": validation.get("status"),
+        "validation_failures": _validation_failures(validation),
+    }
+
+
+def _production_gate_from_completed_run(validation: dict[str, Any], review_decision: str | None) -> dict[str, Any]:
+    review_clean = not _review_decision_blocks_production(review_decision)
+    return {
+        "status": STATUS_PASS if _validation_allows_artifact(validation) and review_clean else STATUS_FAIL,
+        "validation_status": validation.get("status"),
+        "review_decision": review_decision,
+    }
+
+
+def _gate_status(case: dict[str, Any], gate_name: str, *, fallback: Any = None) -> Any:
+    gate = case.get(gate_name)
+    if isinstance(gate, dict):
+        return gate.get("status", fallback)
+    return fallback
+
+
+def _is_expected_blocked(case: dict[str, Any]) -> bool:
+    return case.get("expected_outcome") == "blocked"
+
+
+def _review_decision_blocks_production(review_decision: str | None) -> bool:
+    return str(review_decision).lower() in {STATUS_FAIL, "fail", "failed", "reject", "rejected", "block", "blocked"}
+
+
+def _validation_allows_artifact(validation: dict[str, Any]) -> bool:
+    return validation.get("status") == STATUS_PASS or (
+        validation.get("status") == "manual_required" and not _validation_failures(validation)
+    )
+
+
+def _case_id(case: dict[str, Any]) -> str:
+    raw = str(case.get("id") or case.get("name") or "case")
+    return "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in raw).strip("-") or "case"
