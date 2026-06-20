@@ -1,0 +1,18 @@
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  litellm-proxy:
+    ports:
+      - "4000:4000"
+
+  api:
+    environment:
+      STRATEGY_CODEBOT_API_ARTIFACT_ROOT: /var/lib/strategy-codebot/artifacts
+    volumes:
+      - api-artifacts:/var/lib/strategy-codebot/artifacts

@@ -1,9 +1,11 @@
 from pathlib import Path
+import json
 
 import pytest
 
 from strategy_codebot.live import WORKFLOW_SINGLE, LiveProviderError, LiveGenerationResult, LiveRunOptions
 from strategy_codebot.knowledge_context import build_knowledge_context
+from strategy_codebot.knowledge_base import build_knowledge_index
 from strategy_codebot.pine import generate_pine
 from strategy_codebot.runner import _harness_trace_decisions, _harness_trace_friction, _harness_trace_token_estimate, run_strategy
 from strategy_codebot.schemas import load_json
@@ -30,6 +32,28 @@ def test_dry_run_creates_pine_artifacts(tmp_path: Path) -> None:
     assert (out_dir / "runtime-trace.jsonl").exists()
     assert load_json(out_dir / "runtime-summary.json")["policy_mode"] == "observe"
     assert not (out_dir / "review-report.json").exists()
+
+
+def test_run_strategy_implicitly_skips_unavailable_harness_cli(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    out_dir = tmp_path / "skip-harness-run"
+    monkeypatch.setattr(
+        "strategy_codebot.runner.harness_cli_availability",
+        lambda: {"available": False, "status": "not_executable", "reason": "exec format error"},
+    )
+    monkeypatch.setattr("strategy_codebot.runner.should_record_harness", lambda requested: False if requested is None else requested)
+
+    result = run_strategy(
+        spec_path=Path("examples/specs/ma-crossover-pine.json"),
+        prompt=None,
+        mode="dry-run",
+        out_dir=out_dir,
+        record_harness=None,
+    )
+
+    agent_run = load_json(out_dir / "agent-run.json")
+    assert result["status"] == "pass"
+    assert agent_run["harness_recording_status"] == "skipped_unavailable"
+    assert agent_run["harness_recording_reason"] == "exec format error"
 
 
 def test_combined_target_creates_mql5_runner_design(tmp_path: Path) -> None:
@@ -242,6 +266,79 @@ def test_live_run_writes_quality_report(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert "quality-report.json" in agent_run["validation_refs"]
 
 
+def test_live_run_writes_redacted_proxy_attribution_events(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    out_dir = tmp_path / "live-proxy-attribution"
+    spec = {
+        "target_platform": "pine_v6",
+        "script_type": "strategy",
+        "market": "crypto",
+        "symbol": "BTCUSDT",
+        "timeframe": "15m",
+        "entry_rules": ["Enter long after a liquidity sweep reclaim."],
+        "exit_rules": ["Exit with strategy.exit stop loss and take profit."],
+        "risk_rules": ["Risk 1% account equity per trade."],
+        "position_sizing": "1% account equity risk per trade",
+        "stop_loss": "Structure low invalidation",
+        "take_profit": "2R target",
+    }
+
+    def fake_generate_live(*args, **kwargs):
+        return LiveGenerationResult(
+            strategy_spec=spec,
+            pine_code=generate_pine(spec),
+            model="litellm_proxy/paid_low.pine_code_generation",
+            provider="litellm",
+            latency_ms=1200,
+            workflow="multi-agent",
+            production_gate={"status": "pass", "validation_status": "pass"},
+            attempts=[
+                {
+                    "stage": "pine_code_generation",
+                    "model": "litellm_proxy/paid_low.pine_code_generation",
+                    "route_model": "paid_low.pine_code_generation",
+                    "gateway": "litellm_proxy",
+                    "started_at": "2026-06-18T00:00:00Z",
+                    "completed_at": "2026-06-18T00:00:01Z",
+                    "provider_call_ms": 1190,
+                    "stage_total_ms": 1200,
+                    "provider_call_ratio": 0.99,
+                    "local_processing_ms": 10,
+                    "stage_input_chars": 9000,
+                    "output_chars": 1800,
+                    "status": "pass",
+                    "prompt": "raw prompt must not be mirrored",
+                    "raw_response": {"text": "raw response must not be mirrored"},
+                    "headers": {"Authorization": "Bearer sk-secret123456789"},
+                }
+            ],
+        )
+
+    monkeypatch.setattr("strategy_codebot.runner.generate_live", fake_generate_live)
+
+    run_strategy(
+        spec_path=None,
+        prompt="Create a price-action Pine strategy",
+        mode="live",
+        out_dir=out_dir,
+        record_harness=False,
+        live_options=LiveRunOptions(save_raw_provider=False),
+    )
+
+    artifact = out_dir / "proxy-attribution-events.jsonl"
+    assert artifact.exists()
+    raw_text = artifact.read_text(encoding="utf-8")
+    event = json.loads(raw_text)
+
+    assert event["run_id"] == out_dir.name
+    assert event["stage"] == "pine_code_generation"
+    assert event["route_model"] == "paid_low.pine_code_generation"
+    assert event["provider_call_ratio"] == 0.99
+    assert "raw prompt" not in raw_text
+    assert "raw response" not in raw_text
+    assert "sk-secret" not in raw_text
+    assert "Authorization" not in raw_text
+
+
 def test_live_run_writes_knowledge_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     out_dir = tmp_path / "live-knowledge"
     spec = {
@@ -289,6 +386,59 @@ def test_live_run_writes_knowledge_context(monkeypatch: pytest.MonkeyPatch, tmp_
     assert metadata["knowledge_context_ref"] == "knowledge-context.json"
     assert "pine_v6_rules" in metadata["knowledge_doc_ids"]
     assert "doc:pine_v6_rules" in agent_run["retrieved_sources"]
+
+
+def test_live_run_writes_retrieved_kb_context(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    out_dir = tmp_path / "live-kb-knowledge"
+    index_path = tmp_path / "kb" / "index.json"
+    build_knowledge_index(index_path=index_path)
+    monkeypatch.setenv("STRATEGY_CODEBOT_KNOWLEDGE_INDEX", str(index_path))
+    spec = {
+        "target_platform": "pine_v6",
+        "script_type": "strategy",
+        "market": "forex",
+        "symbol": "EURUSD",
+        "timeframe": "1d",
+        "entry_rules": ["Enter after break of structure retest on a confirmed candle."],
+        "exit_rules": ["Exit with strategy.exit stop loss and take profit."],
+        "risk_rules": ["Risk 1% account equity per trade."],
+        "position_sizing": "1% account equity risk per trade",
+        "stop_loss": "Below retest swing",
+        "take_profit": "2R target",
+    }
+    knowledge_context = build_knowledge_context("Create a price action strategy using break of structure and retest")
+
+    def fake_generate_live(*args, **kwargs):
+        return LiveGenerationResult(
+            strategy_spec=spec,
+            pine_code=generate_pine(spec),
+            model="openrouter/google/gemini-2.5-flash",
+            provider="openrouter",
+            latency_ms=1,
+            workflow="multi-agent",
+            production_gate={"status": "pass", "validation_status": "pass"},
+            knowledge_context=knowledge_context,
+        )
+
+    monkeypatch.setattr("strategy_codebot.runner.generate_live", fake_generate_live)
+
+    run_strategy(
+        spec_path=None,
+        prompt="Create a price action strategy using break of structure and retest",
+        mode="live",
+        out_dir=out_dir,
+        record_harness=False,
+        live_options=LiveRunOptions(save_raw_provider=False),
+    )
+
+    context = load_json(out_dir / "knowledge-context.json")
+    metadata = load_json(out_dir / "live-metadata.json")
+    agent_run = load_json(out_dir / "agent-run.json")
+
+    assert context["store"] == "knowledge_base"
+    assert context["retrieved_chunks"]
+    assert metadata["knowledge_chunk_ids"]
+    assert any(ref.startswith("doc:pattern-price-action") for ref in agent_run["retrieved_sources"])
 
 
 def test_enforce_policy_allows_negative_live_trading_constraints(tmp_path: Path) -> None:
@@ -484,6 +634,84 @@ def test_live_run_failure_writes_diagnostic_artifacts(monkeypatch: pytest.Monkey
     assert otel_path.read_text(encoding="utf-8").strip()
     assert not (out_dir / "strategy-spec.json").exists()
     assert not (out_dir / "pine" / "strategy.pine").exists()
+
+
+def test_live_run_compact_free_timeout_writes_failure_artifacts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    out_dir = tmp_path / "failed-free-live-run"
+    attempts = [
+        {
+            "stage": "compact_free",
+            "status": "fail",
+            "error_code": "provider_timeout",
+            "failure_class": "provider_timeout",
+            "model": "openrouter/qwen/qwen3-coder:free",
+            "provider": "openrouter",
+            "latency_ms": 46000,
+        }
+    ]
+    knowledge_context = {
+        "mode": "auto",
+        "knowledge_context_status": "degraded",
+        "knowledge_health_status": "degraded",
+        "failure_class": "knowledge_unavailable",
+        "internal_docs": [{"id": "pine_v6_rules", "path": "docs/trading/pine-v6-rules.md"}],
+        "external_refs": [],
+        "context_refs": ["docs/trading/pine-v6-rules.md"],
+    }
+
+    def fake_generate_live(*args, **kwargs) -> LiveGenerationResult:
+        diagnostics = {
+            "workflow": "compact-free",
+            "attempts": attempts,
+            "stage_records": [],
+            "knowledge_context_artifact": knowledge_context,
+            "metadata": {
+                "status": "fail",
+                "workflow": "compact-free",
+                "user_tier": "free",
+                "model": "openrouter/qwen/qwen3-coder:free",
+                "provider": "openrouter",
+                "attempts": attempts,
+                "stages": [],
+                "repair_count": 0,
+                "knowledge_context_status": "degraded",
+                "knowledge_failure_class": "knowledge_unavailable",
+                "free_capacity_status": "available",
+                "selected_free_models": ["openrouter/qwen/qwen3-coder:free"],
+            },
+            "workflow_trace": {
+                "run_id": "failed-free-live-run",
+                "workflow": "compact-free",
+                "attempts": attempts,
+                "stages": [],
+                "final_decision": {"status": "fail", "failure_class": "provider_timeout", "failure_stage": "compact_free"},
+            },
+            "final_decision": {"status": "fail", "failure_class": "provider_timeout", "failure_stage": "compact_free"},
+        }
+        raise LiveProviderError("compact free timed out", attempts=attempts, diagnostics=diagnostics)
+
+    monkeypatch.setattr("strategy_codebot.runner.generate_live", fake_generate_live)
+
+    with pytest.raises(LiveProviderError):
+        run_strategy(
+            spec_path=None,
+            prompt="Create a Pine strategy",
+            mode="live",
+            out_dir=out_dir,
+            record_harness=False,
+            live_options=LiveRunOptions(user_tier="free", save_raw_provider=False),
+        )
+
+    metadata = load_json(out_dir / "live-metadata.json")
+    error = load_json(out_dir / "live-error.json")
+
+    assert metadata["workflow"] == "compact-free"
+    assert metadata["user_tier"] == "free"
+    assert metadata["knowledge_context_status"] == "degraded"
+    assert metadata["knowledge_failure_class"] == "knowledge_unavailable"
+    assert error["diagnostics"]["final_decision"]["failure_class"] == "provider_timeout"
+    assert (out_dir / "knowledge-context.json").exists()
+    assert not (out_dir / "strategy-spec.json").exists()
 
 
 def test_live_run_enforce_blocks_prohibited_prompt_before_provider(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

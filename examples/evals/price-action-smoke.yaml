@@ -1,0 +1,6 @@
+name: price-action-smoke
+description: Single-case live latency smoke for routine paid_low price-action verification.
+cases:
+  - id: liquidity_sweep_reclaim_smoke
+    prompt: Create a Pine v6 price-action-only liquidity sweep strategy for crypto that avoids chasing failed reclaims, defines invalidation beyond the swept wick, uses fixed 1% risk, and includes a structure target or bounded reward/risk fallback. Do not use indicators.
+    expected_statuses: ["pass"]

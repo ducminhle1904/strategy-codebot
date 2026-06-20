@@ -1,0 +1,259 @@
+name: strategy-codebot
+
+x-api-environment: &api-environment
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: strategy_codebot
+  POSTGRES_USER: strategy_codebot
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+  OPENROUTER_API_BASE: ${OPENROUTER_API_BASE:-}
+  OPENROUTER_EMBEDDINGS_API_BASE: ${OPENROUTER_EMBEDDINGS_API_BASE:-}
+  OPENAI_EMBEDDINGS_API_BASE: ${OPENAI_EMBEDDINGS_API_BASE:-}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+  LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+  LITELLM_PROXY_API_KEY: ${LITELLM_PROXY_API_KEY:-${LITELLM_MASTER_KEY:-}}
+  LITELLM_PROXY_API_BASE: ${LITELLM_PROXY_API_BASE:-http://litellm-proxy:4000/v1}
+  VERCEL_AI_GATEWAY_API_KEY: ${VERCEL_AI_GATEWAY_API_KEY:-}
+  VERCEL_AI_GATEWAY_API_BASE: ${VERCEL_AI_GATEWAY_API_BASE:-}
+  PORTKEY_API_KEY: ${PORTKEY_API_KEY:-}
+  PORTKEY_API_BASE: ${PORTKEY_API_BASE:-}
+  PORTKEY_VIRTUAL_KEY: ${PORTKEY_VIRTUAL_KEY:-}
+  PORTKEY_CONFIG_ID: ${PORTKEY_CONFIG_ID:-}
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+  FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
+  DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
+  STRATEGY_CODEBOT_API_ARTIFACT_ROOT: /var/lib/strategy-codebot/artifacts
+  STRATEGY_CODEBOT_API_CORS_ORIGINS: ${STRATEGY_CODEBOT_API_CORS_ORIGINS:-}
+  STRATEGY_CODEBOT_API_CORS_ORIGIN_REGEX: ${STRATEGY_CODEBOT_API_CORS_ORIGIN_REGEX:-}
+  STRATEGY_CODEBOT_INTERNAL_AUTH_SECRET: ${STRATEGY_CODEBOT_INTERNAL_AUTH_SECRET:-}
+  STRATEGY_CODEBOT_KNOWLEDGE_DATABASE_URL: postgresql://strategy_codebot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/strategy_codebot
+  STRATEGY_CODEBOT_LLM_REQUEST_TIMEOUT_SECONDS: ${STRATEGY_CODEBOT_LLM_REQUEST_TIMEOUT_SECONDS:-}
+  STRATEGY_CODEBOT_SERVER_USER_TIER: ${STRATEGY_CODEBOT_SERVER_USER_TIER:-}
+  ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY:-}
+  TWELVE_DATA_API_KEY: ${TWELVE_DATA_API_KEY:-}
+  MARKET_DATA_PROVIDER: ${MARKET_DATA_PROVIDER:-auto}
+  MARKET_DATA_TIMEOUT_MS: ${MARKET_DATA_TIMEOUT_MS:-6000}
+  CCXT_EXCHANGE_ID: ${CCXT_EXCHANGE_ID:-binance}
+  CCXT_FALLBACK_EXCHANGES: ${CCXT_FALLBACK_EXCHANGES:-binance,kraken,coinbase}
+  CCXT_OHLCV_TIMEFRAME: ${CCXT_OHLCV_TIMEFRAME:-1h}
+  CCXT_OHLCV_LIMIT: ${CCXT_OHLCV_LIMIT:-72}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: strategy_codebot
+      POSTGRES_USER: strategy_codebot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  litellm-proxy:
+    image: docker.litellm.ai/berriai/litellm:main-latest
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      DATABASE_URL: postgresql://litellm:${LITELLM_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}}@litellm-postgres:5432/litellm
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?LITELLM_MASTER_KEY is required}
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?LITELLM_SALT_KEY is required}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_API_BASE: ${OPENROUTER_API_BASE:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      VERCEL_AI_GATEWAY_API_KEY: ${VERCEL_AI_GATEWAY_API_KEY:-}
+      VERCEL_AI_GATEWAY_API_BASE: ${VERCEL_AI_GATEWAY_API_BASE:-https://ai-gateway.vercel.sh/v1}
+      PORTKEY_API_KEY: ${PORTKEY_API_KEY:-}
+      PORTKEY_API_BASE: ${PORTKEY_API_BASE:-}
+      PORTKEY_VIRTUAL_KEY: ${PORTKEY_VIRTUAL_KEY:-}
+      PORTKEY_CONFIG_ID: ${PORTKEY_CONFIG_ID:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      FIREWORKS_API_KEY: ${FIREWORKS_API_KEY:-}
+      DEEPINFRA_API_KEY: ${DEEPINFRA_API_KEY:-}
+      STRATEGY_CODEBOT_LITELLM_DEBUG_LOGS: ${STRATEGY_CODEBOT_LITELLM_DEBUG_LOGS:-0}
+    volumes:
+      - ./docker/litellm/config.yaml:/app/config.yaml:ro
+    depends_on:
+      litellm-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2).read()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  litellm-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${LITELLM_POSTGRES_PASSWORD:-${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}}
+    volumes:
+      - litellm-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  migration:
+    image: strategy-codebot-api:local
+    build:
+      context: .
+      target: runtime
+    environment: *api-environment
+    command: ["strategy-codebot-migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  knowledge-init:
+    image: strategy-codebot-api:local
+    build:
+      context: .
+      target: runtime
+    profiles:
+      - knowledge-init
+    environment: *api-environment
+    command:
+      - "sh"
+      - "-c"
+      - 'strategy-codebot knowledge init --embedding-profile production-openrouter --db-url "$$STRATEGY_CODEBOT_KNOWLEDGE_DATABASE_URL"'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  api:
+    image: strategy-codebot-api:local
+    build:
+      context: .
+      target: runtime
+    environment: *api-environment
+    volumes:
+      - api-artifacts:/var/lib/strategy-codebot/artifacts
+    ports:
+      - "${STRATEGY_CODEBOT_API_PORT:-8000}:8000"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  backtest-worker:
+    image: strategy-codebot-backtest-worker:local
+    build:
+      context: ./workers/backtest-kit
+    environment:
+      <<: *api-environment
+      BACKTEST_WORKER_ID: ${BACKTEST_WORKER_ID:-}
+      BACKTEST_WORKER_POLL_INTERVAL_MS: ${BACKTEST_WORKER_POLL_INTERVAL_MS:-2000}
+      BACKTEST_WORKER_LEASE_SECONDS: ${BACKTEST_WORKER_LEASE_SECONDS:-300}
+      BACKTEST_WORKER_HEARTBEAT_SECONDS: ${BACKTEST_WORKER_HEARTBEAT_SECONDS:-30}
+      BACKTEST_WORKER_TIMEOUT_MS: ${BACKTEST_WORKER_TIMEOUT_MS:-120000}
+      BACKTEST_WORKER_MAX_CANDLES: ${BACKTEST_WORKER_MAX_CANDLES:-525600}
+      BACKTEST_WORKER_MAX_CANDLES_PER_FETCH: ${BACKTEST_WORKER_MAX_CANDLES_PER_FETCH:-1000}
+      BACKTEST_WORKER_MAX_EVENTS: ${BACKTEST_WORKER_MAX_EVENTS:-10000}
+      BACKTEST_WORKER_MAX_ARTIFACT_BYTES: ${BACKTEST_WORKER_MAX_ARTIFACT_BYTES:-5000000}
+      BACKTEST_WORKER_CACHE_LOCK_TIMEOUT_MS: ${BACKTEST_WORKER_CACHE_LOCK_TIMEOUT_MS:-30000}
+      BACKTEST_WORKER_DATA_FETCH_THROTTLE_MS: ${BACKTEST_WORKER_DATA_FETCH_THROTTLE_MS:-250}
+      BACKTEST_WORKER_DEFAULT_WORKSPACE_ACTIVE_LIMIT: ${BACKTEST_WORKER_DEFAULT_WORKSPACE_ACTIVE_LIMIT:-2}
+      BACKTEST_WORKER_MARKET_DATA_MODE: ${BACKTEST_WORKER_MARKET_DATA_MODE:-ccxt}
+      BACKTEST_WORKER_CANDLE_CACHE_VERSION: ${BACKTEST_WORKER_CANDLE_CACHE_VERSION:-range-v2}
+    volumes:
+      - api-artifacts:/var/lib/strategy-codebot/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    image: strategy-codebot-web:local
+    build:
+      context: ./apps/web
+      args:
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
+        NEXT_PUBLIC_CLERK_SIGN_IN_URL: ${NEXT_PUBLIC_CLERK_SIGN_IN_URL:-/sign-in}
+        NEXT_PUBLIC_CLERK_SIGN_UP_URL: ${NEXT_PUBLIC_CLERK_SIGN_UP_URL:-/sign-up}
+        NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL: ${NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL:-/}
+        NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL: ${NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL:-/}
+    ports:
+      - "${STRATEGY_CODEBOT_WEB_PORT:-3000}:3000"
+    environment:
+      HOSTNAME: 0.0.0.0
+      NEXT_TELEMETRY_DISABLED: "1"
+      PORT: "3000"
+      STRATEGY_CODEBOT_API_BASE_URL: http://api:8000
+      STRATEGY_CODEBOT_WEB_DEBUG: "1"
+      STRATEGY_CODEBOT_USER_ID: local-user
+      STRATEGY_CODEBOT_WORKSPACE_ID: local-workspace
+      STRATEGY_CODEBOT_USER_TIER: ${STRATEGY_CODEBOT_USER_TIER:-free}
+      NEXT_PUBLIC_CLERK_SIGN_IN_URL: ${NEXT_PUBLIC_CLERK_SIGN_IN_URL:-/sign-in}
+      NEXT_PUBLIC_CLERK_SIGN_UP_URL: ${NEXT_PUBLIC_CLERK_SIGN_UP_URL:-/sign-up}
+      NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL: ${NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL:-/}
+      NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL: ${NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL:-/}
+      NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY:-}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  litellm-postgres-data:
+  redis-data:
+  api-artifacts:

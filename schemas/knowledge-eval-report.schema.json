@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/knowledge-eval-report.schema.json",
+  "title": "KnowledgeEvalReport",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["suite", "status", "case_count", "passed", "failed", "cases"],
+  "properties": {
+    "suite": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "enum": ["pass", "fail"] },
+    "case_count": { "type": "integer", "minimum": 0 },
+    "passed": { "type": "integer", "minimum": 0 },
+    "failed": { "type": "integer", "minimum": 0 },
+    "cases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status", "retrieved_chunks"],
+        "properties": {
+          "id": { "type": ["string", "null"] },
+          "status": { "type": "string", "enum": ["pass", "fail"] },
+          "retrieved_chunks": { "type": "array" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+name: price-action-core
+description: Live/eval prompts for price-action-only strategy generation.
+cases:
+  - id: bos_retest_price_action
+    prompt: Create a Pine v6 price-action-only strategy using break of structure, retest, and confirmed candle rejection. Do not use indicators.
+    expected_statuses: ["pass"]
+  - id: liquidity_sweep_reclaim
+    prompt: Create a Pine v6 price-action strategy using a liquidity sweep and reclaim candle, with explicit stop and take-profit rules.
+    expected_statuses: ["pass"]
+  - id: support_resistance_rejection
+    prompt: Create a Pine v6 strategy from support/resistance rejection candles only, avoiding indicator-based entries.
+    expected_statuses: ["pass"]
+  - id: sweep_failed_reclaim_avoidance
+    prompt: Create a Pine v6 price-action-only liquidity sweep strategy that avoids chasing failed reclaims, defines invalidation beyond the swept wick, and uses a structure target or bounded reward/risk fallback. Do not use indicators.
+    expected_statuses: ["pass"]
+  - id: bos_retest_invalidation
+    prompt: Create a Pine v6 no-indicator BOS and retest strategy with confirmed candle rejection, explicit invalidation if structure fails, and fixed 1% risk.
+    expected_statuses: ["pass"]
+  - id: session_liquidity_rejection
+    prompt: Create a Pine v6 support/resistance rejection strategy for crypto that states timeframe and session/liquidity assumptions, uses OHLC-only structure, and avoids indicator-based entries.
+    expected_statuses: ["pass"]
+  - id: vague_price_action_assumptions
+    prompt: Create a Pine v6 price action strategy and encode reasonable assumptions for regime, invalidation, false-break handling, and risk controls instead of leaving vague discretionary rules.
+    expected_statuses: ["pass"]

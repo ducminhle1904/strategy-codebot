@@ -10,6 +10,7 @@ Generated strategy artifacts should state:
 
 - Backtests are not guarantees of future results.
 - Users must review and test code before use.
+- Strategies must not be described as guaranteed profit, no-loss, certified safe, or live-ready.
 - Live trading requires separate risk controls and approval.
 - Platform execution assumptions may differ from real broker behavior.
 
@@ -20,4 +21,3 @@ Generated strategy artifacts should state:
 - Account-specific financial advice.
 - Profitability claims.
 - Hidden optimization or curve fitting.
-

@@ -1,0 +1,67 @@
+name: knowledge-core
+description: Retrieval accuracy checks for the Trading Knowledge Base.
+cases:
+  - id: price_action_bos
+    query: Create a price action strategy using break of structure and retest without indicators.
+    expected_terms: ["break of structure", "pullback", "confirmed bars"]
+    expected_types: ["strategy_pattern"]
+    min_results: 1
+  - id: liquidity_sweep
+    query: Build a liquidity sweep strategy with a reclaim candle and bounded stop.
+    expected_terms: ["liquidity sweep", "reclaim", "sweep extreme"]
+    expected_types: ["strategy_pattern"]
+    min_results: 1
+  - id: pine_repaint
+    query: Repair Pine request.security code that uses lookahead_on.
+    expected_terms: ["lookahead_on", "barmerge.lookahead_off", "repaint"]
+    expected_types: ["procedural"]
+    min_results: 1
+  - id: vague_price_action_structure
+    query: The user asks for a price action strategy but gives no indicators or exact rules.
+    expected_terms: ["observable market structure", "invalidation"]
+    expected_types: ["semantic"]
+    min_results: 1
+  - id: rejection_candle_price_action
+    query: Generate a support and resistance rejection candle strategy without indicators.
+    expected_terms: ["rejection candle", "wick/body", "OHLC"]
+    expected_types: ["strategy_pattern"]
+    min_results: 1
+  - id: risk_boundary
+    query: Add risk controls and avoid live trading readiness claims.
+    expected_terms: ["risk controls", "live trading", "approval"]
+    expected_types: ["procedural"]
+    expected_sources: ["internal-risk-policy"]
+    expected_citations: ["internal-risk-policy"]
+    min_confidence: 0.4
+    min_results: 1
+  - id: crypto_playbook
+    query: Create a crypto BTC perpetual breakout strategy with funding and exchange liquidity risk.
+    expected_terms: ["funding", "exchange", "liquidity"]
+    expected_types: ["semantic"]
+    expected_sources: ["internal-crypto-playbook"]
+    forbidden_sources: ["internal-forex-playbook"]
+    min_confidence: 0.4
+    min_results: 1
+  - id: forex_playbook
+    query: Create a forex EURUSD London session mean reversion strategy with spread and rollover controls.
+    expected_terms: ["session", "spread", "rollover"]
+    expected_types: ["semantic"]
+    expected_sources: ["internal-forex-playbook"]
+    forbidden_sources: ["internal-crypto-playbook"]
+    min_confidence: 0.4
+    min_results: 1
+  - id: crypto_perp_fakeout_playbook
+    query: Build a crypto BTC perpetual fakeout strategy with liquidity sweep, funding risk, and exchange traps.
+    expected_terms: ["funding", "liquidity", "fakeout"]
+    expected_types: ["semantic"]
+    min_results: 1
+  - id: forex_london_breakout_playbook
+    query: Build a forex London breakout strategy with spread, rollover, news, and false-break handling.
+    expected_terms: ["london breakout", "spread", "false-break"]
+    expected_types: ["semantic"]
+    min_results: 1
+  - id: no_indicator_price_action_playbook
+    query: Build a no-indicator price action strategy using BOS retest without future pivots.
+    expected_terms: ["no-indicator price action", "future pivots", "clarifying questions"]
+    expected_types: ["strategy_pattern"]
+    min_results: 1

@@ -59,12 +59,17 @@
         "review_failed",
         "review_validation_disagreement",
         "artifact_missing",
+        "free_capacity_unavailable",
         "tool_error",
         "provider_error",
         "unknown"
       ]
     },
     "tool_id": { "type": "string", "minLength": 1 },
+    "label": { "type": "string" },
+    "input_summary": { "type": "string" },
+    "output_summary": { "type": "string" },
+    "tool_user_summary": { "type": "string" },
     "policy_mode": {
       "type": "string",
       "enum": ["observe", "enforce"]

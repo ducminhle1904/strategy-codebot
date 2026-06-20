@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/knowledge-index.schema.json",
+  "title": "KnowledgeIndex",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["index_id", "created_at", "version", "store", "embedding_model", "items", "chunks", "sources", "stats"],
+  "properties": {
+    "index_id": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "version": { "type": "integer", "minimum": 1 },
+    "store": {
+      "type": "object",
+      "required": ["type", "adapter"],
+      "properties": {
+        "type": { "type": "string", "enum": ["postgres_pgvector"] },
+        "adapter": { "type": "string", "minLength": 1 },
+        "postgres_schema_ref": { "type": "string" }
+      }
+    },
+    "embedding_profile": { "type": "string", "enum": ["local", "production-openrouter", "production-openai"] },
+    "embedding_provider": { "type": "string", "enum": ["local", "openrouter", "openai"] },
+    "embedding_model": { "type": "string", "minLength": 1 },
+    "embedding_dimension": { "type": "integer", "minimum": 1 },
+    "items": { "type": "array", "items": { "type": "object" } },
+    "chunks": { "type": "array", "items": { "type": "object" } },
+    "sources": { "type": "array", "items": { "type": "object" } },
+    "stats": { "type": "object" }
+  }
+}

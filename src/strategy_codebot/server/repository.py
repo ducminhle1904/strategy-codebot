@@ -1,0 +1,1555 @@
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from threading import RLock
+from typing import Protocol
+
+from strategy_codebot.server.auth import AuthContext
+from strategy_codebot.server.ids import opaque_id
+from strategy_codebot.server.models import utc_now
+from strategy_codebot.server.run_modes import BACKTEST_JOB_MAX_ATTEMPTS
+from strategy_codebot.server.run_modes import backtest_active_limit_from_payload
+
+TERMINAL_RUN_STATUSES = {"completed", "failed", "blocked", "cancelled"}
+RunEventInput = tuple[str, dict | None]
+ArtifactInput = tuple[str, str | None, str, str, dict | None]
+
+
+@dataclass(frozen=True)
+class ConversationRecord:
+    id: str
+    owner_user_id: str
+    workspace_id: str
+    title: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class MessageRecord:
+    id: str
+    conversation_id: str
+    owner_user_id: str
+    workspace_id: str
+    role: str
+    content: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ConversationMemoryRecord:
+    id: str
+    conversation_id: str
+    owner_user_id: str
+    workspace_id: str
+    summary: str
+    covered_message_id: str | None
+    summary_version: int
+    estimated_tokens: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class AssistantRunRecord:
+    id: str
+    conversation_id: str
+    owner_user_id: str
+    workspace_id: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    mode: str | None = None
+    retry_of_run_id: str | None = None
+    request_id: str | None = None
+    trace_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RunJobRecord:
+    id: str
+    run_id: str
+    owner_user_id: str
+    workspace_id: str
+    job_type: str
+    status: str
+    payload_json: dict
+    attempts: int
+    max_attempts: int
+    lease_owner: str | None
+    leased_until: datetime | None
+    result_json: dict | None
+    error_code: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class RunQueueStatsRecord:
+    queued: int
+    running: int
+    oldest_queued_seconds: int | None
+    oldest_running_seconds: int | None = None
+    failed: int = 0
+    active_running: int = 0
+    stale_running: int = 0
+
+
+@dataclass(frozen=True)
+class RunEventRecord:
+    id: str
+    run_id: str
+    conversation_id: str
+    owner_user_id: str
+    workspace_id: str
+    sequence: int
+    type: str
+    payload: dict | None
+    created_at: datetime
+    request_id: str | None = None
+    trace_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RunEventSummaryRecord:
+    event_count: int
+    latest_event: RunEventRecord | None
+
+
+@dataclass(frozen=True)
+class ArtifactRecord:
+    id: str
+    run_id: str | None
+    conversation_id: str | None
+    owner_user_id: str
+    workspace_id: str
+    kind: str
+    mime_type: str | None
+    display_name: str
+    storage_key: str
+    metadata_json: dict | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class RunProgressSnapshotRecord:
+    run: AssistantRunRecord
+    event_summary: RunEventSummaryRecord
+    artifacts: list[ArtifactRecord]
+
+
+@dataclass(frozen=True)
+class ConversationStateSnapshotRecord:
+    conversation: ConversationRecord
+    messages: list[MessageRecord]
+    message_count: int
+    messages_truncated: bool
+    message_limit: int
+    latest_run: AssistantRunRecord | None
+    latest_run_artifacts: list[ArtifactRecord]
+    latest_run_events: list[RunEventRecord]
+    latest_strategy_spec: "StrategySpecRecord | None" = None
+
+
+@dataclass(frozen=True)
+class AccountUsageSummaryRecord:
+    messages: int
+    runs: int
+    artifacts: int
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    estimated_cost_usd: float | None
+
+
+@dataclass(frozen=True)
+class StrategySpecRecord:
+    id: str
+    run_id: str
+    owner_user_id: str
+    workspace_id: str
+    payload_json: dict
+    schema_version: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ValidationReportRecord:
+    id: str
+    run_id: str
+    owner_user_id: str
+    workspace_id: str
+    status: str
+    payload_json: dict
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ReviewReportRecord:
+    id: str
+    run_id: str
+    owner_user_id: str
+    workspace_id: str
+    decision: str
+    payload_json: dict
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ToolCallRecord:
+    id: str
+    run_id: str
+    tool_id: str
+    status: str
+    input_json: dict | None
+    output_json: dict | None
+    policy_findings_json: list | None
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class PolicyFindingRecord:
+    id: str
+    run_id: str
+    tool_call_id: str | None
+    owner_user_id: str
+    workspace_id: str
+    severity: str
+    code: str
+    message: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class UsageLedgerRecord:
+    id: str
+    owner_user_id: str
+    workspace_id: str
+    run_id: str | None
+    model: str | None
+    tool_id: str | None
+    input_tokens: int
+    output_tokens: int
+    cost_estimate_usd: float | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class FeedbackRecord:
+    id: str
+    conversation_id: str
+    run_id: str | None
+    message_id: str | None
+    artifact_id: str | None
+    owner_user_id: str
+    workspace_id: str
+    request_id: str | None
+    trace_id: str | None
+    rating: str
+    category: str | None
+    correction: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class ConversationSidebarRecord:
+    conversation: ConversationRecord
+    last_message_content: str | None
+    last_message_at: datetime | None
+    message_count: int
+    latest_run_id: str | None
+    latest_run_status: str | None
+    updated_at: datetime
+
+
+class ConversationRepository(Protocol):
+    def create_conversation(self, auth: AuthContext, title: str | None = None) -> ConversationRecord: ...
+
+    def list_conversations(self, auth: AuthContext) -> list[ConversationRecord]: ...
+
+    def list_conversation_sidebar(self, auth: AuthContext) -> list[ConversationSidebarRecord]: ...
+
+    def get_conversation(self, auth: AuthContext, conversation_id: str) -> ConversationRecord | None: ...
+
+    def update_conversation_title(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        title: str,
+    ) -> ConversationRecord | None: ...
+
+    def delete_conversation(self, auth: AuthContext, conversation_id: str) -> ConversationRecord | None: ...
+
+    def create_message(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        content: str,
+        *,
+        role: str = "user",
+    ) -> MessageRecord | None: ...
+
+    def list_messages(self, auth: AuthContext, conversation_id: str) -> list[MessageRecord]: ...
+
+    def list_messages_for_context(self, auth: AuthContext, conversation_id: str, *, limit: int | None = 80) -> list[MessageRecord]: ...
+
+    def get_conversation_memory(self, auth: AuthContext, conversation_id: str) -> ConversationMemoryRecord | None: ...
+
+    def upsert_conversation_memory(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        summary: str,
+        covered_message_id: str | None,
+        estimated_tokens: int,
+    ) -> ConversationMemoryRecord | None: ...
+
+    def get_conversation_state_snapshot(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        event_limit: int = 30,
+        message_limit: int = 100,
+    ) -> ConversationStateSnapshotRecord | None: ...
+
+    def create_run(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        status: str = "running",
+        mode: str | None = None,
+        retry_of_run_id: str | None = None,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> AssistantRunRecord | None: ...
+
+    def list_runs(self, auth: AuthContext, conversation_id: str) -> list[AssistantRunRecord] | None: ...
+
+    def get_run(self, auth: AuthContext, run_id: str) -> AssistantRunRecord | None: ...
+
+    def create_run_job(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        job_type: str,
+        payload_json: dict,
+        max_attempts: int = BACKTEST_JOB_MAX_ATTEMPTS,
+    ) -> RunJobRecord | None: ...
+
+    def claim_run_job(self, *, job_type: str, worker_id: str, lease_seconds: int = 300) -> RunJobRecord | None: ...
+
+    def complete_run_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        result_json: dict | None = None,
+        error_code: str | None = None,
+    ) -> RunJobRecord | None: ...
+
+    def cancel_run_jobs(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        statuses: tuple[str, ...] = ("queued", "running"),
+        result_json: dict | None = None,
+        error_code: str | None = None,
+    ) -> int: ...
+
+    def get_run_job(self, job_id: str) -> RunJobRecord | None: ...
+
+    def run_queue_stats(self, *, job_type: str | None = None) -> RunQueueStatsRecord: ...
+
+    def append_run_event(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        event_type: str,
+        payload: dict | None = None,
+    ) -> RunEventRecord | None: ...
+
+    def append_run_events(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        events: list[RunEventInput],
+    ) -> list[RunEventRecord] | None: ...
+
+    def list_run_events(self, auth: AuthContext, run_id: str) -> list[RunEventRecord] | None: ...
+
+    def list_run_events_after(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        last_event_id: str | None = None,
+    ) -> list[RunEventRecord] | None: ...
+
+    def summarize_run_events(self, auth: AuthContext, run_id: str) -> RunEventSummaryRecord | None: ...
+
+    def get_run_progress_snapshot(self, auth: AuthContext, run_id: str) -> RunProgressSnapshotRecord | None: ...
+
+    def set_run_status(self, auth: AuthContext, run_id: str, status: str) -> AssistantRunRecord | None: ...
+
+    def create_strategy_spec(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        payload: dict,
+        schema_version: str,
+    ) -> StrategySpecRecord | None: ...
+
+    def create_artifact(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        kind: str,
+        mime_type: str | None,
+        display_name: str,
+        storage_key: str,
+        metadata_json: dict | None = None,
+    ) -> ArtifactRecord | None: ...
+
+    def create_artifacts(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        artifacts: list[ArtifactInput],
+    ) -> list[ArtifactRecord] | None: ...
+
+    def list_artifacts(self, auth: AuthContext, run_id: str) -> list[ArtifactRecord] | None: ...
+
+    def get_artifact(self, auth: AuthContext, artifact_id: str) -> ArtifactRecord | None: ...
+
+    def create_validation_report(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        status: str,
+        payload: dict,
+    ) -> ValidationReportRecord | None: ...
+
+    def create_review_report(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        decision: str,
+        payload: dict,
+    ) -> ReviewReportRecord | None: ...
+
+    def create_tool_call(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        tool_id: str,
+        status: str,
+        input_json: dict | None = None,
+        policy_findings_json: list | None = None,
+    ) -> ToolCallRecord | None: ...
+
+    def complete_tool_call(
+        self,
+        auth: AuthContext,
+        tool_call_id: str,
+        *,
+        status: str,
+        output_json: dict | None = None,
+        policy_findings_json: list | None = None,
+    ) -> ToolCallRecord | None: ...
+
+    def create_policy_finding(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        severity: str,
+        code: str,
+        message: str,
+        tool_call_id: str | None = None,
+    ) -> PolicyFindingRecord | None: ...
+
+    def create_usage_ledger(
+        self,
+        auth: AuthContext,
+        *,
+        run_id: str | None,
+        model: str | None,
+        tool_id: str | None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_estimate_usd: float | None = None,
+    ) -> UsageLedgerRecord | None: ...
+
+    def list_tool_calls(self, auth: AuthContext, run_id: str) -> list[ToolCallRecord] | None: ...
+
+    def list_policy_findings(self, auth: AuthContext, run_id: str) -> list[PolicyFindingRecord] | None: ...
+
+    def list_usage_ledger(self, auth: AuthContext, run_id: str) -> list[UsageLedgerRecord] | None: ...
+
+    def summarize_account_usage(self, auth: AuthContext) -> AccountUsageSummaryRecord: ...
+
+    def create_feedback(
+        self,
+        auth: AuthContext,
+        *,
+        conversation_id: str,
+        rating: str,
+        correction: str,
+        category: str | None = None,
+        run_id: str | None = None,
+        message_id: str | None = None,
+        artifact_id: str | None = None,
+    ) -> FeedbackRecord | None: ...
+
+
+class InMemoryConversationRepository:
+    def __init__(self) -> None:
+        self._lock = RLock()
+        self._conversations: dict[str, ConversationRecord] = {}
+        self._messages: dict[str, list[MessageRecord]] = {}
+        self._conversation_memories: dict[str, ConversationMemoryRecord] = {}
+        self._runs: dict[str, AssistantRunRecord] = {}
+        self._run_jobs: dict[str, RunJobRecord] = {}
+        self._run_events: dict[str, list[RunEventRecord]] = {}
+        self._artifacts: dict[str, ArtifactRecord] = {}
+        self._strategy_specs: dict[str, StrategySpecRecord] = {}
+        self._validation_reports: dict[str, ValidationReportRecord] = {}
+        self._review_reports: dict[str, ReviewReportRecord] = {}
+        self._tool_calls: dict[str, ToolCallRecord] = {}
+        self._policy_findings: dict[str, PolicyFindingRecord] = {}
+        self._usage_ledger: dict[str, UsageLedgerRecord] = {}
+        self._feedback: dict[str, FeedbackRecord] = {}
+
+    def create_conversation(self, auth: AuthContext, title: str | None = None) -> ConversationRecord:
+        now = _now()
+        conversation = ConversationRecord(
+            id=opaque_id("conv"),
+            owner_user_id=auth.user_id,
+            workspace_id=auth.workspace_id,
+            title=title,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self._conversations[conversation.id] = conversation
+            self._messages[conversation.id] = []
+        return conversation
+
+    def list_conversations(self, auth: AuthContext) -> list[ConversationRecord]:
+        with self._lock:
+            conversations = [
+                conversation
+                for conversation in self._conversations.values()
+                if _is_authorized(auth, conversation)
+            ]
+        return sorted(conversations, key=lambda conversation: conversation.updated_at, reverse=True)
+
+    def list_conversation_sidebar(self, auth: AuthContext) -> list[ConversationSidebarRecord]:
+        conversations = self.list_conversations(auth)
+        with self._lock:
+            rows = [
+                _sidebar_record(
+                    conversation,
+                    self._messages.get(conversation.id, []),
+                    [
+                        run
+                        for run in self._runs.values()
+                        if run.conversation_id == conversation.id
+                        and run.owner_user_id == auth.user_id
+                        and run.workspace_id == auth.workspace_id
+                    ],
+                )
+                for conversation in conversations
+            ]
+        return rows
+
+    def get_conversation(self, auth: AuthContext, conversation_id: str) -> ConversationRecord | None:
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+        if conversation is None or not _is_authorized(auth, conversation):
+            return None
+        return conversation
+
+    def update_conversation_title(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        title: str,
+    ) -> ConversationRecord | None:
+        now = _now()
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or not _is_authorized(auth, conversation):
+                return None
+            updated = ConversationRecord(
+                id=conversation.id,
+                owner_user_id=conversation.owner_user_id,
+                workspace_id=conversation.workspace_id,
+                title=title,
+                created_at=conversation.created_at,
+                updated_at=now,
+            )
+            self._conversations[conversation.id] = updated
+            return updated
+
+    def delete_conversation(self, auth: AuthContext, conversation_id: str) -> ConversationRecord | None:
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or not _is_authorized(auth, conversation):
+                return None
+            return self._conversations.pop(conversation_id)
+
+    def create_message(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        content: str,
+        *,
+        role: str = "user",
+    ) -> MessageRecord | None:
+        now = _now()
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or not _is_authorized(auth, conversation):
+                return None
+
+            message = MessageRecord(
+                id=opaque_id("msg"),
+                conversation_id=conversation.id,
+                owner_user_id=auth.user_id,
+                workspace_id=auth.workspace_id,
+                role=role,
+                content=content,
+                created_at=now,
+            )
+            self._messages[conversation.id].append(message)
+            self._conversations[conversation.id] = ConversationRecord(
+                id=conversation.id,
+                owner_user_id=conversation.owner_user_id,
+                workspace_id=conversation.workspace_id,
+                title=conversation.title,
+                created_at=conversation.created_at,
+                updated_at=now,
+            )
+        return message
+
+    def list_messages(self, auth: AuthContext, conversation_id: str) -> list[MessageRecord]:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return []
+        with self._lock:
+            return list(self._messages.get(conversation_id, []))
+
+    def list_messages_for_context(self, auth: AuthContext, conversation_id: str, *, limit: int | None = 80) -> list[MessageRecord]:
+        messages = self.list_messages(auth, conversation_id)
+        if limit is not None:
+            if limit <= 0:
+                return []
+            return messages[-limit:]
+        return messages
+
+    def get_conversation_memory(self, auth: AuthContext, conversation_id: str) -> ConversationMemoryRecord | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        with self._lock:
+            memory = self._conversation_memories.get(conversation_id)
+        if memory is None or not _is_authorized(auth, memory):
+            return None
+        return memory
+
+    def upsert_conversation_memory(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        summary: str,
+        covered_message_id: str | None,
+        estimated_tokens: int,
+    ) -> ConversationMemoryRecord | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        now = _now()
+        with self._lock:
+            existing = self._conversation_memories.get(conversation_id)
+            memory = ConversationMemoryRecord(
+                id=existing.id if existing is not None else opaque_id("mem"),
+                conversation_id=conversation.id,
+                owner_user_id=auth.user_id,
+                workspace_id=auth.workspace_id,
+                summary=summary,
+                covered_message_id=covered_message_id,
+                summary_version=(existing.summary_version + 1) if existing is not None else 1,
+                estimated_tokens=max(0, estimated_tokens),
+                created_at=existing.created_at if existing is not None else now,
+                updated_at=now,
+            )
+            self._conversation_memories[conversation_id] = memory
+        return memory
+
+    def get_conversation_state_snapshot(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        event_limit: int = 30,
+        message_limit: int = 100,
+    ) -> ConversationStateSnapshotRecord | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        bounded_message_limit = _bounded_state_message_limit(message_limit)
+        with self._lock:
+            all_messages = list(self._messages.get(conversation.id, []))
+            message_count = len(all_messages)
+            messages = all_messages[-bounded_message_limit:] if bounded_message_limit > 0 else []
+            runs = [
+                run
+                for run in self._runs.values()
+                if run.conversation_id == conversation.id
+                and run.owner_user_id == auth.user_id
+                and run.workspace_id == auth.workspace_id
+            ]
+            sorted_runs = sorted(runs, key=lambda run: (run.updated_at, run.created_at, run.id), reverse=True)
+            latest_run = sorted_runs[0] if sorted_runs else None
+            artifacts = (
+                [
+                    artifact
+                    for artifact in self._artifacts.values()
+                    if artifact.run_id == latest_run.id
+                    and artifact.owner_user_id == auth.user_id
+                    and artifact.workspace_id == auth.workspace_id
+                ]
+                if latest_run is not None
+                else []
+            )
+            events = list(self._run_events.get(latest_run.id, [])) if latest_run is not None else []
+            latest_strategy_spec = (
+                next(
+                    (
+                        spec
+                        for spec in self._strategy_specs.values()
+                        if spec.run_id == latest_run.id
+                        and spec.owner_user_id == auth.user_id
+                        and spec.workspace_id == auth.workspace_id
+                    ),
+                    None,
+                )
+                if latest_run is not None
+                else None
+            )
+        bounded_events = events[-max(event_limit, 0) :] if event_limit > 0 else []
+        return ConversationStateSnapshotRecord(
+            conversation=conversation,
+            messages=messages,
+            message_count=message_count,
+            messages_truncated=message_count > len(messages),
+            message_limit=bounded_message_limit,
+            latest_run=latest_run,
+            latest_run_artifacts=artifacts,
+            latest_run_events=bounded_events,
+            latest_strategy_spec=latest_strategy_spec,
+        )
+
+    def create_run(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        status: str = "running",
+        mode: str | None = None,
+        retry_of_run_id: str | None = None,
+        request_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> AssistantRunRecord | None:
+        now = _now()
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or not _is_authorized(auth, conversation):
+                return None
+            run = AssistantRunRecord(
+                id=opaque_id("run"),
+                conversation_id=conversation.id,
+                owner_user_id=auth.user_id,
+                workspace_id=auth.workspace_id,
+                status=status,
+                created_at=now,
+                updated_at=now,
+                mode=mode,
+                retry_of_run_id=retry_of_run_id,
+                request_id=request_id or opaque_id("req"),
+                trace_id=trace_id or opaque_id("trace"),
+            )
+            self._runs[run.id] = run
+            self._run_events[run.id] = []
+        return run
+
+    def get_run(self, auth: AuthContext, run_id: str) -> AssistantRunRecord | None:
+        with self._lock:
+            run = self._runs.get(run_id)
+        if run is None or not _is_run_authorized(auth, run):
+            return None
+        return run
+
+    def create_run_job(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        job_type: str,
+        payload_json: dict,
+        max_attempts: int = BACKTEST_JOB_MAX_ATTEMPTS,
+    ) -> RunJobRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            job = RunJobRecord(
+                id=opaque_id("job"),
+                run_id=run.id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                job_type=job_type,
+                status="queued",
+                payload_json=payload_json,
+                attempts=0,
+                max_attempts=max_attempts,
+                lease_owner=None,
+                leased_until=None,
+                result_json=None,
+                error_code=None,
+                created_at=now,
+                updated_at=now,
+            )
+            self._run_jobs[job.id] = job
+            return job
+
+    def claim_run_job(self, *, job_type: str, worker_id: str, lease_seconds: int = 300) -> RunJobRecord | None:
+        now = _now()
+        with self._lock:
+            queued = [
+                job
+                for job in self._run_jobs.values()
+                if job.job_type == job_type
+                and job.attempts < job.max_attempts
+                and (
+                    job.status == "queued"
+                    or (job.status == "running" and job.leased_until is not None and job.leased_until < now)
+                )
+            ]
+            if not queued:
+                return None
+            job = None
+            for candidate in sorted(queued, key=lambda item: (item.created_at, item.id)):
+                active_limit = _job_workspace_active_limit(candidate)
+                running_count = sum(
+                    1
+                    for item in self._run_jobs.values()
+                    if item.job_type == candidate.job_type
+                    and item.workspace_id == candidate.workspace_id
+                    and item.status == "running"
+                    and item.leased_until is not None
+                    and item.leased_until >= now
+                )
+                if running_count < active_limit:
+                    job = candidate
+                    break
+            if job is None:
+                return None
+            updated = RunJobRecord(
+                id=job.id,
+                run_id=job.run_id,
+                owner_user_id=job.owner_user_id,
+                workspace_id=job.workspace_id,
+                job_type=job.job_type,
+                status="running",
+                payload_json=job.payload_json,
+                attempts=job.attempts + 1,
+                max_attempts=job.max_attempts,
+                lease_owner=worker_id,
+                leased_until=now + timedelta(seconds=lease_seconds),
+                result_json=job.result_json,
+                error_code=job.error_code,
+                created_at=job.created_at,
+                updated_at=now,
+            )
+            self._run_jobs[job.id] = updated
+            return updated
+
+    def complete_run_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        result_json: dict | None = None,
+        error_code: str | None = None,
+    ) -> RunJobRecord | None:
+        now = _now()
+        with self._lock:
+            job = self._run_jobs.get(job_id)
+            if job is None:
+                return None
+            updated = RunJobRecord(
+                id=job.id,
+                run_id=job.run_id,
+                owner_user_id=job.owner_user_id,
+                workspace_id=job.workspace_id,
+                job_type=job.job_type,
+                status=status,
+                payload_json=job.payload_json,
+                attempts=job.attempts,
+                max_attempts=job.max_attempts,
+                lease_owner=None,
+                leased_until=None,
+                result_json=result_json,
+                error_code=error_code,
+                created_at=job.created_at,
+                updated_at=now,
+            )
+            self._run_jobs[job.id] = updated
+            return updated
+
+    def cancel_run_jobs(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        statuses: tuple[str, ...] = ("queued", "running"),
+        result_json: dict | None = None,
+        error_code: str | None = None,
+    ) -> int:
+        now = _now()
+        cancelled = 0
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return 0
+            for job in list(self._run_jobs.values()):
+                if job.run_id != run_id or job.status not in statuses:
+                    continue
+                self._run_jobs[job.id] = RunJobRecord(
+                    id=job.id,
+                    run_id=job.run_id,
+                    owner_user_id=job.owner_user_id,
+                    workspace_id=job.workspace_id,
+                    job_type=job.job_type,
+                    status="cancelled",
+                    payload_json=job.payload_json,
+                    attempts=job.attempts,
+                    max_attempts=job.max_attempts,
+                    lease_owner=None,
+                    leased_until=None,
+                    result_json=result_json,
+                    error_code=error_code,
+                    created_at=job.created_at,
+                    updated_at=now,
+                )
+                cancelled += 1
+        return cancelled
+
+    def get_run_job(self, job_id: str) -> RunJobRecord | None:
+        with self._lock:
+            return self._run_jobs.get(job_id)
+
+    def run_queue_stats(self, *, job_type: str | None = None) -> RunQueueStatsRecord:
+        now = _now()
+        with self._lock:
+            jobs = [job for job in self._run_jobs.values() if job_type is None or job.job_type == job_type]
+            queued = [job for job in jobs if job.status == "queued"]
+            running = [job for job in jobs if job.status == "running"]
+            active_running = [
+                job for job in running if job.leased_until is not None and job.leased_until >= now
+            ]
+            failed = [job for job in jobs if job.status == "failed"]
+            oldest = min((job.created_at for job in queued), default=None)
+            oldest_running = min((job.updated_at for job in active_running), default=None)
+        return RunQueueStatsRecord(
+            queued=len(queued),
+            running=len(running),
+            oldest_queued_seconds=int((now - oldest).total_seconds()) if oldest is not None else None,
+            oldest_running_seconds=int((now - oldest_running).total_seconds()) if oldest_running is not None else None,
+            failed=len(failed),
+            active_running=len(active_running),
+            stale_running=len(running) - len(active_running),
+        )
+
+    def list_runs(self, auth: AuthContext, conversation_id: str) -> list[AssistantRunRecord] | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        with self._lock:
+            rows = [
+                run
+                for run in self._runs.values()
+                if run.conversation_id == conversation.id
+                and run.owner_user_id == auth.user_id
+                and run.workspace_id == auth.workspace_id
+            ]
+        return sorted(rows, key=lambda run: (run.updated_at, run.created_at, run.id), reverse=True)
+
+    def append_run_event(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        event_type: str,
+        payload: dict | None = None,
+    ) -> RunEventRecord | None:
+        events = self.append_run_events(auth, run_id, [(event_type, payload)])
+        if not events:
+            return None
+        return events[0]
+
+    def append_run_events(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        events: list[RunEventInput],
+    ) -> list[RunEventRecord] | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            existing = self._run_events.setdefault(run.id, [])
+            created = [
+                RunEventRecord(
+                    id=opaque_id("evt"),
+                    run_id=run.id,
+                    conversation_id=run.conversation_id,
+                    owner_user_id=run.owner_user_id,
+                    workspace_id=run.workspace_id,
+                    sequence=len(existing) + index,
+                    type=event_type,
+                    payload=payload,
+                    created_at=now,
+                    request_id=run.request_id,
+                    trace_id=run.trace_id,
+                )
+                for index, (event_type, payload) in enumerate(events, start=1)
+            ]
+            existing.extend(created)
+        return created
+
+    def list_run_events(self, auth: AuthContext, run_id: str) -> list[RunEventRecord] | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            return list(self._run_events.get(run.id, []))
+
+    def list_run_events_after(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        last_event_id: str | None = None,
+    ) -> list[RunEventRecord] | None:
+        events = self.list_run_events(auth, run_id)
+        if events is None:
+            return None
+        return _events_after_last_id(events, last_event_id)
+
+    def summarize_run_events(self, auth: AuthContext, run_id: str) -> RunEventSummaryRecord | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            events = self._run_events.get(run.id, [])
+            return RunEventSummaryRecord(event_count=len(events), latest_event=events[-1] if events else None)
+
+    def get_run_progress_snapshot(self, auth: AuthContext, run_id: str) -> RunProgressSnapshotRecord | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        event_summary = self.summarize_run_events(auth, run.id)
+        artifacts = self.list_artifacts(auth, run.id)
+        if event_summary is None or artifacts is None:
+            return None
+        return RunProgressSnapshotRecord(run=run, event_summary=event_summary, artifacts=artifacts)
+
+    def set_run_status(self, auth: AuthContext, run_id: str, status: str) -> AssistantRunRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            updated = AssistantRunRecord(
+                id=run.id,
+                conversation_id=run.conversation_id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                status=status,
+                created_at=run.created_at,
+                updated_at=now,
+                mode=run.mode,
+                retry_of_run_id=run.retry_of_run_id,
+                request_id=run.request_id,
+                trace_id=run.trace_id,
+            )
+            self._runs[run.id] = updated
+        return updated
+
+    def create_strategy_spec(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        payload: dict,
+        schema_version: str,
+    ) -> StrategySpecRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            spec = StrategySpecRecord(
+                id=opaque_id("spec"),
+                run_id=run.id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                payload_json=payload,
+                schema_version=schema_version,
+                created_at=now,
+            )
+            self._strategy_specs[spec.id] = spec
+        return spec
+
+    def create_artifact(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        kind: str,
+        mime_type: str | None,
+        display_name: str,
+        storage_key: str,
+        metadata_json: dict | None = None,
+    ) -> ArtifactRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            artifact = ArtifactRecord(
+                id=opaque_id("art"),
+                run_id=run.id,
+                conversation_id=run.conversation_id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                kind=kind,
+                mime_type=mime_type,
+                display_name=display_name,
+                storage_key=storage_key,
+                metadata_json=metadata_json,
+                created_at=now,
+            )
+            self._artifacts[artifact.id] = artifact
+        return artifact
+
+    def create_artifacts(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        artifacts: list[ArtifactInput],
+    ) -> list[ArtifactRecord] | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            created = [
+                ArtifactRecord(
+                    id=opaque_id("art"),
+                    run_id=run.id,
+                    conversation_id=run.conversation_id,
+                    owner_user_id=run.owner_user_id,
+                    workspace_id=run.workspace_id,
+                    kind=kind,
+                    mime_type=mime_type,
+                    display_name=display_name,
+                    storage_key=storage_key,
+                    metadata_json=metadata_json,
+                    created_at=now,
+                )
+                for kind, mime_type, display_name, storage_key, metadata_json in artifacts
+            ]
+            for artifact in created:
+                self._artifacts[artifact.id] = artifact
+        return created
+
+    def list_artifacts(self, auth: AuthContext, run_id: str) -> list[ArtifactRecord] | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            return sorted(
+                [
+                artifact
+                for artifact in self._artifacts.values()
+                if artifact.run_id == run.id
+                and artifact.owner_user_id == auth.user_id
+                and artifact.workspace_id == auth.workspace_id
+                ],
+                key=lambda artifact: (artifact.created_at, artifact.storage_key, artifact.id),
+            )
+
+    def get_artifact(self, auth: AuthContext, artifact_id: str) -> ArtifactRecord | None:
+        with self._lock:
+            artifact = self._artifacts.get(artifact_id)
+        if artifact is None:
+            return None
+        if artifact.owner_user_id != auth.user_id or artifact.workspace_id != auth.workspace_id:
+            return None
+        return artifact
+
+    def create_validation_report(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        status: str,
+        payload: dict,
+    ) -> ValidationReportRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            report = ValidationReportRecord(
+                id=opaque_id("val"),
+                run_id=run.id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                status=status,
+                payload_json=payload,
+                created_at=now,
+            )
+            self._validation_reports[report.id] = report
+        return report
+
+    def create_review_report(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        decision: str,
+        payload: dict,
+    ) -> ReviewReportRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            report = ReviewReportRecord(
+                id=opaque_id("rev"),
+                run_id=run.id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                decision=decision,
+                payload_json=payload,
+                created_at=now,
+            )
+            self._review_reports[report.id] = report
+        return report
+
+    def create_tool_call(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        tool_id: str,
+        status: str,
+        input_json: dict | None = None,
+        policy_findings_json: list | None = None,
+    ) -> ToolCallRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            tool_call = ToolCallRecord(
+                id=opaque_id("toolcall"),
+                run_id=run.id,
+                tool_id=tool_id,
+                status=status,
+                input_json=input_json,
+                output_json=None,
+                policy_findings_json=policy_findings_json,
+                created_at=now,
+                started_at=now if status == "running" else None,
+            )
+            self._tool_calls[tool_call.id] = tool_call
+        return tool_call
+
+    def complete_tool_call(
+        self,
+        auth: AuthContext,
+        tool_call_id: str,
+        *,
+        status: str,
+        output_json: dict | None = None,
+        policy_findings_json: list | None = None,
+    ) -> ToolCallRecord | None:
+        now = _now()
+        with self._lock:
+            tool_call = self._tool_calls.get(tool_call_id)
+            if tool_call is None:
+                return None
+            run = self._runs.get(tool_call.run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            updated = ToolCallRecord(
+                id=tool_call.id,
+                run_id=tool_call.run_id,
+                tool_id=tool_call.tool_id,
+                status=status,
+                input_json=tool_call.input_json,
+                output_json=output_json,
+                policy_findings_json=policy_findings_json or tool_call.policy_findings_json,
+                created_at=tool_call.created_at,
+                started_at=tool_call.started_at,
+                completed_at=now,
+            )
+            self._tool_calls[updated.id] = updated
+        return updated
+
+    def create_policy_finding(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        severity: str,
+        code: str,
+        message: str,
+        tool_call_id: str | None = None,
+    ) -> PolicyFindingRecord | None:
+        now = _now()
+        with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or not _is_run_authorized(auth, run):
+                return None
+            finding = PolicyFindingRecord(
+                id=opaque_id("pol"),
+                run_id=run.id,
+                tool_call_id=tool_call_id,
+                owner_user_id=run.owner_user_id,
+                workspace_id=run.workspace_id,
+                severity=severity,
+                code=code,
+                message=message,
+                created_at=now,
+            )
+            self._policy_findings[finding.id] = finding
+        return finding
+
+    def create_usage_ledger(
+        self,
+        auth: AuthContext,
+        *,
+        run_id: str | None,
+        model: str | None,
+        tool_id: str | None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cost_estimate_usd: float | None = None,
+    ) -> UsageLedgerRecord | None:
+        now = _now()
+        with self._lock:
+            if run_id is not None:
+                run = self._runs.get(run_id)
+                if run is None or not _is_run_authorized(auth, run):
+                    return None
+            record = UsageLedgerRecord(
+                id=opaque_id("usage"),
+                owner_user_id=auth.user_id,
+                workspace_id=auth.workspace_id,
+                run_id=run_id,
+                model=model,
+                tool_id=tool_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cost_estimate_usd=cost_estimate_usd,
+                created_at=now,
+            )
+            self._usage_ledger[record.id] = record
+        return record
+
+    def list_tool_calls(self, auth: AuthContext, run_id: str) -> list[ToolCallRecord] | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            rows = [record for record in self._tool_calls.values() if record.run_id == run.id]
+        return sorted(rows, key=lambda record: (record.created_at, record.id))
+
+    def list_policy_findings(self, auth: AuthContext, run_id: str) -> list[PolicyFindingRecord] | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            rows = [record for record in self._policy_findings.values() if record.run_id == run.id]
+        return sorted(rows, key=lambda record: (record.created_at, record.id))
+
+    def list_usage_ledger(self, auth: AuthContext, run_id: str) -> list[UsageLedgerRecord] | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            rows = [record for record in self._usage_ledger.values() if record.run_id == run.id]
+        return sorted(rows, key=lambda record: (record.created_at, record.id))
+
+    def summarize_account_usage(self, auth: AuthContext) -> AccountUsageSummaryRecord:
+        with self._lock:
+            messages = [
+                message
+                for thread_messages in self._messages.values()
+                for message in thread_messages
+                if message.owner_user_id == auth.user_id and message.workspace_id == auth.workspace_id
+            ]
+            runs = [
+                run
+                for run in self._runs.values()
+                if run.owner_user_id == auth.user_id and run.workspace_id == auth.workspace_id
+            ]
+            artifacts = [
+                artifact
+                for artifact in self._artifacts.values()
+                if artifact.owner_user_id == auth.user_id and artifact.workspace_id == auth.workspace_id
+            ]
+            usage_rows = [
+                record
+                for record in self._usage_ledger.values()
+                if record.owner_user_id == auth.user_id and record.workspace_id == auth.workspace_id
+            ]
+        input_tokens = sum(record.input_tokens for record in usage_rows)
+        output_tokens = sum(record.output_tokens for record in usage_rows)
+        cost_values = [record.cost_estimate_usd for record in usage_rows if record.cost_estimate_usd is not None]
+        return AccountUsageSummaryRecord(
+            messages=len(messages),
+            runs=len(runs),
+            artifacts=len(artifacts),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            estimated_cost_usd=sum(cost_values) if cost_values else None,
+        )
+
+    def create_feedback(
+        self,
+        auth: AuthContext,
+        *,
+        conversation_id: str,
+        rating: str,
+        correction: str,
+        category: str | None = None,
+        run_id: str | None = None,
+        message_id: str | None = None,
+        artifact_id: str | None = None,
+    ) -> FeedbackRecord | None:
+        now = _now()
+        with self._lock:
+            conversation = self._conversations.get(conversation_id)
+            if conversation is None or not _is_authorized(auth, conversation):
+                return None
+            run = self._runs.get(run_id) if run_id else None
+            if run_id is not None and (
+                run is None or not _is_run_authorized(auth, run) or run.conversation_id != conversation_id
+            ):
+                return None
+            if message_id is not None and not any(
+                message.id == message_id
+                and message.owner_user_id == auth.user_id
+                and message.workspace_id == auth.workspace_id
+                for message in self._messages.get(conversation_id, [])
+            ):
+                return None
+            artifact = self._artifacts.get(artifact_id) if artifact_id else None
+            if artifact_id is not None and (
+                artifact is None
+                or artifact.owner_user_id != auth.user_id
+                or artifact.workspace_id != auth.workspace_id
+                or (artifact.conversation_id is not None and artifact.conversation_id != conversation_id)
+            ):
+                return None
+            record = FeedbackRecord(
+                id=opaque_id("fb"),
+                conversation_id=conversation_id,
+                run_id=run_id,
+                message_id=message_id,
+                artifact_id=artifact_id,
+                owner_user_id=auth.user_id,
+                workspace_id=auth.workspace_id,
+                request_id=run.request_id if run else None,
+                trace_id=run.trace_id if run else None,
+                rating=rating,
+                category=category,
+                correction=correction,
+                created_at=now,
+            )
+            self._feedback[record.id] = record
+        return record
+
+
+def _now() -> datetime:
+    return utc_now()
+
+
+def _is_authorized(auth: AuthContext, conversation: ConversationRecord) -> bool:
+    return conversation.owner_user_id == auth.user_id and conversation.workspace_id == auth.workspace_id
+
+
+def _is_run_authorized(auth: AuthContext, run: AssistantRunRecord) -> bool:
+    return run.owner_user_id == auth.user_id and run.workspace_id == auth.workspace_id
+
+
+def _job_workspace_active_limit(job: RunJobRecord) -> int:
+    return backtest_active_limit_from_payload(job.payload_json)
+
+
+def bounded_state_message_limit(message_limit: int | None) -> int:
+    if message_limit is None:
+        return 100
+    return min(500, max(0, int(message_limit)))
+
+
+def _bounded_state_message_limit(message_limit: int | None) -> int:
+    return bounded_state_message_limit(message_limit)
+
+
+def _sidebar_record(
+    conversation: ConversationRecord,
+    messages: list[MessageRecord],
+    runs: list[AssistantRunRecord],
+) -> ConversationSidebarRecord:
+    latest_run = max(runs, key=lambda run: (run.updated_at, run.created_at, run.id), default=None)
+    last_message = max(messages, key=lambda message: (message.created_at, message.id), default=None)
+    return ConversationSidebarRecord(
+        conversation=conversation,
+        last_message_content=last_message.content if last_message is not None else None,
+        last_message_at=last_message.created_at if last_message is not None else None,
+        message_count=len(messages),
+        latest_run_id=latest_run.id if latest_run is not None else None,
+        latest_run_status=latest_run.status if latest_run is not None else None,
+        updated_at=conversation.updated_at,
+    )
+
+
+def _events_after_last_id(events: list[RunEventRecord], last_event_id: str | None) -> list[RunEventRecord]:
+    if not last_event_id:
+        return events
+    if last_event_id.isdecimal():
+        sequence = int(last_event_id)
+        return [event for event in events if event.sequence > sequence]
+    for index, event in enumerate(events):
+        if event.id == last_event_id:
+            return events[index + 1 :]
+    return events

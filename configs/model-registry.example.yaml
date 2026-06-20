@@ -1,9 +1,149 @@
 gateway: litellm
+gateway_profiles:
+  direct_provider:
+    description: Direct provider API keys.
+    providers:
+      - openai
+      - anthropic
+      - google
+      - groq
+      - together
+      - fireworks
+      - deepinfra
+  hosted_router:
+    description: Hosted multi-provider routers for resilience.
+    providers:
+      - openrouter
+      - vercel_ai_gateway
+      - portkey
+  internal_proxy:
+    description: Self-hosted LiteLLM proxy for internal routing, budgets, and provider failover.
+    providers:
+      - litellm_proxy
 defaults:
   temperature: 0.2
   max_retries: 2
   request_timeout_seconds: 60
   require_structured_output: true
+stage_timeouts:
+  compact_free: 45
+  market_research: 45
+  strategy_reasoning: 60
+  strategy_coding: 60
+  pine_code_generation: 90
+  balanced_review: 60
+  repair: 90
+route_policy:
+  cooldown_seconds: 600
+  max_consecutive_failures: 2
+  prefer_healthy_routes: true
+free_route_policy:
+  max_retries: 0
+  cooldown_seconds: 600
+  max_consecutive_failures: 1
+  prefer_healthy_routes: true
+free_compact_model_limit: 3
+web_search:
+  default_mode: auto
+  primary_gateway: openrouter
+  tool_type: openrouter:web_search
+  raw_web_content_policy: citation_metadata_only
+  route_capabilities:
+    litellm_proxy:
+      supports_web_search: true
+      web_search_mode: openrouter_server_tool
+    openrouter:
+      supports_web_search: true
+      web_search_mode: openrouter_server_tool
+    vercel_ai_gateway:
+      supports_web_search: false
+      web_search_mode: candidate_unverified
+model_tiers:
+  free:
+    billing: free
+    max_repair_loops: 1
+    allow_tier_escalation: false
+    routes_by_stage:
+      strategy_reasoning:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      strategy_coding:
+        - openrouter/qwen/qwen3-coder:free
+        - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+        - openrouter/poolside/laguna-m.1:free
+      pine_code_generation:
+        - openrouter/qwen/qwen3-coder:free
+        - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+        - openrouter/poolside/laguna-m.1:free
+      balanced_review:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      repair:
+        - openrouter/qwen/qwen3-coder:free
+        - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+        - openrouter/poolside/laguna-m.1:free
+  paid_low:
+    billing: paid
+    max_repair_loops: 2
+    allow_tier_escalation: false
+    routes_by_stage:
+      strategy_reasoning:
+        - litellm_proxy/paid_low.strategy_reasoning
+        - litellm_proxy/paid_low.strategy_reasoning_vercel
+        - litellm_proxy/paid_low.strategy_reasoning_gemini_lite
+        - litellm_proxy/paid_medium.strategy_reasoning
+      strategy_coding:
+        - litellm_proxy/paid_low.strategy_coding
+        - litellm_proxy/paid_low.strategy_coding_deepseek
+        - litellm_proxy/paid_low.strategy_coding_qwen
+        - litellm_proxy/paid_medium.strategy_coding
+      pine_code_generation:
+        - litellm_proxy/paid_low.pine_code_generation
+        - litellm_proxy/paid_low.pine_code_generation_qwen
+        - litellm_proxy/paid_low.pine_code_generation_vercel
+        - litellm_proxy/paid_medium.pine_code_generation
+      balanced_review:
+        - litellm_proxy/paid_low.balanced_review
+        - litellm_proxy/paid_low.balanced_review_vercel
+        - litellm_proxy/paid_low.balanced_review_minimax
+        - litellm_proxy/paid_medium.balanced_review
+      repair:
+        - litellm_proxy/paid_low.repair
+        - litellm_proxy/paid_low.repair_qwen
+        - litellm_proxy/paid_low.repair_vercel
+        - litellm_proxy/paid_medium.repair
+  paid_medium:
+    billing: paid
+    max_repair_loops: 2
+    allow_tier_escalation: false
+    routes_by_stage:
+      strategy_reasoning:
+        - litellm_proxy/paid_medium.strategy_reasoning
+      strategy_coding:
+        - litellm_proxy/paid_medium.strategy_coding
+      pine_code_generation:
+        - litellm_proxy/paid_medium.pine_code_generation
+      balanced_review:
+        - litellm_proxy/paid_medium.balanced_review
+      repair:
+        - litellm_proxy/paid_medium.repair
+  paid_high:
+    billing: paid
+    max_repair_loops: 2
+    allow_tier_escalation: false
+    routes_by_stage:
+      strategy_reasoning:
+        - litellm_proxy/paid_high.strategy_reasoning
+      strategy_coding:
+        - litellm_proxy/paid_high.strategy_coding
+      pine_code_generation:
+        - litellm_proxy/paid_high.pine_code_generation
+      balanced_review:
+        - litellm_proxy/paid_high.balanced_review
+      repair:
+        - litellm_proxy/paid_high.repair
 
 agents:
   orchestrator:

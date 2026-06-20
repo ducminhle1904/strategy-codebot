@@ -9,10 +9,10 @@ from uuid import uuid4
 
 from strategy_codebot import __version__
 from strategy_codebot.agent_harness import write_otel_export
-from strategy_codebot.harness import build_trace_command, harness_outcome, record_trace, record_trace_intake, should_record_harness
+from strategy_codebot.harness import build_trace_command, harness_cli_availability, harness_outcome, record_trace, record_trace_intake, should_record_harness
 from strategy_codebot.harness_types import STATUS_FAIL, STATUS_PASS, STATUS_SKIPPED
 from strategy_codebot.knowledge_context import KNOWLEDGE_CONTEXT_PATH, knowledge_metadata
-from strategy_codebot.live import LIVE_ERROR_PATH, LIVE_WORKFLOW_TRACE_PATH, WORKFLOW_MULTI_AGENT, LiveError, LiveGenerationResult, LiveRunOptions, generate_live, live_error_report
+from strategy_codebot.live import LIVE_ERROR_PATH, LIVE_WORKFLOW_TRACE_PATH, MARKET_RESEARCH_PATH, PROXY_ATTRIBUTION_EVENTS_PATH, WORKFLOW_COMPACT_FREE, WORKFLOW_MULTI_AGENT, LiveError, LiveGenerationResult, LiveRunOptions, generate_live, live_error_report
 from strategy_codebot.mql5 import runner_design, validation_report as mql5_validation_report
 from strategy_codebot.paths import ensure_dir, repo_root, resolve_repo_path
 from strategy_codebot.pine import generate_pine, manual_checklist, validate_pine
@@ -21,7 +21,6 @@ from strategy_codebot.reporting import aggregate_status
 from strategy_codebot.review import REVIEW_MODE_NONE, REVIEW_MODE_PARALLEL, REVIEW_REPORT_PATH, write_review_report
 from strategy_codebot.schemas import load_strategy_spec, validate_payload, write_json
 from strategy_codebot.tool_runtime import POLICY_MODES, POLICY_OBSERVE, RUNTIME_SUMMARY_PATH, RUNTIME_TRACE_PATH, ToolHarness, call_tool
-
 
 def run_strategy(
     *,
@@ -68,11 +67,13 @@ def run_strategy(
         )
     elif mode == "live":
         assert options is not None
+        if options.proxy_attribution_path is None:
+            options.proxy_attribution_path = out_dir / PROXY_ATTRIBUTION_EVENTS_PATH
         registry_path = resolve_repo_path(model_registry or repo_root() / "configs" / "model-registry.example.yaml")
         live_output_refs = ["strategy-spec.json", "pine/strategy.pine", "live-metadata.json"]
         if options.knowledge_context == "auto":
             live_output_refs.append(KNOWLEDGE_CONTEXT_PATH)
-        if options.workflow == WORKFLOW_MULTI_AGENT:
+        if options.workflow in {WORKFLOW_MULTI_AGENT, WORKFLOW_COMPACT_FREE}:
             live_output_refs.append(LIVE_WORKFLOW_TRACE_PATH)
         try:
             live_result = call_tool(
@@ -121,10 +122,15 @@ def run_strategy(
 
     write_json_artifact("strategy-spec.json", spec)
     if live_result:
+        if live_result.market_research and live_result.market_research.get("web_search_enabled"):
+            write_json_artifact(MARKET_RESEARCH_PATH, live_result.market_research)
         if live_result.knowledge_context:
             write_json_artifact(KNOWLEDGE_CONTEXT_PATH, live_result.knowledge_context)
         if live_result.workflow_trace:
             write_json_artifact(LIVE_WORKFLOW_TRACE_PATH, live_result.workflow_trace)
+        proxy_events = _write_proxy_attribution_events(out_dir, run_id=run_id, options=options, attempts=live_result.attempts)
+        if proxy_events:
+            artifacts.append(PROXY_ATTRIBUTION_EVENTS_PATH)
         if options.save_raw_provider:
             write_json_artifact("live-provider-response.json", live_result.raw_response)
 
@@ -172,7 +178,10 @@ def run_strategy(
         write_json_artifact(QUALITY_REPORT_PATH, quality_report)
         write_json_artifact("live-metadata.json", live_result.metadata())
 
+    harness_availability = harness_cli_availability()
     repository_trace_enabled = should_record_harness(record_harness)
+    harness_recording_status = "recorded" if repository_trace_enabled else ("skipped_requested" if record_harness is False else "skipped_unavailable")
+    harness_recording_reason = "record_harness_enabled" if repository_trace_enabled else ("record_harness_disabled" if record_harness is False else str(harness_availability.get("reason") or "harness_cli_unavailable"))
     repository_intake_id = (
         record_trace_intake(
             summary=f"Strategy generation {run_id}",
@@ -218,11 +227,17 @@ def run_strategy(
         "prompt_version": __version__,
         "input_refs": [str(spec_path)] if spec_path else ["prompt"],
         "retrieved_sources": _live_retrieved_sources(live_result),
-        "tool_calls": [*(["multi-model-live-generation"] if live_result and live_result.workflow == WORKFLOW_MULTI_AGENT else []), *(["pine-static-validator"] if pine_code else []), *(["parallel-review"] if review_report else [])],
+        "tool_calls": [
+            *([_live_generation_tool_call(live_result)] if live_result else []),
+            *(["pine-static-validator"] if pine_code else []),
+            *(["parallel-review"] if review_report else []),
+        ],
         "output_refs": [*artifacts, *runtime_artifacts, "agent-run.json"],
         "validation_refs": ["validation-report.json", *([QUALITY_REPORT_PATH] if quality_report else []), *([REVIEW_REPORT_PATH] if review_report else []), *runtime_artifacts],
         "status": validation["status"],
         "warnings": [*validation["warnings"], *([finding["message"] for finding in quality_report.get("warnings", [])] if quality_report else []), *(review_report["warnings"] if review_report else [])],
+        "harness_recording_status": harness_recording_status,
+        "harness_recording_reason": harness_recording_reason,
     }
     validate_payload(agent_run, "agent-run.schema.json")
     write_json_artifact("agent-run.json", agent_run)
@@ -262,6 +277,18 @@ def _live_retrieved_sources(live_result: LiveGenerationResult | None) -> list[st
     if not live_result or not live_result.knowledge_context:
         return ["configs/source-registry.yaml"]
     return _knowledge_retrieved_sources(live_result.knowledge_context)
+
+
+def _live_generation_tool_call(live_result: LiveGenerationResult) -> str:
+    return _live_generation_tool_call_from_workflow(live_result.workflow)
+
+
+def _live_generation_tool_call_from_workflow(workflow: str) -> str:
+    if workflow == WORKFLOW_MULTI_AGENT:
+        return "multi-model-live-generation"
+    if workflow == WORKFLOW_COMPACT_FREE:
+        return "compact-free-live-generation"
+    return "live-generation"
 
 
 def _knowledge_retrieved_sources(knowledge_context: dict[str, Any]) -> list[str]:
@@ -412,9 +439,12 @@ def _write_live_failure_artifacts(
     raw_response = diagnostics.get("raw_responses", {})
     knowledge_context = diagnostics.get("knowledge_context_artifact") or {}
     output_refs = [LIVE_ERROR_PATH, "live-metadata.json", "agent-run.json"]
+    attempts = metadata.get("attempts") if isinstance(metadata.get("attempts"), list) else exc.attempts
 
     write_json(out_dir / LIVE_ERROR_PATH, error_report)
     write_json(out_dir / "live-metadata.json", metadata)
+    if _write_proxy_attribution_events(out_dir, run_id=run_id, options=options, attempts=attempts):
+        output_refs.append(PROXY_ATTRIBUTION_EVENTS_PATH)
     if workflow_trace:
         write_json(out_dir / LIVE_WORKFLOW_TRACE_PATH, workflow_trace)
         output_refs.append(LIVE_WORKFLOW_TRACE_PATH)
@@ -436,7 +466,7 @@ def _write_live_failure_artifacts(
         "prompt_version": __version__,
         "input_refs": ["prompt"] if prompt else [],
         "retrieved_sources": _knowledge_retrieved_sources(knowledge_context),
-        "tool_calls": ["multi-model-live-generation"] if options.workflow == WORKFLOW_MULTI_AGENT else ["live-generation"],
+        "tool_calls": [_live_generation_tool_call_from_workflow(options.workflow)],
         "output_refs": output_refs,
         "validation_refs": [LIVE_ERROR_PATH],
         "status": STATUS_FAIL,
@@ -449,6 +479,73 @@ def _write_live_failure_artifacts(
         tool_harness.write_trace(out_dir / RUNTIME_TRACE_PATH, out_dir / RUNTIME_SUMMARY_PATH, [*output_refs, RUNTIME_TRACE_PATH, RUNTIME_SUMMARY_PATH])
     if otel_export:
         write_otel_export(out_dir, otel_export)
+
+
+def _write_proxy_attribution_events(
+    out_dir: Path,
+    *,
+    run_id: str,
+    options: LiveRunOptions | None,
+    attempts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    path = out_dir / PROXY_ATTRIBUTION_EVENTS_PATH
+    if path.exists():
+        return _read_proxy_attribution_events(path)
+    events = [_proxy_attribution_event(run_id=run_id, options=options, attempt=attempt) for attempt in attempts]
+    events = [event for event in events if event]
+    if not events:
+        return []
+    path.write_text("\n".join(json.dumps(event, ensure_ascii=False, sort_keys=True) for event in events) + "\n", encoding="utf-8")
+    return events
+
+
+def _read_proxy_attribution_events(path: Path) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _proxy_attribution_event(
+    *,
+    run_id: str,
+    options: LiveRunOptions | None,
+    attempt: dict[str, Any],
+) -> dict[str, Any] | None:
+    model = str(attempt.get("model") or "")
+    gateway = attempt.get("gateway")
+    if gateway != "litellm_proxy" and not model.startswith("litellm_proxy/"):
+        return None
+    route_model = attempt.get("route_model") or (model.split("/", 1)[1] if model.startswith("litellm_proxy/") else None)
+    return {
+        "event_type": "proxy.attribution",
+        "run_id": run_id,
+        "case_id": options.case_id if options else None,
+        "stage": attempt.get("stage"),
+        "route_model": route_model,
+        "model": model,
+        "gateway": gateway or "litellm_proxy",
+        "started_at": attempt.get("started_at"),
+        "completed_at": attempt.get("completed_at"),
+        "provider_call_ms": attempt.get("provider_call_ms"),
+        "stage_total_ms": attempt.get("stage_total_ms") or attempt.get("duration_ms") or attempt.get("latency_ms"),
+        "provider_call_ratio": attempt.get("provider_call_ratio"),
+        "local_processing_ms": attempt.get("local_processing_ms"),
+        "stage_input_chars": attempt.get("stage_input_chars"),
+        "output_chars": attempt.get("output_chars"),
+        "status": attempt.get("status"),
+        "failure_class": attempt.get("failure_class"),
+        "timeout_overrun": attempt.get("timeout_overrun"),
+        "fallback_used": attempt.get("fallback_used"),
+        "fallback_from": attempt.get("fallback_from"),
+    }
 
 
 def validate_pine_file(file_path: Path, spec_path: Path, out_path: Path) -> dict[str, Any]:

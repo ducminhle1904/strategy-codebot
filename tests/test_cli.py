@@ -1,5 +1,7 @@
 import json
 from pathlib import Path
+import sys
+import types
 
 from typer.testing import CliRunner
 
@@ -7,7 +9,8 @@ from strategy_codebot import __version__
 from strategy_codebot import cli as cli_module
 from strategy_codebot import harness as harness_module
 from strategy_codebot.cli import app
-from strategy_codebot.schemas import load_json
+from strategy_codebot.knowledge_base import EMBEDDING_DIMENSION_TEXT_3_SMALL, EMBEDDING_MODEL_PRODUCTION_OPENROUTER
+from strategy_codebot.schemas import load_json, write_json
 
 
 runner = CliRunner()
@@ -50,6 +53,72 @@ def test_cli_doctor_writes_report(tmp_path: Path) -> None:
     assert any(check["name"] == "optional_harness_cli" for check in report["checks"])
     if report["environment"]["harness_cli"]["status"] == "missing_optional":
         assert report["warnings"]
+
+
+def test_cli_harness_route_health_writes_report(tmp_path: Path, monkeypatch) -> None:
+    out_path = tmp_path / "route-health.json"
+    monkeypatch.setattr(
+        cli_module,
+        "route_health_report",
+        lambda **kwargs: {
+            "status": "pass",
+            "store": "postgres",
+            "configured": True,
+            "route_count": 1,
+            "cooldown_count": 1,
+            "routes": [{"stage": "repair", "route_status": "cooldown"}],
+        },
+    )
+
+    result = runner.invoke(app, ["harness", "route-health", "--out", str(out_path), "--user-tier", "paid_low"])
+
+    assert result.exit_code == 0, result.output
+    assert "routes=1" in result.output
+    assert load_json(out_path)["routes"][0]["route_status"] == "cooldown"
+
+
+def test_cli_harness_model_candidate_matrix_writes_report(tmp_path: Path, monkeypatch) -> None:
+    out_path = tmp_path / "candidate-matrix.json"
+
+    def fake_matrix(**kwargs):
+        payload = {
+            "status": "pass",
+            "candidate_count": 1,
+            "catalog_status": "pass",
+            "candidates": [{"promotion_eligible": True}],
+            "promotion_recommendations": {"pine_code_generation": {"recommended_route": "openrouter/qwen/qwen3-coder-next"}},
+        }
+        write_json(kwargs["out"], payload)
+        return payload
+
+    monkeypatch.setattr(cli_module, "build_model_candidate_matrix", fake_matrix)
+
+    result = runner.invoke(app, ["harness", "model-candidate-matrix", "--out", str(out_path), "--stage", "pine_code_generation"])
+
+    assert result.exit_code == 0, result.output
+    assert "candidates=1" in result.output
+    assert "eligible=1" in result.output
+    assert load_json(out_path)["promotion_recommendations"]["pine_code_generation"]["recommended_route"] == "openrouter/qwen/qwen3-coder-next"
+
+
+def test_cli_models_gateways_smoke_route_reports_connection_error(tmp_path: Path, monkeypatch) -> None:
+    out_path = tmp_path / "smoke-route.json"
+
+    def completion(**_kwargs):
+        raise RuntimeError("OpenAIException - Connection error.")
+
+    monkeypatch.setitem(sys.modules, "litellm", types.SimpleNamespace(completion=completion))
+    monkeypatch.setenv("LITELLM_PROXY_API_KEY", "test-proxy")
+    monkeypatch.setenv("LITELLM_PROXY_API_BASE", "https://litellm-proxy.example/v1")
+
+    result = runner.invoke(app, ["models", "gateways", "smoke-route", "--alias", "paid_low.repair", "--out", str(out_path)])
+
+    assert result.exit_code == 1
+    report = load_json(out_path)
+    assert report["status"] == "fail"
+    assert report["provider_error_subclass"] == "provider_connection_error"
+    assert "messages" not in report
+    assert "api_key" not in json.dumps(report).lower()
 
 
 def test_cli_doctor_exits_nonzero_on_failed_report(monkeypatch, tmp_path: Path) -> None:
@@ -748,6 +817,9 @@ def test_cli_run_live_passes_provider_options(monkeypatch, tmp_path: Path) -> No
             "--save-raw-provider",
             "--knowledge-context",
             "off",
+            "--prompt-profile",
+            "optimized_v1",
+            "--require-web-search",
             "--otel-export",
             str(tmp_path / "live" / "otel.jsonl"),
             "--policy",
@@ -763,6 +835,9 @@ def test_cli_run_live_passes_provider_options(monkeypatch, tmp_path: Path) -> No
     assert captured["live_options"].model_stage_overrides == {"pine_code_generation": "openrouter/qwen/qwen3-coder:free"}
     assert captured["live_options"].save_raw_provider is True
     assert captured["live_options"].knowledge_context == "off"
+    assert captured["live_options"].prompt_profile == "optimized_v1"
+    assert captured["live_options"].web_search == "auto"
+    assert captured["live_options"].require_web_search is True
     assert captured["otel_export"] == tmp_path / "live" / "otel.jsonl"
     assert captured["policy"] == "enforce"
 
@@ -783,6 +858,125 @@ def test_cli_rejects_unknown_model_stage() -> None:
 
     assert result.exit_code != 0
     assert "Unknown model stage override" in result.output
+
+
+def test_cli_litellm_keys_aliases_lists_paid_tier_routes(tmp_path: Path) -> None:
+    out_path = tmp_path / "aliases.json"
+    result = runner.invoke(app, ["models", "litellm", "keys", "aliases", "--tier", "paid_medium", "--out", str(out_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "status=pass tier=paid_medium aliases=5" in result.output
+    assert "paid_medium.strategy_reasoning" in result.output
+    report = load_json(out_path)
+    assert report["aliases"] == [
+        "paid_medium.balanced_review",
+        "paid_medium.pine_code_generation",
+        "paid_medium.repair",
+        "paid_medium.strategy_coding",
+        "paid_medium.strategy_reasoning",
+    ]
+
+
+def test_cli_litellm_keys_check_allows_local_master_key(monkeypatch) -> None:
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-litellm-local-dev")
+    monkeypatch.setenv("LITELLM_PROXY_API_KEY", "sk-litellm-local-dev")
+    monkeypatch.setenv("LITELLM_ADMIN_API_BASE", "http://127.0.0.1:4000")
+
+    result = runner.invoke(app, ["models", "litellm", "keys", "check"])
+
+    assert result.exit_code == 0, result.output
+    assert "status=pass production=False" in result.output
+
+
+def test_cli_litellm_keys_check_production_rejects_master_key_as_runtime_key(monkeypatch, tmp_path: Path) -> None:
+    out_path = tmp_path / "litellm-key-check.json"
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-litellm-master")
+    monkeypatch.setenv("LITELLM_PROXY_API_KEY", "sk-litellm-master")
+    monkeypatch.setenv("LITELLM_ADMIN_API_BASE", "http://127.0.0.1:4000")
+
+    result = runner.invoke(app, ["models", "litellm", "keys", "check", "--production", "--out", str(out_path)])
+
+    assert result.exit_code == 1
+    report = load_json(out_path)
+    assert report["status"] == "fail"
+    assert {"name": "proxy_key_is_virtual", "status": "fail"} in report["checks"]
+
+
+def test_cli_litellm_keys_provision_posts_admin_payload(monkeypatch, tmp_path: Path) -> None:
+    requests = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return json.dumps({"key": "sk-generated-virtual-key", "key_alias": "workspace-a-paid-medium"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return FakeResponse()
+
+    out_path = tmp_path / "generated-key.json"
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-litellm-master")
+    monkeypatch.setenv("LITELLM_BUDGET_PAID_MEDIUM_MONTHLY_USD", "42.5")
+    monkeypatch.setattr(cli_module.urllib.request, "urlopen", fake_urlopen)
+
+    result = runner.invoke(
+        app,
+        [
+            "models",
+            "litellm",
+            "keys",
+            "provision",
+            "--tier",
+            "paid_medium",
+            "--workspace-id",
+            "workspace-a",
+            "--user-id",
+            "user-a",
+            "--api-base",
+            "http://litellm.local",
+            "--out",
+            str(out_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "contains_secret=true" in result.output
+    request, timeout = requests[0]
+    assert timeout == 30
+    assert request.full_url == "http://litellm.local/key/generate"
+    assert request.headers["Authorization"] == "Bearer sk-litellm-master"
+    payload = json.loads(request.data.decode("utf-8"))
+    assert payload["models"] == [
+        "paid_medium.balanced_review",
+        "paid_medium.pine_code_generation",
+        "paid_medium.repair",
+        "paid_medium.strategy_coding",
+        "paid_medium.strategy_reasoning",
+    ]
+    assert payload["metadata"] == {
+        "tier": "paid_medium",
+        "workspace_id": "workspace-a",
+        "source": "strategy-codebot",
+        "user_id": "user-a",
+    }
+    assert payload["budget_duration"] == "30d"
+    assert payload["max_budget"] == 42.5
+    report = load_json(out_path)
+    assert report["response"]["key"] == "sk-generated-virtual-key"
+
+
+def test_cli_litellm_keys_provision_requires_master_key(monkeypatch) -> None:
+    monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+
+    result = runner.invoke(app, ["models", "litellm", "keys", "provision", "--workspace-id", "workspace-a"])
+
+    assert result.exit_code != 0
+    assert "LITELLM_MASTER_KEY is required" in result.output
 
 
 def test_cli_run_with_parallel_review_creates_review_report(tmp_path: Path) -> None:
@@ -931,6 +1125,10 @@ def test_cli_eval_live_reports_failure(monkeypatch, tmp_path: Path) -> None:
             "3",
             "--knowledge-context",
             "off",
+            "--prompt-profile",
+            "optimized_v1",
+            "--web-search",
+            "on",
             "--otel-export",
             str(tmp_path / "eval" / "otel.jsonl"),
         ],
@@ -941,6 +1139,8 @@ def test_cli_eval_live_reports_failure(monkeypatch, tmp_path: Path) -> None:
     assert captured["live_options"].cost_profile == "cheap"
     assert captured["live_options"].model_stage_overrides == {"balanced_review": "openrouter/qwen/qwen3.6-plus-preview"}
     assert captured["live_options"].knowledge_context == "off"
+    assert captured["live_options"].prompt_profile == "optimized_v1"
+    assert captured["live_options"].web_search == "on"
     assert captured["otel_export"] == tmp_path / "eval" / "otel.jsonl"
     assert captured["concurrency"] == 3
 
@@ -976,14 +1176,45 @@ def test_cli_eval_matrix_passes_options(monkeypatch, tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "status=pass combos=1 recommended=baseline_gemini_all" in result.output
+    assert "status=pass mode=combo combos=1 tiers=0 recommended=baseline_gemini_all" in result.output
     assert captured["smoke_suite_path"] == tmp_path / "smoke.yaml"
     assert captured["full_suite_path"] == tmp_path / "full.yaml"
     assert captured["out_dir"] == tmp_path / "matrix"
     assert captured["combo_ids"] == ["baseline_gemini_all"]
+    assert captured["matrix_mode"] == "combo"
+    assert captured["tier_ids"] is None
     assert captured["run_full"] is True
     assert captured["concurrency"] == 1
     assert captured["knowledge_context"] == "off"
+
+
+def test_cli_eval_matrix_tier_mode_passes_tiers(monkeypatch, tmp_path: Path) -> None:
+    captured = {}
+
+    def fake_run_model_combo_matrix(**kwargs):
+        captured.update(kwargs)
+        return {"status": "pass", "mode": "tier", "tiers": [{"id": "free"}], "combos": [], "recommended_tier": "free"}
+
+    monkeypatch.setattr(cli_module, "run_model_combo_matrix", fake_run_model_combo_matrix)
+
+    result = runner.invoke(
+        app,
+        [
+            "eval",
+            "matrix",
+            "--mode",
+            "tier",
+            "--tier",
+            "free",
+            "--out",
+            str(tmp_path / "matrix"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "status=pass mode=tier combos=0 tiers=1 recommended=free" in result.output
+    assert captured["matrix_mode"] == "tier"
+    assert captured["tier_ids"] == ["free"]
 
 
 def test_cli_registry_defaults_work_outside_repo_cwd(monkeypatch, tmp_path: Path) -> None:
@@ -1082,3 +1313,190 @@ def test_cli_knowledge_snapshot_diff_audit_and_propose(tmp_path: Path) -> None:
     )
     assert proposal_result.exit_code == 0, proposal_result.output
     assert load_json(proposal_path)["status"] == "needs_review"
+
+
+def test_cli_knowledge_base_init_search_eval_and_candidates(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    schema_path = tmp_path / "kb" / "postgres-schema.sql"
+    init_result = runner.invoke(app, ["knowledge", "init", "--index", str(index_path), "--postgres-schema", str(schema_path)])
+
+    assert init_result.exit_code == 0, init_result.output
+    assert load_json(index_path)["store"]["type"] == "postgres_pgvector"
+    assert "CREATE EXTENSION IF NOT EXISTS vector" in schema_path.read_text(encoding="utf-8")
+
+    search_path = tmp_path / "search.json"
+    search_result = runner.invoke(app, ["knowledge", "search", "break of structure retest", "--index", str(index_path), "--out", str(search_path)])
+    assert search_result.exit_code == 0, search_result.output
+    search_report = load_json(search_path)
+    assert search_report["retrieved_chunks"]
+    assert search_report["citations"]
+    assert "retrieval_confidence" in search_report
+    assert "filters_applied" in search_report
+    assert "low_confidence" in search_report
+    assert "required_source_hits" in search_report
+
+    eval_path = tmp_path / "knowledge-eval.json"
+    eval_result = runner.invoke(app, ["knowledge", "eval", "--index", str(index_path), "--out", str(eval_path)])
+    assert eval_result.exit_code == 0, eval_result.output
+    assert load_json(eval_path)["status"] == "pass"
+
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    propose_result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "candidates",
+            "propose",
+            "--lesson",
+            "Use confirmed bars for BOS retest entries.",
+            "--evidence-ref",
+            "review-report.json",
+            "--candidates",
+            str(candidates_path),
+        ],
+    )
+    assert propose_result.exit_code == 0, propose_result.output
+    candidate_id = load_json(candidates_path)["candidates"][0]["candidate_id"]
+
+    approve_result = runner.invoke(app, ["knowledge", "candidates", "approve", candidate_id, "--index", str(index_path), "--candidates", str(candidates_path)])
+    assert approve_result.exit_code == 0, approve_result.output
+    assert load_json(candidates_path)["candidates"][0]["status"] == "approved"
+
+    reject_result = runner.invoke(app, ["knowledge", "candidates", "reject", candidate_id, "--candidates", str(candidates_path)])
+    assert reject_result.exit_code == 0, reject_result.output
+    assert load_json(candidates_path)["candidates"][0]["status"] == "rejected"
+
+
+def test_cli_knowledge_learn_from_run_auto_promotes_candidate(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    artifacts_root = tmp_path / "artifacts"
+    report_path = tmp_path / "learning-report.json"
+    init_result = runner.invoke(app, ["knowledge", "init", "--index", str(index_path)])
+    assert init_result.exit_code == 0, init_result.output
+    for run in ("run-01", "run-02"):
+        write_json(
+            artifacts_root / run / "eval-report.json",
+            {
+                "status": "fail",
+                "cases": [
+                    {
+                        "id": "case-a",
+                        "status": "fail",
+                        "failure_class": "static_validation_failed",
+                        "failure_stage": "final_gate",
+                        "validation_failures": [{"name": "version_header", "status": "fail"}],
+                    }
+                ],
+            },
+        )
+
+    result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "learn-from-run",
+            "--artifacts-root",
+            str(artifacts_root),
+            "--index",
+            str(index_path),
+            "--candidates",
+            str(candidates_path),
+            "--out",
+            str(report_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = load_json(report_path)
+    assert report["promoted_count"] == 1
+    assert load_json(candidates_path)["candidates"][0]["status"] == "approved"
+
+
+def test_cli_knowledge_trusted_source_snapshot_summary_and_approval(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "strategy_codebot.knowledge_base._fetch_url_text",
+        lambda url: (
+            "Risk management for crypto trading requires position sizing, stop loss planning, liquidity review, "
+            "and volatility awareness. Exchange risk and leverage can change strategy risk."
+        ),
+    )
+    index_path = tmp_path / "kb" / "index.json"
+    snapshot_path = tmp_path / "snapshot.json"
+    proposal_path = tmp_path / "proposal.json"
+
+    init_result = runner.invoke(app, ["knowledge", "init", "--index", str(index_path)])
+    assert init_result.exit_code == 0, init_result.output
+
+    snapshot_result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "snapshot",
+            "--source-id",
+            "binance-academy-risk-management-strategies",
+            "--fetch",
+            "--out",
+            str(snapshot_path),
+        ],
+    )
+    assert snapshot_result.exit_code == 0, snapshot_result.output
+    assert load_json(snapshot_path)["source_state"] == "snapshotted"
+
+    summarize_result = runner.invoke(app, ["knowledge", "summarize-snapshot", "--snapshot", str(snapshot_path), "--out", str(proposal_path)])
+    assert summarize_result.exit_code == 0, summarize_result.output
+    proposal = load_json(proposal_path)
+    assert proposal["status"] == "needs_review"
+    assert "extracted_text" not in proposal
+
+    approve_result = runner.invoke(app, ["knowledge", "approve-source-summary", "--proposal", str(proposal_path), "--index", str(index_path)])
+    assert approve_result.exit_code == 0, approve_result.output
+
+    search_path = tmp_path / "source-search.json"
+    search_result = runner.invoke(app, ["knowledge", "search", "crypto liquidity exchange risk", "--index", str(index_path), "--out", str(search_path)])
+    assert search_result.exit_code == 0, search_result.output
+    assert any(chunk["source_type"] == "approved_source_summary" for chunk in load_json(search_path)["retrieved_chunks"])
+
+
+def test_cli_knowledge_health_skips_when_unconfigured(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("STRATEGY_CODEBOT_KNOWLEDGE_DATABASE_URL", raising=False)
+    out = tmp_path / "knowledge-health.json"
+
+    result = runner.invoke(app, ["knowledge", "health", "--out", str(out)])
+
+    assert result.exit_code == 0, result.output
+    report = load_json(out)
+    assert report["status"] == "skipped"
+    assert report["configured"] is False
+
+
+def test_cli_knowledge_init_production_openrouter_profile_writes_1536_schema(tmp_path: Path, monkeypatch) -> None:
+    def fake_remote_embedding(text: str, embedding_model: str, embedding_provider: str) -> list[float]:
+        assert embedding_model == EMBEDDING_MODEL_PRODUCTION_OPENROUTER
+        assert embedding_provider == "openrouter"
+        return [0.0] * EMBEDDING_DIMENSION_TEXT_3_SMALL
+
+    monkeypatch.setattr("strategy_codebot.knowledge_base._remote_embedding", fake_remote_embedding)
+    index_path = tmp_path / "kb" / "index.json"
+    schema_path = tmp_path / "kb" / "postgres-schema.sql"
+
+    result = runner.invoke(
+        app,
+        [
+            "knowledge",
+            "init",
+            "--index",
+            str(index_path),
+            "--postgres-schema",
+            str(schema_path),
+            "--embedding-profile",
+            "production-openrouter",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    index = load_json(index_path)
+    assert index["embedding_provider"] == "openrouter"
+    assert index["embedding_model"] == EMBEDDING_MODEL_PRODUCTION_OPENROUTER
+    assert index["embedding_dimension"] == EMBEDDING_DIMENSION_TEXT_3_SMALL
+    assert "embedding vector(1536)" in schema_path.read_text(encoding="utf-8")

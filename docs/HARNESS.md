@@ -105,6 +105,18 @@ Use `strategy-codebot harness recommend-next` for local recommendation backlog o
 
 Use `strategy-codebot harness memory-candidates` only to generate candidate insights from repeated warnings. It never writes Codex memory or global context. Memory promotion must be explicitly requested by the user and handled through the normal memory-update workflow.
 
+Use `strategy-codebot harness intelligence-report` to aggregate local eval/live artifacts into a model-stage scorecard, failure summary, and route recommendations. It reads only explicit artifact roots or local JSON reports and writes a bounded report under `.strategy-codebot/` by default.
+
+Use `strategy-codebot harness propose-lessons` to turn repeated failures into review-only proposal artifacts. Proposals may include knowledge-candidate IDs for prompt, validator, or playbook gaps, but they are not approved knowledge and do not mutate source registries.
+
+Use `strategy-codebot harness replay-recommendations` to run an eval suite against proposal output and record whether proposals are ready for human review. Replay results are evidence, not auto-approval.
+
+Use `strategy-codebot harness propose-improvements` to turn reviewed lesson proposals into improvement candidates such as route policy patches, KB candidate reviews, or eval gaps. Candidates are review-only and never mutate registries, KB, or memory.
+
+Use `strategy-codebot harness apply-approved-improvement` only after a candidate artifact has `status=approved`. The command writes a patch artifact for a later implementation turn; it does not edit repo-tracked files directly.
+
+Live eval writes checkpointed root `eval-report.json` progress while cases run. Long or detached runs should be polled until `is_complete=true`; if a run is interrupted, the latest report and per-case artifacts remain partial evidence.
+
 ## Anti-Pollution Contract
 
 - Do not place raw trace rows, raw artifacts, full reports, or long JSON in model context.
@@ -113,6 +125,9 @@ Use `strategy-codebot harness memory-candidates` only to generate candidate insi
 - Keep generated loop reports under ignored `.strategy-codebot/` unless `--out` or `--write-story` is explicitly supplied.
 - Do not update `AGENTS.md`, global context, or Codex memory from trace insights automatically.
 - Treat recommendations and memory candidates as proposals, not durable knowledge.
+- Treat harness intelligence proposals and replay results as review inputs. Do not auto-promote them into KB, routing registries, source registries, or memory.
+- Treat harness improvement candidates and approved patch artifacts as review inputs. Do not auto-apply them to repo-tracked config, KB, source registries, or memory.
+- Treat `evidence_completeness.confidence=partial` as useful diagnostic signal, not full-suite proof.
 
 ## Done Definition
 

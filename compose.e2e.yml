@@ -1,0 +1,68 @@
+name: strategy-codebot-e2e
+
+services:
+  postgres:
+    ports:
+      - "${STRATEGY_CODEBOT_E2E_POSTGRES_PORT:-55432}:5432"
+
+  redis:
+    ports:
+      - "${STRATEGY_CODEBOT_E2E_REDIS_PORT:-56379}:6379"
+
+  litellm-proxy:
+    image: python:3.13-slim-bookworm
+    command:
+      - python
+      - -c
+      - |
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import json
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"status": "ok", "service": "e2e-litellm-stub"}).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                return
+
+        HTTPServer(("0.0.0.0", 4000), Handler).serve_forever()
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=2).read()\""]
+      interval: 5s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  api:
+    environment:
+      STRATEGY_CODEBOT_LLM_MODE: ${STRATEGY_CODEBOT_E2E_LLM_MODE:-fake}
+      STRATEGY_CODEBOT_E2E_RELAX_RATE_LIMITS: "1"
+      STRATEGY_CODEBOT_SERVER_USER_TIER: ${STRATEGY_CODEBOT_SERVER_USER_TIER:-paid_medium}
+      STRATEGY_CODEBOT_KNOWLEDGE_DATABASE_URL: ""
+      STRATEGY_CODEBOT_DISABLE_KNOWLEDGE_READINESS: "1"
+
+  backtest-worker:
+    environment:
+      BACKTEST_WORKER_MARKET_DATA_MODE: ${BACKTEST_WORKER_MARKET_DATA_MODE:-fixture}
+      BACKTEST_WORKER_POLL_INTERVAL_MS: ${BACKTEST_WORKER_POLL_INTERVAL_MS:-250}
+      BACKTEST_WORKER_LEASE_SECONDS: ${BACKTEST_WORKER_LEASE_SECONDS:-20}
+      BACKTEST_WORKER_HEARTBEAT_SECONDS: ${BACKTEST_WORKER_HEARTBEAT_SECONDS:-5}
+      BACKTEST_WORKER_TIMEOUT_MS: ${BACKTEST_WORKER_TIMEOUT_MS:-60000}
+      BACKTEST_WORKER_MAX_CANDLES: ${BACKTEST_WORKER_MAX_CANDLES:-5000}
+      BACKTEST_WORKER_MAX_ARTIFACT_BYTES: ${BACKTEST_WORKER_MAX_ARTIFACT_BYTES:-1000000}
+      BACKTEST_WORKER_CACHE_LOCK_TIMEOUT_MS: ${BACKTEST_WORKER_CACHE_LOCK_TIMEOUT_MS:-5000}
+      BACKTEST_WORKER_DEFAULT_WORKSPACE_ACTIVE_LIMIT: ${BACKTEST_WORKER_DEFAULT_WORKSPACE_ACTIVE_LIMIT:-2}
+      BACKTEST_WORKER_CANDLE_CACHE_VERSION: ${BACKTEST_WORKER_CANDLE_CACHE_VERSION:-range-v2}
+
+  web:
+    environment:
+      STRATEGY_CODEBOT_API_BASE_URL: http://api:8000
+      STRATEGY_CODEBOT_WEB_DEBUG: "1"
+      STRATEGY_CODEBOT_USER_ID: e2e-user
+      STRATEGY_CODEBOT_WORKSPACE_ID: e2e-workspace
+      STRATEGY_CODEBOT_USER_TIER: paid_medium

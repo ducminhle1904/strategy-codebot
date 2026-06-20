@@ -55,10 +55,28 @@ def harness_cli_path() -> Path:
     return repo_root() / "scripts" / "bin" / "harness-cli"
 
 
+def harness_cli_availability() -> dict[str, Any]:
+    path = harness_cli_path()
+    if not path.exists():
+        return {"available": False, "status": "missing", "path": str(path), "reason": "harness_cli_missing"}
+    if not path.is_file():
+        return {"available": False, "status": "not_file", "path": str(path), "reason": "harness_cli_not_file"}
+    try:
+        result = subprocess.run([str(path), "--help"], cwd=repo_root(), capture_output=True, text=True, timeout=5)
+    except OSError as exc:
+        return {"available": False, "status": "not_executable", "path": str(path), "reason": str(exc)}
+    except subprocess.TimeoutExpired:
+        return {"available": False, "status": "timeout", "path": str(path), "reason": "harness_cli_help_timeout"}
+    if result.returncode != 0:
+        reason = (result.stderr or result.stdout or f"exit_code={result.returncode}").strip()
+        return {"available": False, "status": "unusable", "path": str(path), "reason": reason}
+    return {"available": True, "status": "available", "path": str(path), "reason": "ok"}
+
+
 def should_record_harness(requested: bool | None) -> bool:
     if requested is not None:
         return requested
-    return harness_cli_path().exists()
+    return bool(harness_cli_availability()["available"])
 
 
 def classify_trace_intake(

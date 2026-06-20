@@ -512,6 +512,28 @@ def test_model_health_marks_timeout_route_unstable(monkeypatch, tmp_path: Path) 
                     "repair_count": 0,
                     "quality_status": None,
                     "quality_blockers": [],
+                    "cooldown_skips": [
+                        {
+                            "stage": "pine_code_generation",
+                            "model": "openrouter/qwen/qwen3-coder",
+                            "provider": "openrouter",
+                            "status": STATUS_SKIPPED,
+                            "failure_class": FAILURE_PROVIDER_TIMEOUT,
+                            "skip_reason": "route_cooldown",
+                            "consecutive_failure_count": 1,
+                        }
+                    ],
+                    "route_health_snapshot": [
+                        {
+                            "stage": "pine_code_generation",
+                            "model": "openrouter/qwen/qwen3-coder",
+                            "provider": "openrouter",
+                            "status": "cooldown",
+                            "cooldown_count": 1,
+                            "consecutive_failure_max": 1,
+                            "timeout_count": 1,
+                        }
+                    ],
                     "stages": [{"stage": "pine_code_generation", "model": "openrouter/qwen/qwen3-coder", "latency_ms": 90_000}],
                 }
             ],
@@ -529,4 +551,35 @@ def test_model_health_marks_timeout_route_unstable(monkeypatch, tmp_path: Path) 
 
     health = (tmp_path / "matrix" / "model-health.json").read_text(encoding="utf-8")
     assert '"status": "unstable"' in health
+    assert '"route_status": "unstable"' in health
+    assert '"cooldown_count": 2' in health
+    assert '"timeout_rate":' in health
+    assert '"consecutive_failure_max": 1' in health
     assert "openrouter/qwen/qwen3-coder" in health
+
+
+def test_model_matrix_tier_mode_runs_user_tier_routes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter")
+    smoke_suite = _suite(tmp_path / "smoke.yaml")
+    full_suite = _suite(tmp_path / "full.yaml")
+    captured_tiers: list[str] = []
+
+    def fake_run_live_eval(**kwargs):
+        captured_tiers.append(kwargs["live_options"].user_tier)
+        return _write_eval_report(kwargs["out_dir"], _eval_report(suite_path=kwargs["suite_path"]))
+
+    monkeypatch.setattr("strategy_codebot.model_matrix.run_live_eval", fake_run_live_eval)
+
+    report = run_model_combo_matrix(
+        smoke_suite_path=smoke_suite,
+        full_suite_path=full_suite,
+        out_dir=tmp_path / "matrix",
+        policy="enforce",
+        matrix_mode="tier",
+        tier_ids=["free", "paid_low"],
+    )
+
+    assert report["mode"] == "tier"
+    assert report["recommended_tier"] in {"free", "paid_low"}
+    assert [tier["user_tier"] for tier in report["tiers"]] == ["free", "paid_low"]
+    assert captured_tiers == ["free", "paid_low"]

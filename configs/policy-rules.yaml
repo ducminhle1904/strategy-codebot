@@ -1,0 +1,138 @@
+rules:
+  - id: guaranteed_return_claim
+    category: profitability_claim
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading claim: {matched_text}"
+    block_patterns:
+      - "\\bguarantee(?:d|s)?\\s+(?:profit|returns?)\\b"
+      - "\\brisk-free\\b"
+    allow_patterns:
+      - "\\b(no|without|do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|exclude|excludes|excluded|excluding|constraints against|not for|not used for|not be used for)\\b.{0,140}\\b(?:guarantee(?:d|s)?\\s+(?:profit|returns?)|risk-free)\\b"
+      - "\\b(?:guarantee(?:d|s)?\\s+(?:profit|returns?)|risk-free)\\b.{0,140}\\b(is not|are not|was not|were not|must not|should not|without|avoid|avoided|not performed|not requested|not included|claim|claims)\\b"
+      - "\\b(disclaimer|disclaimers|disclaiming|educational)\\b.{0,160}\\b(?:guarantee(?:d|s)?\\s+(?:profit|returns?)|risk-free)\\b"
+
+  - id: no_loss_claim
+    category: risk_claim
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading claim: {matched_text}"
+    block_patterns:
+      - "\\bcannot\\s+lose(?:\\s+money)?\\b"
+      - "\\bcan't\\s+lose(?:\\s+money)?\\b"
+    allow_patterns:
+      - "\\b(do not|does not|don't|never|must not|should not|avoid|avoids|avoiding)\\b.{0,80}\\bclaim\\b.{0,80}\\b(?:cannot|can't)\\s+lose(?:\\s+money)?\\b"
+
+  - id: live_ready_claim
+    category: live_trading_claim
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading claim: {matched_text}"
+    block_patterns:
+      - "\\blive\\s+trading\\s+ready\\b"
+      - "\\blive\\s+ready\\b"
+      - "\\blive-ready\\b"
+      - "\\blive\\s+immediately\\b"
+      - "\\b(?:certify|certified|safe)\\b.{0,80}\\blive\\s+trading\\b"
+      - "\\bautonomous\\s+live\\b"
+    allow_patterns:
+      - "\\b(no|not|without|do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|exclude|excludes|excluded|excluding|constraints against|not for|not used for|not be used for)\\b.{0,140}\\b(?:live\\s+trading\\s+ready|live\\s+ready|live-ready|live\\s+immediately|live\\s+trading|autonomous\\s+live)\\b"
+      - "\\b(?:live\\s+trading\\s+ready|live\\s+ready|live-ready|live\\s+immediately|live\\s+trading|autonomous\\s+live)\\b.{0,140}\\b(is not|are not|was not|were not|must not|should not|without|avoid|avoided|not performed|not requested|not included|claim|claims)\\b"
+      - "\\bnot\\s+safe\\s+for\\s+live\\s+trading\\b"
+      - "\\b(disclaimer|disclaimers|disclaiming|educational)\\b.{0,160}\\blive\\s+(trading|execution)\\b"
+
+  - id: broker_execution
+    category: live_execution
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading action or arbitrary IO request: {matched_text}"
+    block_patterns:
+      - "\\bbroker\\s+execution\\b"
+      - "\\bexchange\\s+execution\\b"
+      - "\\b(connect|integrate|deploy)\\b.{0,80}\\b(broker|exchange)\\b"
+      - "\\bbroker\\s+(integration|deployment)\\b"
+      - "\\bconnects\\s+to\\s+my\\s+broker\\b"
+    allow_patterns:
+      - "\\b(no|without|do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|exclude|excludes|excluded|excluding|constraints against|not for|not used for|not be used for)\\b.{0,140}\\b(?:broker\\s+execution|exchange\\s+execution|broker\\s+integration|broker\\s+deployment|broker|exchange)\\b"
+      - "\\b(?:broker\\s+execution|exchange\\s+execution|broker\\s+integration|broker\\s+deployment|broker|exchange)\\b.{0,140}\\b(is not|are not|was not|were not|must not|should not|without|avoid|avoided|not performed|not requested|not included|claim|claims)\\b"
+
+  - id: live_order_execution
+    category: live_execution
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading action or arbitrary IO request: {matched_text}"
+    block_patterns:
+      - "\\bplace\\s+live\\s+orders?\\b"
+      - "\\bexecute\\s+live\\s+trades?\\b"
+      - "\\b(place|send|submit|execute)\\b.{0,80}\\blive\\s+(orders?|trades?)\\b"
+      - "\\blive\\s+trades?\\s+automatically\\b"
+    allow_patterns:
+      - "\\b(no|without|do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|exclude|excludes|excluded|excluding|not for|not used for|not be used for)\\b.{0,140}\\blive\\s+(orders?|trades?)\\b"
+
+  - id: arbitrary_io_request
+    category: arbitrary_io
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading action or arbitrary IO request: {matched_text}"
+    block_patterns:
+      - "\\bshell\\s+command\\b"
+      - "\\brun\\s+shell\\b"
+      - "\\bnetwork\\s+request\\b"
+      - "\\bhttp://"
+      - "\\bhttps://"
+      - "\\bfilesystem\\b"
+      - "/etc/"
+
+  - id: tool_request
+    category: arbitrary_io
+    severity: blocker
+    code: policy_violation
+    message: "Blocked trading action or arbitrary IO request: {matched_text}"
+    block_patterns:
+      - "\\b(call|use|run|execute)\\s+((shell|network|file)(\\s*/\\s*|\\s+or\\s+|\\s*,\\s*)?){1,3}\\s+tools?\\b"
+
+  - id: source_injection
+    category: source_injection
+    severity: blocker
+    code: policy_violation
+    message: "Blocked source-injection request: {matched_text}"
+    block_patterns:
+      - "\\bignore\\s+(all\\s+)?(prior|previous|system|developer)\\s+(rules|instructions)\\b"
+
+  - id: runtime_success_without_proof
+    category: runtime_proof
+    severity: blocker
+    code: policy_violation
+    message: "Runtime, compile, or backtest success claim requires manual runtime proof: {matched_text}"
+    block_patterns:
+      - "\\bcompile\\s+success\\b"
+      - "\\bcompiled\\s+successfully\\b"
+      - "\\bbacktest\\s+success\\b"
+      - "\\bbacktested\\s+successfully\\b"
+      - "\\bbacktest\\s+passed\\b"
+    allow_patterns:
+      - "\\b(no|without|not|does not|do not|before claiming|before any|avoid|avoids|avoiding)\\b.{0,140}\\b(?:compile\\s+success|compiled\\s+successfully|backtest\\s+success|backtested\\s+successfully|backtest\\s+passed)\\b"
+    evidence_levels:
+      - education
+      - strategy_idea
+      - generated_artifact
+      - static_validation
+    surfaces:
+      - agent.chat.output
+      - agent.run.output
+      - artifact.validation_report
+
+  - id: profitability_warning
+    category: profitability_claim
+    severity: warning
+    code: policy_warning
+    message: "Trading claim warning: {matched_text}"
+    block_patterns:
+      - "\\bprofitability\\b"
+      - "\\bprofitable\\b"
+      - "\\blive\\s+trading\\b"
+      - "\\blive\\s+trades\\b"
+      - "\\bbroker\\b"
+    allow_patterns:
+      - "\\b(no|without|do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|exclude|excludes|excluded|excluding|constraints against|not for|not used for|not be used for|disclaimer|disclaimers|disclaiming)\\b.{0,140}\\b(?:profitability|profitable|live\\s+trading|live\\s+trades|broker)\\b"
+      - "\\b(?:rather\\s+than\\s+claim(?:ing)?|cannot|can't|lack\\s+of)\\b.{0,140}\\b(?:profitability|profitable|live\\s+trading|live\\s+trades|broker)\\b"

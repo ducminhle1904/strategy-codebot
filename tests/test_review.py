@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -305,6 +306,7 @@ def test_live_review_uses_live_options_stage_models(monkeypatch, capsys) -> None
 
     def fake_completion(**kwargs):
         print("Provider List: endpoint warning")
+        logging.getLogger("litellm").warning("Provider List: endpoint warning")
         calls.append(kwargs)
         content = json.dumps(
             {
@@ -361,5 +363,8 @@ def test_live_review_uses_live_options_stage_models(monkeypatch, capsys) -> None
     assert {call["model"] for call in calls} == {"openrouter/google/gemini-2.5-flash"}
     assert {call["base_url"] for call in calls} == {"https://openrouter.example/api/v1"}
     assert {call["response_format"]["json_schema"]["name"] for call in calls} == {"strategy_codebot_reviewer_result"}
-    assert "Provider List" not in capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert "Provider List" not in captured.out
+    assert "Provider List" not in captured.err
     assert all(reviewer["provider_warnings"] for reviewer in report["reviewers"])
+    assert any("provider log" in warning for reviewer in report["reviewers"] for warning in reviewer["provider_warnings"])

@@ -1,0 +1,7 @@
+name: live-free-smoke
+description: Minimal free-tier compact workflow smoke for container and CI runtime checks.
+cases:
+  - id: free_crypto_risk_smoke
+    name: Free crypto risk smoke
+    prompt: Create a Pine v6 strategy for BTCUSD on the 1h timeframe using a moving average crossover, include conservative risk controls, and do not make profitability or live-readiness claims.
+    expected_statuses: ["pass"]

@@ -26,6 +26,30 @@ tools:
       - live-metadata.json
       - live-workflow-trace.json
     phase_status: implemented
+  - id: market_research
+    capability: live-web-market-research
+    risk_tier: read
+    input_schema_ref: prompt
+    output_schema_ref: market-research.json
+    evidence_required:
+      - market-research.json
+    phase_status: implemented
+  - id: market.quote
+    capability: read-only-market-quote
+    risk_tier: read
+    input_schema_ref: symbol
+    output_schema_ref: market-quote.json
+    evidence_required:
+      - chat.market_snapshot
+    phase_status: implemented
+  - id: market.ohlcv
+    capability: read-only-market-ohlcv
+    risk_tier: read
+    input_schema_ref: symbol + interval
+    output_schema_ref: market-series.json
+    evidence_required:
+      - chat.market_snapshot
+    phase_status: implemented
   - id: validate_pine_static
     capability: pine-static-validation
     risk_tier: validation
@@ -57,6 +81,31 @@ tools:
     output_schema_ref: schemas/review-report.schema.json
     evidence_required:
       - review-report.json
+    phase_status: implemented
+  - id: create_backtest_plan
+    capability: backtest-plan-generation
+    risk_tier: validation
+    input_schema_ref: prompt + schemas/strategy-spec.schema.json
+    output_schema_ref: backtest/backtest-plan.json
+    evidence_required:
+      - backtest/backtest-plan.json
+    phase_status: implemented
+  - id: run_backtest_preview
+    capability: backtest-preview-queue
+    risk_tier: validation
+    input_schema_ref: schemas/strategy-spec.schema.json + backtest_config
+    output_schema_ref: queued backtest-preview run
+    evidence_required:
+      - backtest.queued run event
+    phase_status: implemented
+  - id: run_backtest_variant_lab
+    capability: backtest-variant-lab
+    risk_tier: validation
+    input_schema_ref: schemas/strategy-spec.schema.json + backtest_config variants
+    output_schema_ref: backtest/variant-lab-*.json
+    evidence_required:
+      - backtest/variant-lab-*.json
+      - backtest.queued run events
     phase_status: implemented
   - id: knowledge_registry_check
     capability: knowledge-refresh

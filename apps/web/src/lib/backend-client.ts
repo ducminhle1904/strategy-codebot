@@ -1,0 +1,555 @@
+import { z } from "zod";
+
+import {
+  AccountUsageResponseSchema,
+  ArtifactContentResponseSchema,
+  ArtifactPreviewResponseSchema,
+  BackendErrorResponseSchema,
+  ConversationCreateSchema,
+  ConversationListResponseSchema,
+  ConversationSchema,
+  ConversationSidebarResponseSchema,
+  ConversationStateResponseSchema,
+  ConversationUpdateSchema,
+  FeedbackCreateSchema,
+  FeedbackOptionsResponseSchema,
+  FeedbackSchema,
+  HealthResponseSchema,
+  MeResponseSchema,
+  MessageCreateSchema,
+  MessageListResponseSchema,
+  MessageSchema,
+  ProviderStatusResponseSchema,
+  ReadyResponseSchema,
+  RunCreateResponseSchema,
+  RunCreateSchema,
+  RunEventSchema,
+  RunObservabilityResponseSchema,
+  RunSchema,
+  type AccountUsageResponse,
+  type ArtifactContentResponse,
+  type ArtifactPreviewResponse,
+  type Conversation,
+  type ConversationCreate,
+  type ConversationListResponse,
+  type ConversationSidebarResponse,
+  type ConversationStateResponse,
+  type ConversationUpdate,
+  type Feedback,
+  type FeedbackCreate,
+  type FeedbackOptionsResponse,
+  type HealthResponse,
+  type MeResponse,
+  type Message,
+  type MessageCreate,
+  type MessageListResponse,
+  type ProviderStatusResponse,
+  type ReadyResponse,
+  type Run,
+  type RunCreate,
+  type RunCreateResponse,
+  type RunEvent,
+  type RunObservabilityResponse,
+} from "./backend-schemas";
+import { parseSseJsonPayloads } from "./sse";
+
+type Fetcher = typeof fetch;
+
+export type BackendClientOptions = {
+  baseUrl?: string;
+  userId?: string;
+  workspaceId?: string;
+  userTier?: string;
+  workspaceRole?: string;
+  internalAuthSecret?: string;
+  fetcher?: Fetcher;
+  idempotencyKeyFactory?: () => string;
+};
+
+export type BackendHeaderOptions = {
+  userId?: string;
+  workspaceId?: string;
+  userTier?: string;
+  workspaceRole?: string;
+  internalAuthSecret?: string;
+  body?: unknown;
+  requestId?: string;
+  idempotencyKey?: string;
+  lastEventId?: string;
+  createOperation?: boolean;
+  idempotencyKeyFactory?: () => string;
+};
+
+export const DEFAULT_API_BASE_URL =
+  process.env.STRATEGY_CODEBOT_API_BASE_URL ??
+  process.env.PYTHON_BACKEND_URL ??
+  process.env.NEXT_PUBLIC_STRATEGY_CODEBOT_API_URL ??
+  process.env.NEXT_PUBLIC_API_BASE_URL ??
+  "http://localhost:8000";
+
+export type RequestOptions = {
+  requestId?: string;
+  idempotencyKey?: string;
+  signal?: AbortSignal;
+};
+
+export type MessageCreateOptions = RequestOptions & {
+  mode?: "deterministic" | "agent";
+};
+
+export type StreamOptions = RequestOptions & {
+  lastEventId?: string;
+};
+
+export class BackendClientError extends Error {
+  readonly status: number;
+  readonly payload: unknown;
+
+  constructor(message: string, status: number, payload: unknown) {
+    super(message);
+    this.name = "BackendClientError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
+export type BackendApiError = BackendClientError;
+
+export class BackendClient {
+  private readonly baseUrl: string;
+  private readonly userId?: string;
+  private readonly workspaceId?: string;
+  private readonly userTier?: string;
+  private readonly workspaceRole?: string;
+  private readonly internalAuthSecret?: string;
+  private readonly fetcher: Fetcher;
+  private readonly idempotencyKeyFactory: () => string;
+
+  constructor(options: BackendClientOptions) {
+    this.baseUrl = options.baseUrl ?? DEFAULT_API_BASE_URL;
+    this.userId = options.userId;
+    this.workspaceId = options.workspaceId;
+    this.userTier = options.userTier;
+    this.workspaceRole = options.workspaceRole;
+    this.internalAuthSecret = options.internalAuthSecret;
+    this.fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
+    this.idempotencyKeyFactory =
+      options.idempotencyKeyFactory ?? defaultIdempotencyKey;
+  }
+
+  health(): Promise<HealthResponse> {
+    return this.request("/health", {
+      responseSchema: HealthResponseSchema,
+    });
+  }
+
+  ready(): Promise<ReadyResponse> {
+    return this.request("/ready", {
+      responseSchema: ReadyResponseSchema,
+    });
+  }
+
+  me(): Promise<MeResponse> {
+    return this.request("/v1/me", {
+      responseSchema: MeResponseSchema,
+    });
+  }
+
+  getProviderStatus(): Promise<ProviderStatusResponse> {
+    return this.request("/v1/provider/status", {
+      responseSchema: ProviderStatusResponseSchema,
+    });
+  }
+
+  getAccountUsage(): Promise<AccountUsageResponse> {
+    return this.request("/v1/account/usage", {
+      responseSchema: AccountUsageResponseSchema,
+    });
+  }
+
+  createConversation(
+    payload: ConversationCreate = {},
+    options: RequestOptions = {}
+  ): Promise<Conversation> {
+    return this.request("/v1/conversations", {
+      method: "POST",
+      body: ConversationCreateSchema.parse(payload),
+      responseSchema: ConversationSchema,
+      idempotencyKey: options.idempotencyKey,
+      requestId: options.requestId,
+      createOperation: true,
+    });
+  }
+
+  listConversations(): Promise<ConversationListResponse> {
+    return this.request("/v1/conversations", {
+      responseSchema: ConversationListResponseSchema,
+    });
+  }
+
+  updateConversationTitle(
+    conversationId: string,
+    payload: ConversationUpdate,
+    options: RequestOptions = {}
+  ): Promise<Conversation> {
+    return this.request(`/v1/conversations/${encodePath(conversationId)}`, {
+      method: "PATCH",
+      body: ConversationUpdateSchema.parse(payload),
+      responseSchema: ConversationSchema,
+      requestId: options.requestId,
+    });
+  }
+
+  deleteConversation(
+    conversationId: string,
+    options: RequestOptions = {}
+  ): Promise<Conversation> {
+    return this.request(`/v1/conversations/${encodePath(conversationId)}`, {
+      method: "DELETE",
+      responseSchema: ConversationSchema,
+      requestId: options.requestId,
+    });
+  }
+
+  listConversationSidebar(): Promise<ConversationSidebarResponse> {
+    return this.request("/v1/conversations/sidebar", {
+      responseSchema: ConversationSidebarResponseSchema,
+    });
+  }
+
+  getConversationState(
+    conversationId: string
+  ): Promise<ConversationStateResponse> {
+    return this.request(`/v1/conversations/${encodePath(conversationId)}/state`, {
+      responseSchema: ConversationStateResponseSchema,
+    });
+  }
+
+  listMessages(conversationId: string): Promise<MessageListResponse> {
+    return this.request(
+      `/v1/conversations/${encodePath(conversationId)}/messages`,
+      {
+        responseSchema: MessageListResponseSchema,
+      }
+    );
+  }
+
+  createMessage(
+    conversationId: string,
+    payload: MessageCreate,
+    options: MessageCreateOptions = {}
+  ): Promise<Message> {
+    const query = new URLSearchParams();
+    if (options.mode) {
+      query.set("mode", options.mode);
+    }
+    return this.request(
+      `/v1/conversations/${encodePath(conversationId)}/messages${queryString(
+        query
+      )}`,
+      {
+        method: "POST",
+        body: MessageCreateSchema.parse(payload),
+        responseSchema: MessageSchema,
+        idempotencyKey: options.idempotencyKey,
+        requestId: options.requestId,
+        createOperation: true,
+      }
+    );
+  }
+
+  streamMessage(
+    conversationId: string,
+    payload: MessageCreate,
+    options: MessageCreateOptions = {}
+  ): Promise<Response> {
+    const query = new URLSearchParams({ stream: "true" });
+    if (options.mode) {
+      query.set("mode", options.mode);
+    }
+    return this.streamRequest(
+      `/v1/conversations/${encodePath(conversationId)}/messages${queryString(
+        query
+      )}`,
+      {
+        method: "POST",
+        body: MessageCreateSchema.parse(payload),
+        idempotencyKey: options.idempotencyKey,
+        requestId: options.requestId,
+        signal: options.signal,
+        createOperation: true,
+      }
+    );
+  }
+
+  createRun(
+    payload: RunCreate,
+    options: RequestOptions = {}
+  ): Promise<RunCreateResponse> {
+    return this.request("/v1/runs", {
+      method: "POST",
+      body: RunCreateSchema.parse(payload),
+      responseSchema: RunCreateResponseSchema,
+      idempotencyKey: options.idempotencyKey,
+      requestId: options.requestId,
+      createOperation: true,
+    });
+  }
+
+  streamRunEvents(runId: string, options: StreamOptions = {}): Promise<Response> {
+    return this.streamRequest(`/v1/runs/${encodePath(runId)}/events`, {
+      lastEventId: options.lastEventId,
+      requestId: options.requestId,
+      signal: options.signal,
+    });
+  }
+
+  streamRunProgress(
+    runId: string,
+    options: StreamOptions = {}
+  ): Promise<Response> {
+    return this.streamRequest(`/v1/runs/${encodePath(runId)}/progress`, {
+      lastEventId: options.lastEventId,
+      requestId: options.requestId,
+      signal: options.signal,
+    });
+  }
+
+  getRunObservability(runId: string): Promise<RunObservabilityResponse> {
+    return this.request(`/v1/runs/${encodePath(runId)}/observability`, {
+      responseSchema: RunObservabilityResponseSchema,
+    });
+  }
+
+  cancelRun(runId: string): Promise<Run> {
+    return this.request(`/v1/runs/${encodePath(runId)}/cancel`, {
+      method: "POST",
+      responseSchema: RunSchema,
+    });
+  }
+
+  retryRun(
+    runId: string,
+    options: RequestOptions = {}
+  ): Promise<Run> {
+    return this.request(`/v1/runs/${encodePath(runId)}/retry`, {
+      method: "POST",
+      responseSchema: RunSchema,
+      idempotencyKey: options.idempotencyKey,
+      requestId: options.requestId,
+      createOperation: true,
+    });
+  }
+
+  getArtifactPreview(
+    artifactId: string,
+    options: { maxBytes?: number } = {}
+  ): Promise<ArtifactPreviewResponse> {
+    const query = new URLSearchParams();
+    if (options.maxBytes !== undefined) {
+      query.set("max_bytes", String(options.maxBytes));
+    }
+    return this.request(
+      `/v1/artifacts/${encodePath(artifactId)}/preview${queryString(query)}`,
+      {
+        responseSchema: ArtifactPreviewResponseSchema,
+      }
+    );
+  }
+
+  getArtifactContent(artifactId: string): Promise<ArtifactContentResponse> {
+    return this.request(`/v1/artifacts/${encodePath(artifactId)}`, {
+      responseSchema: ArtifactContentResponseSchema,
+    });
+  }
+
+  getFeedbackOptions(): Promise<FeedbackOptionsResponse> {
+    return this.request("/v1/feedback/options", {
+      responseSchema: FeedbackOptionsResponseSchema,
+    });
+  }
+
+  createFeedback(
+    payload: FeedbackCreate,
+    options: RequestOptions = {}
+  ): Promise<Feedback> {
+    return this.request("/v1/feedback", {
+      method: "POST",
+      body: FeedbackCreateSchema.parse(payload),
+      responseSchema: FeedbackSchema,
+      idempotencyKey: options.idempotencyKey,
+      requestId: options.requestId,
+      createOperation: true,
+    });
+  }
+
+  private async request<T>(
+    path: string,
+    options: JsonRequestOptions<T>
+  ): Promise<T> {
+    const response = await this.fetcher(this.buildUrl(path), {
+      method: options.method ?? "GET",
+      headers: this.headers(options),
+      body:
+        options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: options.signal,
+    });
+    const payload = await readJson(response);
+    if (!response.ok) {
+      throw backendError(response.status, payload);
+    }
+    return options.responseSchema.parse(payload);
+  }
+
+  private async streamRequest(
+    path: string,
+    options: StreamRequestOptions = {}
+  ): Promise<Response> {
+    const response = await this.fetcher(this.buildUrl(path), {
+      method: options.method ?? "GET",
+      headers: this.headers(options),
+      body:
+        options.body === undefined ? undefined : JSON.stringify(options.body),
+      signal: options.signal,
+    });
+    if (!response.ok) {
+      throw backendError(response.status, await readJson(response));
+    }
+    return response;
+  }
+
+  private headers(options: HeaderOptions = {}): Headers {
+    return buildBackendHeaders({
+      ...options,
+      internalAuthSecret: this.internalAuthSecret,
+      idempotencyKeyFactory: this.idempotencyKeyFactory,
+      userId: this.userId,
+      userTier: this.userTier,
+      workspaceId: this.workspaceId,
+      workspaceRole: this.workspaceRole,
+    });
+  }
+
+  private buildUrl(path: string): string {
+    if (!this.baseUrl) {
+      return path;
+    }
+    return `${this.baseUrl.replace(/\/$/, "")}${path}`;
+  }
+}
+
+type JsonRequestOptions<T> = HeaderOptions & {
+  method?: "DELETE" | "GET" | "PATCH" | "POST";
+  responseSchema: z.ZodType<T>;
+};
+
+type StreamRequestOptions = HeaderOptions & {
+  method?: "GET" | "POST";
+};
+
+type HeaderOptions = {
+  body?: unknown;
+  requestId?: string;
+  idempotencyKey?: string;
+  lastEventId?: string;
+  createOperation?: boolean;
+  signal?: AbortSignal;
+};
+
+export function parseBackendSseEvents(text: string): RunEvent[] {
+  return parseSseJsonPayloads(text).map((payload) => RunEventSchema.parse(payload));
+}
+
+export function buildBackendHeaders(options: BackendHeaderOptions = {}): Headers {
+  const headers = new Headers({
+    Accept: "application/json",
+  });
+  if (options.userId) {
+    headers.set("X-User-Id", options.userId);
+  }
+  if (options.workspaceId) {
+    headers.set("X-Workspace-Id", options.workspaceId);
+  }
+  if (options.userTier) {
+    headers.set("X-User-Tier", options.userTier);
+  }
+  if (options.workspaceRole) {
+    headers.set("X-Workspace-Role", options.workspaceRole);
+  }
+  if (options.internalAuthSecret) {
+    headers.set("X-Strategy-Codebot-Internal-Secret", options.internalAuthSecret);
+  }
+  if (options.body !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (options.requestId) {
+    headers.set("X-Request-Id", options.requestId);
+  }
+  if (options.lastEventId) {
+    headers.set("Last-Event-ID", options.lastEventId);
+  }
+  if (options.createOperation) {
+    headers.set(
+      "Idempotency-Key",
+      options.idempotencyKey ??
+        options.idempotencyKeyFactory?.() ??
+        defaultIdempotencyKey()
+    );
+  }
+  return headers;
+}
+
+async function readJson(response: Response): Promise<unknown> {
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+  return JSON.parse(text);
+}
+
+function backendError(status: number, payload: unknown): BackendClientError {
+  const parsed = BackendErrorResponseSchema.safeParse(payload);
+  const reason = parsed.success
+    ? parsed.data.error.code
+    : backendErrorDetail(payload) ?? "request_failed";
+  return new BackendClientError(`Backend request failed: ${reason}`, status, payload);
+}
+
+function backendErrorDetail(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object" || !("detail" in payload)) {
+    return null;
+  }
+  const detail = (payload as { detail: unknown }).detail;
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    const firstMessage = detail
+      .map((item) => {
+        if (!item || typeof item !== "object" || !("msg" in item)) {
+          return null;
+        }
+        const message = (item as { msg: unknown }).msg;
+        return typeof message === "string" ? message : null;
+      })
+      .find(Boolean);
+    return firstMessage ?? null;
+  }
+  return null;
+}
+
+function defaultIdempotencyKey(): string {
+  if (globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function encodePath(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function queryString(params: URLSearchParams): string {
+  const serialized = params.toString();
+  return serialized ? `?${serialized}` : "";
+}

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -12,6 +11,11 @@ import yaml
 
 from strategy_codebot.harness_types import FAILURE_POLICY_VIOLATION, FAILURE_TOOL_ERROR, STATUS_BLOCKED, STATUS_FAIL, STATUS_PASS, STATUS_STARTED
 from strategy_codebot.paths import ensure_parent, repo_root
+from strategy_codebot.policy_engine import EVIDENCE_GENERATED_ARTIFACT
+from strategy_codebot.policy_engine import EVIDENCE_STRATEGY_IDEA
+from strategy_codebot.policy_engine import contains_blocking_policy as contains_engine_blocking_policy
+from strategy_codebot.policy_engine import find_policy_findings as find_engine_policy_findings
+from strategy_codebot.policy_engine import validate_policy_rules
 from strategy_codebot.reporting import aggregate_status, validation_check
 from strategy_codebot.schemas import validate_payload, write_json
 
@@ -22,86 +26,7 @@ POLICY_OBSERVE = "observe"
 POLICY_ENFORCE = "enforce"
 POLICY_MODES = {POLICY_OBSERVE, POLICY_ENFORCE}
 BLOCKED_RISK_TIERS = {"broker_write", "destructive"}
-BLOCKED_CLAIMS = (
-    "guarantee profit",
-    "guarantee returns",
-    "guarantees profit",
-    "guarantees returns",
-    "guaranteed profit",
-    "guaranteed returns",
-    "risk-free",
-    "live ready",
-    "live-ready",
-    "live immediately",
-    "safe for live trading",
-    "certified for live trading",
-    "broker integration",
-    "broker deployment",
-    "connects to my broker",
-    "place live trades",
-    "places live trades",
-    "live trades automatically",
-    "cannot lose money",
-    "autonomous live",
-)
-WARNING_CLAIMS = (
-    "profitability",
-    "profitable",
-    "live trading",
-    "live trades",
-    "broker",
-)
-ALLOWED_CLAIM_PATTERNS = (
-    r"\b(do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|lack|lacks|lacking|against|constraints against)\b.{0,120}\b(live trading|live trades|live ready|live-ready|live immediately|profitability|profitable|guarantee profit|guarantee returns|guarantees profit|guarantees returns|guaranteed profit|guaranteed returns|risk-free|cannot lose money|broker integration|broker deployment|broker|autonomous live)\b",
-    r"\b(no|without|not for|not used for|not be used for|cannot|lack of|against|constraints against)\b.{0,120}\b(live trading|live trades|live ready|live-ready|live immediately|profitability|profitable|guarantee profit|guarantee returns|guarantees profit|guarantees returns|guaranteed profit|guaranteed returns|risk-free|cannot lose money|broker integration|broker deployment|broker|autonomous live)\b",
-    r"\b(disclaimer|disclaimers|disclaiming)\b.{0,120}\b(regarding|about|against|around|or)\b.{0,120}\b(live trading|live trades|live ready|live-ready|live immediately|profitability|profitable|guarantee profit|guarantee returns|guarantees profit|guarantees returns|guaranteed profit|guaranteed returns|risk-free|cannot lose money|broker integration|broker deployment|broker|autonomous live)\b",
-    r"\b(live trading|live trades|live ready|live-ready|live immediately|profitability|profitable|guarantee profit|guarantee returns|guarantees profit|guarantees returns|guaranteed profit|guaranteed returns|risk-free|cannot lose money|broker integration|broker deployment|broker|autonomous live)\b.{0,120}\b(is not|are not|must not|should not|without|avoid|avoided|claim)\b",
-)
-NEGATED_CLAIM_PREFIXES = (
-    "no ",
-    "without ",
-    "lack of ",
-    "lack ",
-    "lacks ",
-    "lacking ",
-    "before any ",
-    "does not ",
-    "does not claim ",
-    "do not ",
-    "not ",
-    "never ",
-    "never claim ",
-    "avoid ",
-    "avoids ",
-    "avoiding ",
-    "against ",
-    "constraints against ",
-    "disclaiming ",
-    "rather than claim ",
-    "rather than claiming ",
-    "must not ",
-    "should not ",
-    "cannot ",
-    "can't ",
-)
 REQUIRED_TOOL_KEYS = {"id", "capability", "risk_tier", "input_schema_ref", "output_schema_ref", "evidence_required", "phase_status"}
-POLICY_SAFE_CONTEXT_KEYS = {"non_goals", "policy_observations"}
-
-
-@dataclass(frozen=True)
-class PolicyFinding:
-    claim: str
-    matched_text: str
-    reason: str
-    sentence: str
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "claim": self.claim,
-            "matched_text": self.matched_text,
-            "reason": self.reason,
-            "sentence": self.sentence,
-        }
 
 
 class ToolBlockedError(RuntimeError):
@@ -292,6 +217,14 @@ def check_tool_registry(registry_path: Path) -> dict[str, Any]:
         else:
             checks.append({"name": f"{tool_id}:schema", "status": STATUS_PASS, "details": "Tool contract schema is valid."})
 
+    policy_report = validate_policy_rules()
+    checks.append(
+        validation_check(
+            "policy_rules:schema",
+            policy_report["status"] == STATUS_PASS,
+            f"Policy rules loaded: {policy_report['rule_count']}" if policy_report["status"] == STATUS_PASS else "; ".join(policy_report["errors"]),
+        )
+    )
     status = aggregate_status({check["status"] for check in checks})
     return {
         "platform": "both",
@@ -304,84 +237,35 @@ def check_tool_registry(registry_path: Path) -> dict[str, Any]:
 
 
 def contains_blocked_claim(text: str) -> bool:
-    return bool(find_blocked_claims(text))
+    return contains_engine_blocking_policy(text, surface="policy_text", evidence_level=EVIDENCE_GENERATED_ARTIFACT)
 
 
 def find_blocked_claims(text: str) -> list[dict[str, str]]:
     return [finding for finding in find_policy_claims(text) if finding.get("severity") == "block"]
 
 
+def find_prompt_boundary_violations(text: str) -> list[dict[str, str]]:
+    return [
+        _legacy_policy_finding(finding, claim_field="rule_id")
+        for finding in find_engine_policy_findings(text, surface="user_prompt", evidence_level=EVIDENCE_STRATEGY_IDEA)
+        if finding.get("severity") == "blocker"
+    ]
+
+
 def find_policy_claims(text: str) -> list[dict[str, str]]:
-    findings: list[dict[str, str]] = []
-    for fragment in _policy_text_fragments(text):
-        for sentence in _claim_sentences(fragment):
-            lowered = sentence.lower()
-            if _allowed_policy_boundary(lowered):
-                continue
-            for claim, severity in (*((claim, "block") for claim in BLOCKED_CLAIMS), *((claim, "warn") for claim in WARNING_CLAIMS)):
-                start = 0
-                while True:
-                    index = lowered.find(claim, start)
-                    if index == -1:
-                        break
-                    prefix = lowered[max(0, index - 96) : index]
-                    if not any(marker in prefix for marker in NEGATED_CLAIM_PREFIXES):
-                        findings.append(
-                            PolicyFinding(
-                                claim=claim,
-                                matched_text=sentence[index : index + len(claim)],
-                                reason=_claim_reason(claim),
-                                sentence=sentence,
-                            ).to_dict()
-                            | {"severity": severity}
-                        )
-                        break
-                    start = index + len(claim)
-    return findings
+    return [
+        _legacy_policy_finding(finding)
+        for finding in find_engine_policy_findings(text, surface="policy_text", evidence_level=EVIDENCE_GENERATED_ARTIFACT)
+    ]
 
 
-def _policy_text_fragments(text: str) -> list[str]:
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return [text]
-    fragments: list[str] = []
-    _collect_policy_fragments(payload, fragments)
-    return fragments
-
-
-def _collect_policy_fragments(value: Any, fragments: list[str], *, key: str | None = None) -> None:
-    if key in POLICY_SAFE_CONTEXT_KEYS:
-        return
-    if isinstance(value, str):
-        fragments.append(value)
-    elif isinstance(value, dict):
-        for child_key, child_value in value.items():
-            _collect_policy_fragments(child_value, fragments, key=str(child_key))
-    elif isinstance(value, list):
-        for item in value:
-            _collect_policy_fragments(item, fragments, key=key)
-
-
-def _claim_sentences(text: str) -> list[str]:
-    normalized = re.sub(r"\s+", " ", text).strip()
-    if not normalized:
-        return []
-    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|[\n\r;]+", normalized) if part.strip()]
-
-
-def _allowed_policy_boundary(sentence: str) -> bool:
-    return any(re.search(pattern, sentence) for pattern in ALLOWED_CLAIM_PATTERNS)
-
-
-def _claim_reason(claim: str) -> str:
-    if "broker" in claim:
-        return "broker integration or deployment claim"
-    if "live" in claim:
-        return "live trading readiness or execution claim"
-    if "risk" in claim or "cannot lose" in claim:
-        return "risk-free or no-loss claim"
-    return "profitability or guaranteed return claim"
+def _legacy_policy_finding(finding: dict[str, str], *, claim_field: str = "matched_text") -> dict[str, str]:
+    payload = dict(finding)
+    payload.update({
+        "claim": finding.get(claim_field) or finding.get("claim") or finding.get("matched_text", ""),
+        "severity": "block" if finding.get("severity") == "blocker" else "warn",
+    })
+    return payload
 
 
 def _contains_blocked_claim(text: str) -> bool:

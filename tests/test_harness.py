@@ -9,6 +9,7 @@ from strategy_codebot.harness import (
     build_trace_command,
     classify_trace_intake,
     gate_development,
+    harness_cli_availability,
     harness_outcome,
     memory_candidates,
     preflight_context,
@@ -130,6 +131,19 @@ def test_harness_trace_command_shape() -> None:
 
 def test_explicit_no_record_harness_wins() -> None:
     assert should_record_harness(False) is False
+
+
+def test_implicit_record_harness_requires_executable_cli(monkeypatch, tmp_path: Path) -> None:
+    fake_cli = tmp_path / "harness-cli"
+    fake_cli.write_bytes(b"\xcf\xfa\xed\xfe")
+    fake_cli.chmod(0o755)
+    monkeypatch.setattr("strategy_codebot.harness.harness_cli_path", lambda: fake_cli)
+
+    availability = harness_cli_availability()
+
+    assert availability["available"] is False
+    assert availability["status"] in {"not_executable", "unusable"}
+    assert should_record_harness(None) is False
 
 
 def test_harness_outcome_maps_validation_status() -> None:

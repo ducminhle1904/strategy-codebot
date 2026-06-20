@@ -23,11 +23,14 @@ from strategy_codebot.harness_types import (
 from strategy_codebot.live import (
     COST_PROFILE_CHEAP,
     COST_PROFILE_QUALITY,
+    DEFAULT_USER_TIER,
     STAGE_BALANCED_REVIEW,
     STAGE_PINE_CODE_GENERATION,
     STAGE_REPAIR,
     STAGE_STRATEGY_CODING,
     STAGE_STRATEGY_REASONING,
+    USER_TIERS,
+    USER_TIER_FREE,
     WORKFLOW_MULTI_AGENT,
     LiveRunOptions,
 )
@@ -36,6 +39,8 @@ from strategy_codebot.schemas import write_json
 
 MODEL_MATRIX_REPORT_PATH = "model-matrix-report.json"
 MODEL_HEALTH_REPORT_PATH = "model-health.json"
+MATRIX_MODE_COMBO = "combo"
+MATRIX_MODE_TIER = "tier"
 
 GEMINI_FLASH_OPENROUTER = "openrouter/google/gemini-2.5-flash"
 KIMI_K2_OPENROUTER = "openrouter/moonshotai/kimi-k2.5"
@@ -70,6 +75,7 @@ class ModelCombo:
             model_stage_overrides=dict(self.model_stage_overrides),
             save_raw_provider=save_raw_provider,
             knowledge_context=knowledge_context,
+            use_tier_routing=False,
         )
 
 
@@ -180,6 +186,8 @@ def run_model_combo_matrix(
     concurrency: int = 1,
     case_timeout_seconds: int | None = 300,
     knowledge_context: str = "auto",
+    matrix_mode: str = MATRIX_MODE_COMBO,
+    tier_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
@@ -187,6 +195,23 @@ def run_model_combo_matrix(
     full_suite = resolve_repo_path(full_suite_path)
     registry_path = resolve_repo_path(model_registry or repo_root() / "configs" / "model-registry.example.yaml")
     ensure_dir(out_dir)
+
+    if matrix_mode not in {MATRIX_MODE_COMBO, MATRIX_MODE_TIER}:
+        raise ValueError("matrix_mode must be combo or tier")
+    if matrix_mode == MATRIX_MODE_TIER:
+        return _run_tier_matrix(
+            smoke_suite=smoke_suite,
+            full_suite=full_suite,
+            out_dir=out_dir,
+            policy=policy,
+            model_registry=registry_path,
+            tier_ids=tier_ids,
+            run_full=run_full,
+            save_raw_provider=save_raw_provider,
+            concurrency=concurrency,
+            case_timeout_seconds=case_timeout_seconds,
+            knowledge_context=knowledge_context,
+        )
 
     combos = _select_combos(combo_ids)
     combo_reports = []
@@ -219,6 +244,7 @@ def run_model_combo_matrix(
         "concurrency": concurrency,
         "case_timeout_seconds": case_timeout_seconds,
         "knowledge_context": knowledge_context,
+        "mode": MATRIX_MODE_COMBO,
         "acceptance": {
             "smoke_min_pass_rate": SMOKE_PASS_RATE,
             "full_min_pass_rate": FULL_PASS_RATE,
@@ -235,6 +261,68 @@ def run_model_combo_matrix(
     return report
 
 
+def _run_tier_matrix(
+    *,
+    smoke_suite: Path,
+    full_suite: Path,
+    out_dir: Path,
+    policy: str,
+    model_registry: Path,
+    tier_ids: list[str] | None,
+    run_full: bool,
+    save_raw_provider: bool,
+    concurrency: int,
+    case_timeout_seconds: int | None,
+    knowledge_context: str,
+) -> dict[str, Any]:
+    tiers = _select_tiers(tier_ids)
+    tier_reports = []
+    for tier in tiers:
+        options = LiveRunOptions(
+            workflow=WORKFLOW_MULTI_AGENT,
+            cost_profile=COST_PROFILE_CHEAP,
+            user_tier=tier,
+            save_raw_provider=save_raw_provider,
+            knowledge_context=knowledge_context,
+        )
+        tier_reports.append(
+            _run_tier(
+                tier=tier,
+                smoke_suite=smoke_suite,
+                full_suite=full_suite,
+                out_dir=out_dir / tier,
+                policy=policy,
+                model_registry=model_registry,
+                run_full=run_full,
+                live_options=options,
+                concurrency=concurrency,
+                case_timeout_seconds=case_timeout_seconds,
+            )
+        )
+    accepted = [tier for tier in tier_reports if tier.get("accepted")]
+    report = {
+        "created_at": datetime.now(UTC).isoformat(),
+        "status": STATUS_PASS if accepted else STATUS_FAIL,
+        "mode": MATRIX_MODE_TIER,
+        "policy": policy,
+        "smoke_suite": str(smoke_suite),
+        "full_suite": str(full_suite),
+        "model_registry": str(model_registry),
+        "run_full": run_full,
+        "concurrency": concurrency,
+        "case_timeout_seconds": case_timeout_seconds,
+        "knowledge_context": knowledge_context,
+        "recommended_tier": _recommended_tier_id(tier_reports),
+        "recommended_combo": None,
+        "model_health_ref": MODEL_HEALTH_REPORT_PATH,
+        "tiers": tier_reports,
+        "combos": [],
+    }
+    write_json(out_dir / MODEL_HEALTH_REPORT_PATH, _model_health_scorecard(out_dir, tier_reports))
+    write_json(out_dir / MODEL_MATRIX_REPORT_PATH, report)
+    return report
+
+
 def _select_combos(combo_ids: list[str] | None) -> list[ModelCombo]:
     combos = default_model_combos()
     if not combo_ids:
@@ -245,6 +333,17 @@ def _select_combos(combo_ids: list[str] | None) -> list[ModelCombo]:
         valid = ", ".join(sorted(by_id))
         raise ValueError(f"Unknown model combo(s): {', '.join(unknown)}. Valid combos: {valid}")
     return [by_id[combo_id] for combo_id in combo_ids]
+
+
+def _select_tiers(tier_ids: list[str] | None) -> list[str]:
+    tiers = [USER_TIER_FREE, DEFAULT_USER_TIER, "paid_medium", "paid_high"]
+    if not tier_ids:
+        return tiers
+    unknown = [tier for tier in tier_ids if tier not in USER_TIERS]
+    if unknown:
+        valid = ", ".join(sorted(USER_TIERS))
+        raise ValueError(f"Unknown user tier(s): {', '.join(unknown)}. Valid tiers: {valid}")
+    return tier_ids
 
 
 def _run_combo(
@@ -313,6 +412,77 @@ def _run_combo(
         otel_export=out_dir / "full" / "otel.jsonl",
         concurrency=concurrency,
         case_timeout_seconds=case_timeout_seconds,
+    )
+    full_summary = _summarize_eval_report(full_report, tier="full")
+    report["full"] = full_summary
+    report["status"] = STATUS_PASS if full_summary["accepted"] else STATUS_FAIL
+    report["accepted"] = full_summary["accepted"]
+    return report
+
+
+def _run_tier(
+    *,
+    tier: str,
+    smoke_suite: Path,
+    full_suite: Path,
+    out_dir: Path,
+    policy: str,
+    model_registry: Path,
+    run_full: bool,
+    live_options: LiveRunOptions,
+    concurrency: int,
+    case_timeout_seconds: int | None,
+) -> dict[str, Any]:
+    ensure_dir(out_dir)
+    missing_env = [] if os.getenv("OPENROUTER_API_KEY") else ["OPENROUTER_API_KEY"]
+    report: dict[str, Any] = {
+        "id": tier,
+        "user_tier": tier,
+        "description": f"Production user-tier route profile: {tier}",
+        "status": STATUS_SKIPPED if missing_env else STATUS_FAIL,
+        "accepted": False,
+        "skip_reason": None,
+        "cost_profile": live_options.cost_profile,
+        "model_stage_overrides": {},
+        "required_env_all": ["OPENROUTER_API_KEY"],
+        "out_dir": str(out_dir),
+        "smoke": None,
+        "full": None,
+    }
+    if missing_env:
+        report["skip_reason"] = f"missing credential env: {', '.join(missing_env)}"
+        return report
+    effective_case_timeout_seconds = 120 if tier == USER_TIER_FREE and case_timeout_seconds in {None, 300} else case_timeout_seconds
+
+    smoke_report = _run_live_eval_for_matrix(
+        suite_path=smoke_suite,
+        out_dir=out_dir / "smoke",
+        policy=policy,
+        model_registry=model_registry,
+        live_options=live_options,
+        otel_export=out_dir / "smoke" / "otel.jsonl",
+        concurrency=concurrency,
+        case_timeout_seconds=effective_case_timeout_seconds,
+    )
+    smoke_summary = _summarize_eval_report(smoke_report, tier="smoke")
+    report["smoke"] = smoke_summary
+    report["status"] = STATUS_PASS if smoke_summary["accepted"] else STATUS_FAIL
+    report["accepted"] = smoke_summary["accepted"]
+    if not run_full:
+        return report
+    if not smoke_summary["accepted"]:
+        report["full"] = {"status": STATUS_SKIPPED, "accepted": False, "skip_reason": "smoke gate failed"}
+        report["accepted"] = False
+        return report
+    full_report = _run_live_eval_for_matrix(
+        suite_path=full_suite,
+        out_dir=out_dir / "full",
+        policy=policy,
+        model_registry=model_registry,
+        live_options=live_options,
+        otel_export=out_dir / "full" / "otel.jsonl",
+        concurrency=concurrency,
+        case_timeout_seconds=effective_case_timeout_seconds,
     )
     full_summary = _summarize_eval_report(full_report, tier="full")
     report["full"] = full_summary
@@ -459,6 +629,30 @@ def _summarize_eval_report(report: dict[str, Any], *, tier: str) -> dict[str, An
     knowledge_cases = [case for case in artifact_cases if case.get("knowledge_context_ref")]
     internal_doc_counts = [len(case.get("knowledge_doc_ids") or []) for case in knowledge_cases]
     external_source_ids = sorted({source_id for case in knowledge_cases for source_id in (case.get("external_source_ids") or [])})
+    knowledge_candidate_ids = sorted(
+        {
+            str(candidate_id)
+            for case in cases
+            for candidate_id in (case.get("knowledge_candidate_ids") or [])
+            if candidate_id
+        }
+    )
+    unstable_route_count = sum(
+        1
+        for case in artifact_cases
+        for route in (case.get("route_health_snapshot") or [])
+        if route.get("status") in {"unstable", "cooldown"}
+    )
+    fallback_gateway_count = sum(int(case.get("fallback_gateway_count") or 0) for case in artifact_cases)
+    selected_free_models = sorted(
+        {
+            str(model)
+            for case in artifact_cases
+            for model in (case.get("selected_free_models") or [])
+            if model
+        }
+    )
+    free_capacity_statuses = dict(sorted(Counter(str(case.get("free_capacity_status")) for case in artifact_cases if case.get("free_capacity_status")).items()))
     min_pass_rate = SMOKE_PASS_RATE if tier == "smoke" else FULL_PASS_RATE
     generation_accepted = (
         len(artifact_cases) > 0
@@ -467,6 +661,7 @@ def _summarize_eval_report(report: dict[str, Any], *, tier: str) -> dict[str, An
         and artifact_missing_count == 0
         and stalled_case_count == 0
         and quality_blocker_count == 0
+        and unstable_route_count == 0
     )
     safety_accepted = safety_pass_rate >= 1.0
     production_accepted = (
@@ -509,6 +704,12 @@ def _summarize_eval_report(report: dict[str, Any], *, tier: str) -> dict[str, An
         "knowledge_context_case_count": len(knowledge_cases),
         "avg_internal_doc_count": sum(internal_doc_counts) / len(internal_doc_counts) if internal_doc_counts else 0.0,
         "external_ref_count": len(external_source_ids),
+        "knowledge_candidate_count": len(knowledge_candidate_ids),
+        "knowledge_candidate_ids": knowledge_candidate_ids,
+        "selected_free_models": selected_free_models,
+        "free_capacity_statuses": free_capacity_statuses,
+        "unstable_route_count": unstable_route_count,
+        "fallback_gateway_count": fallback_gateway_count,
         "latency_ms": {
             "avg": sum(latency_values) / len(latency_values) if latency_values else None,
             "p95": _percentile(latency_values, 0.95) if latency_values else None,
@@ -554,7 +755,21 @@ def _model_health_scorecard(out_dir: Path, combo_reports: list[dict[str, Any]]) 
                     model = stage.get("model")
                     if not stage_name or not model:
                         continue
-                    buckets.setdefault((str(stage_name), str(model)), []).append({"case": case, "stage": stage, "tier": tier, "combo_id": combo.get("id")})
+                    buckets.setdefault((str(stage_name), str(model)), []).append({"case": case, "stage": stage, "tier": tier, "combo_id": combo.get("id"), "kind": "stage"})
+                for attempt in [*(case.get("failure_attempts") or []), *(case.get("cooldown_skips") or [])]:
+                    stage_name = attempt.get("stage")
+                    model = attempt.get("model")
+                    if not stage_name or not model:
+                        continue
+                    buckets.setdefault((str(stage_name), str(model)), []).append({"case": case, "stage": attempt, "tier": tier, "combo_id": combo.get("id"), "kind": "attempt"})
+                for health in case.get("route_health_snapshot") or []:
+                    stage_name = health.get("stage")
+                    model = health.get("model")
+                    if not stage_name or not model:
+                        continue
+                    if not health.get("cooldown_count") and health.get("status") not in {"cooldown", "unstable"}:
+                        continue
+                    buckets.setdefault((str(stage_name), str(model)), []).append({"case": case, "stage": health, "tier": tier, "combo_id": combo.get("id"), "kind": "health"})
     routes = []
     for (stage, model), records in sorted(buckets.items()):
         routes.append(_model_health_route(stage, model, records))
@@ -563,21 +778,24 @@ def _model_health_scorecard(out_dir: Path, combo_reports: list[dict[str, Any]]) 
 
 def _model_health_route(stage: str, model: str, records: list[dict[str, Any]]) -> dict[str, Any]:
     case_count = len(records)
-    success_count = sum(1 for record in records if record["case"].get("status") == STATUS_PASS)
+    success_count = sum(1 for record in records if record["stage"].get("status") == STATUS_PASS or (record["kind"] == "stage" and record["case"].get("status") == STATUS_PASS))
     quality_blocker_count = sum(len(record["case"].get("quality_blockers") or []) for record in records)
     static_validation_fail_count = sum(1 for record in records if record["case"].get("validation_status") not in {None, STATUS_PASS, "manual_required"})
     schema_fail_count = sum(1 for record in records if record["case"].get("failure_class") == FAILURE_SCHEMA_INVALID)
-    timeout_stall_count = sum(1 for record in records if record["case"].get("failure_class") == FAILURE_PROVIDER_TIMEOUT or _case_is_stalled(record["case"]))
+    timeout_stall_count = sum(1 for record in records if record["case"].get("failure_class") == FAILURE_PROVIDER_TIMEOUT or record["stage"].get("failure_class") == FAILURE_PROVIDER_TIMEOUT or _case_is_stalled(record["case"]))
+    cooldown_count = sum(int(record["stage"].get("cooldown_count") or 0) for record in records if record["kind"] == "health") + sum(1 for record in records if record["stage"].get("skip_reason") == "route_cooldown")
+    consecutive_failure_max = max([int(record["stage"].get("consecutive_failure_max") or record["stage"].get("consecutive_failure_count") or 0) for record in records] or [0])
     latency_values = [float(record["stage"].get("latency_ms")) for record in records if isinstance(record["stage"].get("latency_ms"), int | float)]
     repair_counts = [int(record["case"].get("repair_count") or 0) for record in records]
     total_usage = _sum_case_usage([record["case"] for record in records])
     success_rate = success_count / case_count if case_count else 0.0
     quality_blocker_rate = quality_blocker_count / case_count if case_count else 0.0
-    status = _model_health_status(success_rate, quality_blocker_rate, timeout_stall_count, latency_values)
+    status = _model_health_status(success_rate, quality_blocker_rate, timeout_stall_count, latency_values, cooldown_count=cooldown_count)
     return {
         "stage": stage,
         "model": model,
         "status": status,
+        "route_status": status,
         "case_count": case_count,
         "success_rate": success_rate,
         "quality_blocker_rate": quality_blocker_rate,
@@ -585,6 +803,9 @@ def _model_health_route(stage: str, model: str, records: list[dict[str, Any]]) -
         "static_validation_fail_rate": static_validation_fail_count / case_count if case_count else 0.0,
         "schema_fail_rate": schema_fail_count / case_count if case_count else 0.0,
         "timeout_stall_count": timeout_stall_count,
+        "timeout_rate": timeout_stall_count / case_count if case_count else 0.0,
+        "cooldown_count": cooldown_count,
+        "consecutive_failure_max": consecutive_failure_max,
         "latency_ms": {
             "p50": _percentile(latency_values, 0.50) if latency_values else None,
             "p95": _percentile(latency_values, 0.95) if latency_values else None,
@@ -596,9 +817,9 @@ def _model_health_route(stage: str, model: str, records: list[dict[str, Any]]) -
     }
 
 
-def _model_health_status(success_rate: float, quality_blocker_rate: float, timeout_stall_count: int, latency_values: list[float]) -> str:
+def _model_health_status(success_rate: float, quality_blocker_rate: float, timeout_stall_count: int, latency_values: list[float], *, cooldown_count: int = 0) -> str:
     p95_latency = _percentile(latency_values, 0.95) if latency_values else None
-    if timeout_stall_count or success_rate < 0.8 or quality_blocker_rate > 0.2:
+    if cooldown_count or timeout_stall_count or success_rate < 0.8 or quality_blocker_rate > 0.2:
         return "unstable"
     if success_rate < 1.0 or quality_blocker_rate > 0 or (p95_latency is not None and p95_latency > 60_000):
         return "degraded"
@@ -692,6 +913,24 @@ def _recommended_combo_id(combo_reports: list[dict[str, Any]]) -> str | None:
             float(summary.get("avg_repair_count", 99.0)),
             -float(summary.get("static_validation_pass_rate", 0.0)),
             combo["id"],
+        )
+
+    return sorted(accepted, key=sort_key)[0]["id"]
+
+
+def _recommended_tier_id(tier_reports: list[dict[str, Any]]) -> str | None:
+    accepted = [tier for tier in tier_reports if tier.get("accepted")]
+    if not accepted:
+        return None
+    preference = {USER_TIER_FREE: 0, DEFAULT_USER_TIER: 1, "paid_medium": 2, "paid_high": 3}
+
+    def sort_key(tier: dict[str, Any]) -> tuple[float, float, float, int]:
+        summary = tier.get("full") or tier.get("smoke") or {}
+        return (
+            -float(summary.get("pass_rate", 0.0)),
+            float(summary.get("avg_repair_count", 99.0)),
+            -float(summary.get("static_validation_pass_rate", 0.0)),
+            preference.get(str(tier["id"]), 99),
         )
 
     return sorted(accepted, key=sort_key)[0]["id"]

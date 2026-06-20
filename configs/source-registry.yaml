@@ -47,9 +47,78 @@ sources:
     trust_level: high
     path: docs/trading/risk-policy.md
     freshness_ttl_days: 90
+    domain_tags: [risk, safety_boundary]
+    market_tags: [general]
+    platform_tags: [general]
   - id: internal-anti-overfit-checklist
     platform: general
     type: internal
     trust_level: high
     path: docs/trading/anti-overfit-checklist.md
     freshness_ttl_days: 90
+    domain_tags: [risk, anti_overfit, validation]
+    market_tags: [general]
+    platform_tags: [general]
+  - id: internal-crypto-playbook
+    platform: general
+    type: internal
+    knowledge_type: semantic
+    trust_level: high
+    path: docs/trading/strategy-playbooks/crypto-playbook.md
+    freshness_ttl_days: 90
+    domain_tags: [strategy_design, market_regime, liquidity, risk]
+    market_tags: [crypto]
+    platform_tags: [general, pine_v6, mql5]
+    stages: [strategy_reasoning, balanced_review, repair]
+  - id: internal-forex-playbook
+    platform: general
+    type: internal
+    knowledge_type: semantic
+    trust_level: high
+    path: docs/trading/strategy-playbooks/forex-playbook.md
+    freshness_ttl_days: 90
+    domain_tags: [strategy_design, market_regime, session, risk]
+    market_tags: [forex]
+    platform_tags: [general, pine_v6, mql5]
+    stages: [strategy_reasoning, balanced_review, repair]
+  - id: internal-strategy-patterns
+    platform: general
+    type: internal
+    knowledge_type: strategy_pattern
+    trust_level: high
+    path: docs/trading/strategy-playbooks/strategy-patterns.md
+    freshness_ttl_days: 90
+    domain_tags: [strategy_design, risk, anti_overfit, price_action]
+    market_tags: [general, crypto, forex]
+    platform_tags: [general, pine_v6, mql5]
+    stages: [strategy_reasoning, strategy_coding, balanced_review, repair]
+  - id: babypips-school-of-pipsology
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://www.babypips.com/learn/forex
+    freshness_ttl_days: 60
+    domain_tags: [education, forex, risk]
+    market_tags: [forex]
+    platform_tags: [general]
+    notes: External reference only; ingest through snapshot/proposal review before becoming curated content.
+  - id: binance-academy-risk-management-strategies
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://www.binance.com/en/academy/articles/five-risk-management-strategies
+    freshness_ttl_days: 60
+    domain_tags: [education, crypto, risk]
+    market_tags: [crypto]
+    platform_tags: [general]
+    notes: External reference only; ingest through snapshot/proposal review before becoming curated content.
+  - id: binance-academy-beginner-risk-management
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://www.binance.com/en/academy/articles/a-beginners-guide-to-understanding-risk-management
+    freshness_ttl_days: 60
+    domain_tags: [education, crypto, risk]
+    market_tags: [crypto]
+    platform_tags: [general]
+    notes: External reference only; ingest through snapshot/proposal review before becoming curated content.

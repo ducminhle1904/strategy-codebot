@@ -5,8 +5,9 @@ import contextlib
 import io
 import inspect
 import json
+import logging
 import os
-import re
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,8 +23,12 @@ from strategy_codebot.live import (
     STAGE_STRATEGY_REASONING,
     LiveRunOptions,
     _models_for_stage,
+    _provider_route,
 )
 from strategy_codebot.paths import repo_root, resolve_repo_path
+from strategy_codebot.policy_engine import EVIDENCE_GENERATED_ARTIFACT
+from strategy_codebot.policy_engine import PolicySubject as EnginePolicySubject
+from strategy_codebot.policy_engine import evaluate_policy as evaluate_engine_policy
 from strategy_codebot.schemas import load_json, validate_payload, write_json
 from strategy_codebot.tool_runtime import POLICY_MODES, POLICY_OBSERVE, ToolHarness, call_tool
 
@@ -33,6 +38,7 @@ REVIEW_MODE_NONE = "none"
 REVIEW_MODE_PARALLEL = "parallel"
 REVIEW_REPORT_PATH = "review-report.json"
 REVIEW_RUNTIME_TRACE_PATH = "review-runtime-trace.jsonl"
+_PROVIDER_OUTPUT_CAPTURE_LOCK = threading.Lock()
 REVIEW_RUNTIME_SUMMARY_PATH = "review-runtime-summary.json"
 REVIEW_STATUSES = {"pass", "fail", "manual_required", "skipped", "error"}
 FINDING_SEVERITIES = {"info", "warning", "blocker"}
@@ -474,14 +480,11 @@ def _review_pine(context: ReviewContext) -> dict[str, Any]:
 
 
 def _review_risk(context: ReviewContext) -> dict[str, Any]:
-    text = " ".join(
-        [
-            json.dumps(context.spec, ensure_ascii=False).lower(),
-            (context.pine_code or "").lower(),
-            (context.mql5_runner_design or "").lower(),
-        ]
-    )
-    blockers = _blocked_risk_claims(text)
+    blockers = [
+        * _blocked_risk_claims(context.spec),
+        * _blocked_risk_claims(context.pine_code or ""),
+        * _blocked_risk_claims(context.mql5_runner_design or ""),
+    ]
     findings = []
     if blockers:
         findings.append(
@@ -575,24 +578,50 @@ def _run_live_reviewer(role: str, context: ReviewContext) -> dict[str, Any]:
         "temperature": context.model_registry.get("defaults", {}).get("temperature", 0.2),
         "response_format": _reviewer_response_format(),
     }
-    if model.startswith("openrouter/") and os.getenv("OPENROUTER_API_BASE"):
-        kwargs["base_url"] = os.getenv("OPENROUTER_API_BASE")
-    stdout_buffer = io.StringIO()
-    stderr_buffer = io.StringIO()
-    with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
-        response = litellm.completion(**kwargs)
+    route = _provider_route(model)
+    kwargs["model"] = route.route_model
+    kwargs.update(route.completion_kwargs())
+    with _PROVIDER_OUTPUT_CAPTURE_LOCK:
+        stdout_buffer = io.StringIO()
+        stderr_buffer = io.StringIO()
+        log_buffer = io.StringIO()
+        with _capture_provider_loggers(log_buffer), contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+            response = litellm.completion(**kwargs)
     payload = json.loads(response.choices[0].message.content)
-    provider_warnings = _captured_provider_warnings(stdout_buffer.getvalue(), stderr_buffer.getvalue())
+    provider_warnings = _captured_provider_warnings(stdout_buffer.getvalue(), stderr_buffer.getvalue(), log_buffer.getvalue())
     if provider_warnings:
         payload["provider_warnings"] = provider_warnings
-    payload["provider"] = model.split("/", 1)[0] if "/" in model else "litellm"
+    payload["provider"] = route.provider
+    payload["gateway"] = route.gateway
+    payload["route_model"] = route.route_model
     payload["model"] = model
     return payload
 
 
-def _captured_provider_warnings(stdout_text: str, stderr_text: str) -> list[str]:
+@contextlib.contextmanager
+def _capture_provider_loggers(log_buffer: io.StringIO) -> Any:
+    handler = logging.StreamHandler(log_buffer)
+    handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    loggers = [logging.getLogger(), logging.getLogger("litellm"), logging.getLogger("LiteLLM")]
+    saved = [(logger, logger.level, logger.propagate, list(logger.handlers), logger.disabled) for logger in loggers]
+    try:
+        for logger in loggers:
+            logger.handlers = [handler]
+            logger.propagate = False
+            logger.disabled = False
+            logger.setLevel(logging.WARNING)
+        yield
+    finally:
+        for logger, level, propagate, handlers, disabled in saved:
+            logger.handlers = handlers
+            logger.propagate = propagate
+            logger.disabled = disabled
+            logger.setLevel(level)
+
+
+def _captured_provider_warnings(stdout_text: str, stderr_text: str, log_text: str = "") -> list[str]:
     warnings = []
-    for label, text in (("stdout", stdout_text), ("stderr", stderr_text)):
+    for label, text in (("stdout", stdout_text), ("stderr", stderr_text), ("log", log_text)):
         normalized = text.strip()
         if normalized:
             warnings.append(f"provider {label}: {normalized}")
@@ -608,6 +637,8 @@ def _review_model(role: str, context: ReviewContext) -> str:
             stage,
             model_stage_overrides=options.model_stage_overrides,
             cost_profile=options.cost_profile,
+            user_tier=options.user_tier,
+            use_tier_routing=options.use_tier_routing,
         )[0]
     agent_config = context.model_registry["agents"][role]
     return agent_config["primary"]
@@ -759,17 +790,14 @@ def _decision_as_validation_status(decision: str) -> str:
     }[decision]
 
 
-def _blocked_risk_claims(text: str) -> list[str]:
-    blocked_terms = ("guarantee profit", "guarantee returns", "guarantees profit", "guarantees returns", "guaranteed profit", "guaranteed returns", "risk-free", "cannot lose money", "live ready", "live-ready", "live immediately", "broker deployment", "broker integration", "autonomous live")
-    blockers: list[str] = []
-    for term in blocked_terms:
-        for match in re.finditer(re.escape(term), text):
-            prefix = text[max(0, match.start() - 32) : match.start()]
-            if any(marker in prefix for marker in ("no ", "without ", "before any ", "do not ", "not ")):
-                continue
-            blockers.append(term)
-            break
-    return blockers
+def _blocked_risk_claims(payload: Any) -> list[str]:
+    return [
+        finding.matched_text
+        for finding in evaluate_engine_policy(
+            EnginePolicySubject(surface="review.risk", payload=payload, evidence_level=EVIDENCE_GENERATED_ARTIFACT)
+        ).findings
+        if finding.severity == "blocker"
+    ]
 
 
 def _read_optional_text(path: Path) -> str | None:

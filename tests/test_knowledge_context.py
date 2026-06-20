@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from strategy_codebot.knowledge_context import build_knowledge_context, compact_knowledge_context
+from strategy_codebot.knowledge_context import knowledge_metadata
+from strategy_codebot.knowledge_base import build_knowledge_index
 from strategy_codebot.live import _messages
 
 
@@ -19,6 +21,26 @@ def test_knowledge_context_selects_pine_risk_and_external_refs() -> None:
     assert context["stage_relevance"]["pine_code_generation"] == ["pine_v6_rules"]
 
 
+def test_knowledge_context_auto_degrades_to_static_context_when_database_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("strategy_codebot.knowledge_context.ensure_database_url", lambda: "postgresql://localhost/unavailable")
+
+    def unavailable(*args, **kwargs):
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr("strategy_codebot.knowledge_context.build_retrieved_knowledge_context", unavailable)
+
+    context = build_knowledge_context("Create a Pine v6 strategy with stop loss")
+    metadata = knowledge_metadata(context)
+
+    assert context["knowledge_context_status"] == "degraded"
+    assert context["knowledge_health_status"] == "degraded"
+    assert context["failure_class"] == "knowledge_unavailable"
+    assert context["fallback"] == "static_curated_context"
+    assert "pine_v6_rules" in [doc["id"] for doc in context["internal_docs"]]
+    assert metadata["knowledge_context_status"] == "degraded"
+    assert metadata["knowledge_failure_class"] == "knowledge_unavailable"
+
+
 def test_knowledge_context_selects_mql5_for_both_platform_prompt() -> None:
     context = build_knowledge_context("Create both-platform Pine and MQL5 strategy artifacts")
 
@@ -30,12 +52,112 @@ def test_knowledge_context_selects_mql5_for_both_platform_prompt() -> None:
     assert "mql5-reference" in source_ids
 
 
+def test_knowledge_context_selects_crypto_playbook_and_trusted_refs() -> None:
+    context = build_knowledge_context("Create a crypto BTC perpetual breakout strategy with funding risk")
+
+    doc_ids = [doc["id"] for doc in context["internal_docs"]]
+    source_ids = [source["id"] for source in context["external_refs"]]
+
+    assert "crypto_playbook" in doc_ids
+    assert "strategy_patterns" in doc_ids
+    assert "binance-academy-risk-management-strategies" in source_ids
+    assert "babypips-school-of-pipsology" not in source_ids
+    assert context["selection_reasons"]["crypto_context"] is True
+    assert all("excerpt" not in source for source in context["external_refs"])
+
+
+def test_knowledge_context_selects_forex_playbook_and_trusted_refs() -> None:
+    context = build_knowledge_context("Create a forex EURUSD London session mean reversion strategy with spread controls")
+
+    doc_ids = [doc["id"] for doc in context["internal_docs"]]
+    source_ids = [source["id"] for source in context["external_refs"]]
+
+    assert "forex_playbook" in doc_ids
+    assert "strategy_patterns" in doc_ids
+    assert "babypips-school-of-pipsology" in source_ids
+    assert "binance-academy-risk-management-strategies" not in source_ids
+    assert context["selection_reasons"]["forex_context"] is True
+    assert all("excerpt" not in source for source in context["external_refs"])
+
+
+def test_generation_context_does_not_fetch_trusted_public_refs(monkeypatch) -> None:
+    def fail_fetch(url: str) -> str:
+        raise AssertionError(f"unexpected fetch during generation context: {url}")
+
+    monkeypatch.setattr("strategy_codebot.knowledge_base._fetch_url_text", fail_fetch)
+
+    context = build_knowledge_context("Create a crypto BTC strategy with Binance risk context")
+
+    assert "binance-academy-risk-management-strategies" in [source["id"] for source in context["external_refs"]]
+    assert all("excerpt" not in source for source in context["external_refs"])
+
+
 def test_knowledge_context_is_deterministically_truncated(tmp_path: Path) -> None:
     context = build_knowledge_context("Create a Pine v6 indicator")
     compact = compact_knowledge_context(context)
 
     assert compact["context_refs"] == context["context_refs"]
     assert all(len(doc["excerpt"]) <= 1800 for doc in context["internal_docs"])
+
+
+def test_knowledge_context_uses_kb_index_when_available(monkeypatch, tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    build_knowledge_index(index_path=index_path)
+    monkeypatch.setenv("STRATEGY_CODEBOT_KNOWLEDGE_INDEX", str(index_path))
+
+    context = build_knowledge_context("Create a price action strategy with break of structure and liquidity sweep")
+    compact = compact_knowledge_context(context)
+
+    assert context["store"] == "knowledge_base"
+    assert context["retrieved_chunks"]
+    assert any("break of structure" in chunk["text"].lower() for chunk in context["retrieved_chunks"])
+    assert compact["retrieved_chunks"][0]["chunk_id"]
+    assert context["citations"]
+    assert compact["citations"][0]["chunk_id"]
+    assert context["retrieval_confidence"]["score"] >= 0
+    assert "low_confidence" in compact
+
+
+def test_knowledge_context_uses_database_url_when_index_file_is_absent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_KNOWLEDGE_DATABASE_URL", "postgresql://kb_user:secret@localhost/strategy")
+    monkeypatch.setenv("STRATEGY_CODEBOT_KNOWLEDGE_INDEX", str(tmp_path / "missing.json"))
+
+    def fake_search_db(query, database_url, *, stage, options, started):
+        return {
+            "status": "pass",
+            "index_ref": "postgres:postgresql://kb_user:***@localhost/strategy",
+            "index_id": "kb-postgres",
+            "knowledge_version": 1,
+            "retrieval_query": query,
+            "intent": {"tags": ["price_action"], "target": "pine"},
+            "expanded_terms": ["BOS"],
+            "embedding_model": "text-embedding-3-small",
+            "retrieval_latency_ms": 3,
+            "hybrid_candidate_count": 1,
+            "rerank_latency_ms": 0,
+            "cache_hit": False,
+            "retrieved_chunks": [
+                {
+                    "chunk_id": "pattern-price-action-bos-retest#1",
+                    "item_id": "pattern-price-action-bos-retest",
+                    "source_id": "pattern-price-action-bos-retest",
+                    "type": "strategy_pattern",
+                    "title": "BOS retest",
+                    "text": "Break of structure retest context.",
+                    "stages": ["strategy_reasoning"],
+                }
+            ],
+            "source_ids": ["pattern-price-action-bos-retest"],
+            "metrics": {"chunk_hit_rate": 1.0, "source_coverage": 1},
+        }
+
+    monkeypatch.setattr("strategy_codebot.knowledge_base._search_db_knowledge", fake_search_db)
+
+    context = build_knowledge_context("Use break of structure and retest")
+
+    assert context["store"] == "knowledge_base"
+    assert context["index_ref"].startswith("postgres:")
+    assert context["retrieved_chunks"][0]["chunk_id"] == "pattern-price-action-bos-retest#1"
 
 
 def test_single_workflow_prompt_shape_preserved_when_knowledge_off() -> None:

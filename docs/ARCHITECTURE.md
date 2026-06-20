@@ -92,6 +92,44 @@ flowchart TD
 
 Phase 5 hardens the CLI for source installs, repeatable checks, and GitHub artifact builds. It does not add API, web UI, PyPI publishing, or trading execution capability.
 
+## API Initiative Phase 0
+
+The API initiative is a future SaaS product surface, not current Phase 5
+runtime behavior. The CLI remains the current production surface until a future
+API phase is implemented and verified.
+
+```mermaid
+flowchart TD
+  UI["Chat trading UI"] --> API["/v1 API server"]
+  API --> G["Auth, tenant, policy, and budget gates"]
+  G --> R["Runner, review, and validation services"]
+  R --> A["Artifacts and typed run events"]
+  A --> T["Repository and API trace evidence"]
+```
+
+The API server is planned as a domain workflow server, not a generic LLM proxy.
+It must preserve the existing safety boundary while adding SaaS-ready
+conversation, run, artifact, feedback, and streaming-event interfaces. Public
+resources use opaque IDs and are designed around user plus workspace
+authorization from day one.
+
+The first streaming transport is Server-Sent Events for chat and run progress.
+WebSocket support is deferred until a future UI requires bidirectional realtime
+interaction.
+
+## Backtest Preview Worker Boundary
+
+Backtest Kit integration uses a separate Node/TypeScript worker. The Python API
+creates queued `backtest-preview` runs and persists `run_jobs`; workers lease
+jobs from Postgres, write artifacts under the shared artifact root, and append
+typed run events. The API process does not execute Backtest Kit directly.
+
+Backtest preview reports are local preview evidence only. They are not
+TradingView proof, MQL5 proof, live-trading evidence, broker execution evidence,
+or profitability claims. Allowed worker runtime is limited to Backtest Kit local
+preview execution and read-only market data adapters; live, paper, broker,
+Telegram, and Docker live surfaces remain blocked.
+
 ## Platform Boundary
 
 Pine Script and MQL5 are not interchangeable:

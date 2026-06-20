@@ -65,6 +65,14 @@
       "type": "array",
       "items": { "type": "string" },
       "default": []
+    },
+    "harness_recording_status": {
+      "type": "string",
+      "enum": ["recorded", "skipped_unavailable", "skipped_requested"],
+      "default": "skipped_requested"
+    },
+    "harness_recording_reason": {
+      "type": "string"
     }
   }
 }
