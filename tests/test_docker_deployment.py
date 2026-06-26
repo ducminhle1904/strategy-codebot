@@ -1,9 +1,42 @@
 from pathlib import Path
+import json
+import subprocess
 
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def backtest_ohlcv_contract() -> dict[str, object]:
+    return json.loads((ROOT / "contracts" / "backtest-ohlcv.json").read_text(encoding="utf-8"))
+
+
+def exchange_env_default() -> str:
+    contract = backtest_ohlcv_contract()
+    return ",".join(contract["allowed_exchanges"])
+
+
+def test_backtest_ohlcv_contract_generated_files_are_current() -> None:
+    result = subprocess.run(
+        ["python", "scripts/sync-backtest-contracts.py", "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_backtest_contract_covers_runtime_vocab_and_bounds() -> None:
+    contract = backtest_ohlcv_contract()
+
+    assert contract["executable_timeframes"] == ["1m", "3m", "5m", "15m", "30m", "1h"]
+    assert contract["max_cost_bps"] == 1000
+    assert contract["run_events"]["dataFetching"] == "backtest.data.fetching"
+    assert contract["run_events"]["reportCompleted"] == "backtest.report.completed"
+    assert len(set(contract["run_events"].values())) == len(contract["run_events"])
 
 
 def test_dockerfile_uses_production_runtime_practices() -> None:
@@ -22,7 +55,7 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     compose = yaml.safe_load((ROOT / "compose.yml").read_text(encoding="utf-8"))
     services = compose["services"]
 
-    assert {"api", "migration", "knowledge-init", "postgres", "redis", "litellm-proxy"} <= set(services)
+    assert {"api", "migration", "knowledge-init", "postgres", "redis", "litellm-proxy", "pineforge-runner"} <= set(services)
     assert services["postgres"]["image"] == "pgvector/pgvector:pg17"
     assert "ports" not in services["postgres"]
     assert "ports" not in services["redis"]
@@ -34,11 +67,34 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     assert services["api"]["depends_on"]["migration"]["condition"] == "service_completed_successfully"
     assert "knowledge-init" not in services["api"]["depends_on"]
     assert services["api"]["depends_on"]["redis"]["condition"] == "service_healthy"
-    assert services["api"]["depends_on"]["litellm-proxy"]["condition"] == "service_healthy"
+    assert "litellm-proxy" not in services["api"]["depends_on"]
     assert services["litellm-proxy"]["image"] == "docker.litellm.ai/berriai/litellm:main-latest"
     assert services["litellm-proxy"]["command"] == ["--config", "/app/config.yaml", "--port", "4000"]
     assert "./docker/litellm/config.yaml:/app/config.yaml:ro" in services["litellm-proxy"]["volumes"]
     assert services["migration"]["command"] == ["strategy-codebot-migrate"]
+    assert services["pineforge-runner"]["build"]["context"] == "./workers/pineforge-runner"
+    assert services["pineforge-runner"]["build"]["args"]["PINEFORGE_ENGINE_REF"] == "${PINEFORGE_ENGINE_REF:-v0.10.10}"
+    assert services["pineforge-runner"]["build"]["args"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.7.5}"
+    assert services["pineforge-runner"]["environment"]["PINEFORGE_RUNNER_MODE"] == "${PINEFORGE_RUNNER_MODE:-native}"
+    assert "PINEFORGE_NATIVE_COMMAND" not in services["pineforge-runner"]["environment"]
+    assert "PINEFORGE_NATIVE_ARGS" not in services["pineforge-runner"]["environment"]
+    assert services["pineforge-runner"]["environment"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.7.5}"
+    assert services["backtest-worker"]["depends_on"]["pineforge-runner"]["condition"] == "service_healthy"
+    assert services["backtest-worker"]["environment"]["BACKTEST_PINEFORGE_RUNNER_URL"] == "${BACKTEST_PINEFORGE_RUNNER_URL:-http://pineforge-runner:8080}"
+    assert services["backtest-worker"]["environment"]["BACKTEST_WORKER_ALLOWED_EXCHANGES"] == f"${{BACKTEST_WORKER_ALLOWED_EXCHANGES:-{exchange_env_default()}}}"
+    assert services["backtest-worker"]["environment"]["BACKTEST_WORKER_DEFAULT_EXCHANGE"] == f"${{BACKTEST_WORKER_DEFAULT_EXCHANGE:-{backtest_ohlcv_contract()['default_exchange']}}}"
+    assert (
+        services["backtest-worker"]["environment"]["BACKTEST_WORKER_DATA_FETCH_THROTTLE_TTL_MS"]
+        == "${BACKTEST_WORKER_DATA_FETCH_THROTTLE_TTL_MS:-900000}"
+    )
+    assert (
+        services["backtest-worker"]["environment"]["BACKTEST_WORKER_DATA_FETCH_THROTTLE_MAX_KEYS"]
+        == "${BACKTEST_WORKER_DATA_FETCH_THROTTLE_MAX_KEYS:-10000}"
+    )
+    assert services["api"]["environment"]["STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED"] == "${STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED:-1}"
+    assert services["chat-worker"]["command"] == ["python", "-m", "strategy_codebot.server.chat_worker"]
+    assert services["chat-worker"]["environment"]["STRATEGY_CODEBOT_CHAT_WORKER_LEASE_SECONDS"] == "${STRATEGY_CODEBOT_CHAT_WORKER_LEASE_SECONDS:-60}"
+    assert services["chat-worker"]["depends_on"]["migration"]["condition"] == "service_completed_successfully"
     assert services["knowledge-init"]["command"] == [
         "sh",
         "-c",
@@ -50,6 +106,14 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     assert compose["x-api-environment"]["REDIS_PASSWORD"] == "${REDIS_PASSWORD:?REDIS_PASSWORD is required}"
     assert compose["x-api-environment"]["LITELLM_PROXY_API_BASE"] == "${LITELLM_PROXY_API_BASE:-http://litellm-proxy:4000/v1}"
     assert compose["x-api-environment"]["LITELLM_PROXY_API_KEY"] == "${LITELLM_PROXY_API_KEY:-${LITELLM_MASTER_KEY:-}}"
+    assert compose["x-api-environment"]["STRATEGY_CODEBOT_LLM_PROVIDER"] == "${STRATEGY_CODEBOT_LLM_PROVIDER:-}"
+    assert compose["x-api-environment"]["STRATEGY_CODEBOT_LLM_MODEL"] == "${STRATEGY_CODEBOT_LLM_MODEL:-}"
+    assert compose["x-api-environment"]["STRATEGY_CODEBOT_LLM_ROUTING"] == "${STRATEGY_CODEBOT_LLM_ROUTING:-registry}"
+    assert (
+        compose["x-api-environment"]["STRATEGY_CODEBOT_MODEL_REGISTRY"]
+        == "${STRATEGY_CODEBOT_MODEL_REGISTRY:-configs/model-registry.example.yaml}"
+    )
+    assert compose["x-api-environment"]["STRATEGY_CODEBOT_SERVER_USER_TIER"] == "${STRATEGY_CODEBOT_SERVER_USER_TIER:-paid_low}"
     assert "OPENROUTER_API_KEY" in compose["x-api-environment"]
     assert "LITELLM_PROXY_API_KEY" in compose["x-api-environment"]
     assert "VERCEL_AI_GATEWAY_API_KEY" in compose["x-api-environment"]
@@ -66,6 +130,9 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     assert "FIREWORKS_API_KEY" in compose["x-api-environment"]
     assert "DEEPINFRA_API_KEY" in compose["x-api-environment"]
     assert "secrets" not in compose
+    worker_env = services["backtest-worker"]["environment"]
+    assert worker_env["BACKTEST_WORKER_FETCH_PROGRESS_MIN_PERCENT_STEP"] == "${BACKTEST_WORKER_FETCH_PROGRESS_MIN_PERCENT_STEP:-5}"
+    assert worker_env["BACKTEST_WORKER_FETCH_PROGRESS_MIN_INTERVAL_MS"] == "${BACKTEST_WORKER_FETCH_PROGRESS_MIN_INTERVAL_MS:-5000}"
     assert "secrets" not in services["migration"]
     assert "secrets" not in services["knowledge-init"]
     assert "secrets" not in services["api"]
@@ -86,11 +153,20 @@ def test_e2e_compose_enables_deterministic_real_service_stack() -> None:
     assert compose["name"] == "strategy-codebot-e2e"
     assert compose["services"]["postgres"]["ports"] == ["${STRATEGY_CODEBOT_E2E_POSTGRES_PORT:-55432}:5432"]
     assert compose["services"]["redis"]["ports"] == ["${STRATEGY_CODEBOT_E2E_REDIS_PORT:-56379}:6379"]
-    assert compose["services"]["api"]["environment"]["STRATEGY_CODEBOT_LLM_MODE"] == "fake"
+    assert compose["services"]["api"]["environment"]["STRATEGY_CODEBOT_LLM_MODE"] == "${STRATEGY_CODEBOT_E2E_LLM_MODE:-fake}"
     assert compose["services"]["litellm-proxy"]["image"] == "python:3.13-slim-bookworm"
     worker_env = compose["services"]["backtest-worker"]["environment"]
     assert worker_env["BACKTEST_WORKER_MARKET_DATA_MODE"] == "${BACKTEST_WORKER_MARKET_DATA_MODE:-fixture}"
+    assert worker_env["BACKTEST_WORKER_ALLOWED_EXCHANGES"] == f"${{BACKTEST_WORKER_ALLOWED_EXCHANGES:-{exchange_env_default()}}}"
+    assert worker_env["BACKTEST_WORKER_DEFAULT_EXCHANGE"] == f"${{BACKTEST_WORKER_DEFAULT_EXCHANGE:-{backtest_ohlcv_contract()['default_exchange']}}}"
+    assert worker_env["BACKTEST_WORKER_FETCH_PROGRESS_MIN_PERCENT_STEP"] == "${BACKTEST_WORKER_FETCH_PROGRESS_MIN_PERCENT_STEP:-5}"
+    assert worker_env["BACKTEST_WORKER_FETCH_PROGRESS_MIN_INTERVAL_MS"] == "${BACKTEST_WORKER_FETCH_PROGRESS_MIN_INTERVAL_MS:-5000}"
+    assert worker_env["BACKTEST_WORKER_DATA_FETCH_THROTTLE_TTL_MS"] == "${BACKTEST_WORKER_DATA_FETCH_THROTTLE_TTL_MS:-900000}"
+    assert worker_env["BACKTEST_WORKER_DATA_FETCH_THROTTLE_MAX_KEYS"] == "${BACKTEST_WORKER_DATA_FETCH_THROTTLE_MAX_KEYS:-10000}"
     assert worker_env["BACKTEST_WORKER_DEFAULT_WORKSPACE_ACTIVE_LIMIT"] == "${BACKTEST_WORKER_DEFAULT_WORKSPACE_ACTIVE_LIMIT:-2}"
+    assert worker_env["BACKTEST_PINEFORGE_RUNNER_URL"] == "http://pineforge-runner:8080"
+    assert compose["services"]["chat-worker"]["environment"]["STRATEGY_CODEBOT_CHAT_WORKER_POLL_INTERVAL_SECONDS"] == "${STRATEGY_CODEBOT_CHAT_WORKER_POLL_INTERVAL_SECONDS:-0.25}"
+    assert compose["services"]["pineforge-runner"]["environment"]["PINEFORGE_RUNNER_MODE"] == "fixture"
 
 
 def test_e2e_runner_collects_evidence_and_runs_real_service_groups() -> None:
@@ -104,6 +180,25 @@ def test_e2e_runner_collects_evidence_and_runs_real_service_groups() -> None:
     assert "reports/e2e" in script
     assert "analysis.md" in script
     assert "npm audit --omit=dev" in script
+
+
+def test_prod_live_backtest_smoke_uses_production_compose_and_real_model_guard() -> None:
+    script = (ROOT / "scripts" / "prod-live-backtest-smoke.sh").read_text(encoding="utf-8")
+
+    assert '-f "$ROOT_DIR/compose.yml"' in script
+    assert "compose.e2e.yml" not in script
+    assert "STRATEGY_CODEBOT_LLM_MODE=fake is not allowed" in script
+    assert "OPENROUTER_API_KEY is required for --provider openrouter" in script
+    assert "VERCEL_AI_GATEWAY_API_KEY is required for --provider vercel-ai-gateway" in script
+    assert "STRATEGY_CODEBOT_LLM_PROVIDER=\"$PROVIDER\"" in script
+    assert "BACKTEST_WORKER_MARKET_DATA_MODE=ccxt" in script
+    assert "--auto-chain" in script
+    assert "STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED=1" in script
+    assert "chat-worker" in script
+    assert "tests/e2e/docker/test_prod_live_backtest_smoke.py::test_prod_live_model_btc_1y_pineforge_backtest_smoke" in script
+    assert "tests/e2e/docker/test_prod_live_backtest_smoke.py::test_prod_live_model_auto_chain_btc_1y_pineforge_backtest_smoke" in script
+    assert "reports/prod-live-smoke" in script
+    assert "pineforge-runner" in script
 
 
 def test_dockerignore_excludes_local_state_and_secrets() -> None:
@@ -145,6 +240,7 @@ def test_litellm_proxy_config_covers_registry_routes() -> None:
         if tier_name != "free"
         for routes in tier["routes_by_stage"].values()
         for route in routes
+        if route.startswith("litellm_proxy/")
     }
     assert set(entries_by_alias) == expected_aliases | diagnostic_aliases
     assert all(len(entries_by_alias[alias]) >= 1 for alias in expected_aliases)
@@ -204,6 +300,7 @@ def test_paid_registry_routes_use_litellm_proxy_aliases_and_free_stays_direct() 
     tiers = registry["model_tiers"]
 
     assert all(not route.startswith("litellm_proxy/") for routes in tiers["free"]["routes_by_stage"].values() for route in routes)
+    assert all(not route.startswith("litellm_proxy/") for routes in tiers["dev"]["routes_by_stage"].values() for route in routes)
     for tier in ("paid_low", "paid_medium", "paid_high"):
         for stage, routes in tiers[tier]["routes_by_stage"].items():
             if tier == "paid_low" and stage == "strategy_reasoning":
@@ -222,10 +319,10 @@ def test_paid_registry_routes_use_litellm_proxy_aliases_and_free_stays_direct() 
                 ]
             elif tier == "paid_low" and stage == "pine_code_generation":
                 assert routes == [
-                    "litellm_proxy/paid_low.pine_code_generation",
                     "litellm_proxy/paid_low.pine_code_generation_qwen",
                     "litellm_proxy/paid_low.pine_code_generation_vercel",
                     "litellm_proxy/paid_medium.pine_code_generation",
+                    "litellm_proxy/paid_low.pine_code_generation",
                 ]
             elif tier == "paid_low" and stage == "balanced_review":
                 assert routes == [
@@ -245,14 +342,11 @@ def test_paid_registry_routes_use_litellm_proxy_aliases_and_free_stays_direct() 
                 assert routes == [f"litellm_proxy/{tier}.{stage}"]
 
 
-def test_env_example_contains_litellm_proxy_runtime_keys() -> None:
-    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+def test_docker_env_example_contains_litellm_proxy_runtime_keys() -> None:
+    env_example = (ROOT / ".env.docker.example").read_text(encoding="utf-8")
 
     assert "LITELLM_MASTER_KEY=sk-litellm-local-dev-change-me" in env_example
     assert "LITELLM_SALT_KEY=change-me-long-random-value" in env_example
     assert "LITELLM_ADMIN_API_BASE=http://127.0.0.1:4000" in env_example
     assert "LITELLM_PROXY_API_KEY=sk-litellm-local-dev-change-me" in env_example
     assert "LITELLM_PROXY_API_BASE=http://litellm-proxy:4000/v1" in env_example
-    assert "LITELLM_BUDGET_PAID_LOW_DAILY_USD=2" in env_example
-    assert "LITELLM_BUDGET_PAID_MEDIUM_DAILY_USD=10" in env_example
-    assert "LITELLM_BUDGET_PAID_HIGH_DAILY_USD=50" in env_example

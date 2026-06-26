@@ -5,33 +5,13 @@ import {
   ConversationContent,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
-import { CodeBlock } from "@/components/ai-elements/code-block";
-import {
-  Artifact as AiArtifact,
-  ArtifactAction,
-  ArtifactActions,
-  ArtifactContent,
-  ArtifactDescription,
-  ArtifactHeader,
-  ArtifactTitle,
-} from "@/components/ai-elements/artifact";
 import {
   Message,
   MessageAction,
   MessageActions,
   MessageContent,
   MessageMarkdown,
-  MessageResponse,
-  type MessageResponseProps,
 } from "@/components/ai-elements/message";
-import {
-  PromptInput,
-  PromptInputBody,
-  PromptInputFooter,
-  PromptInputProvider,
-  PromptInputTextarea,
-  usePromptInputController,
-} from "@/components/ai-elements/prompt-input";
 import {
   Reasoning,
   ReasoningContent,
@@ -79,46 +59,76 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import {
-  strategyPromptInputShellClassName,
+  StrategyComposer,
   StrategyStartPrompt,
-  strategyPromptTextareaClassName,
 } from "@/components/strategy/start-prompt";
+import {
+  ArtifactPreviewContent,
+  artifactPreviewContent,
+} from "@/components/strategy/artifact-preview-content";
+import { BacktestPreviewHitlCard } from "@/components/strategy/agent-tools/tool-cards";
 import { StatusPill } from "@/components/strategy/status-pill";
 import { BacktestReportCard } from "@/components/strategy/backtest-report-card";
+import { BacktestResultInlineCard } from "@/components/strategy/backtest-result-inline-card";
+import {
+  AUTO_CHAIN_SUMMARY_PENDING_EVENT,
+  AUTO_CHAIN_SUMMARY_TIMEOUT_EVENT,
+  AUTO_CHAIN_TERMINAL_STATUSES,
+  autoChainContinuationFromRunEvents,
+  createAutoChainLocalEvent,
+  hasAutoChainSummaryCompletedEvent,
+  hasAutoChainSummaryMessage,
+  mergeRunEvents,
+  updateAutoChainContinuationFromRunEvent,
+  type AutoChainContinuation,
+} from "@/lib/auto-chain-continuation";
 import {
   BackendClient,
   BackendClientError,
   parseBackendSseEvents,
 } from "@/lib/backend-client";
+import {
+  actionRegistryLookup,
+  actionToolLabel,
+  actionToolPrompt,
+  type ActionRegistryLookup,
+} from "@/lib/action-tool-metadata";
 import { splitCompleteSseFrames } from "@/lib/sse";
 import {
   ARTIFACT_WORKSPACE_TABS,
+  backtestLiveStageLabel,
+  backtestLiveStatusFromRunEvents,
   currentProgressStep,
   getArtifactForGroupedTab,
   getArtifactUserSummary,
+  getBestArtifactForDrawer,
+  getDefaultArtifactTab,
   getUserFacingArtifacts,
   groupArtifactsByKind,
   mapRunEventsToUserSteps,
   runStatusSummary,
+  type BacktestLiveStatus,
   type ArtifactUserKind,
   type ArtifactWorkspaceTab,
 } from "@/lib/artifact-workspace";
 import {
-  backendMessagesToUiMessages,
+  backendMessagesToStrategyMessages,
   compactActivityTitle,
   getChatSuggestions,
-  getMessageMarketSnapshot,
-  getMessageResponseIntent,
-  getMessageSuggestions,
-  getMessageSources,
   getMessageText,
   hasAssistantText,
   isRenderableMessage,
+  mergeStrategyChatMessageMetadata,
   shouldShowStrategyProfile,
+  type ChatInlineTable,
   type ChatSuggestionItem,
   type ChatMessageSource,
   type MarketSnapshot,
   type ResponseIntent,
+  type StrategyChatMessage,
+  groupArtifactsByAnchorMessage,
+  latestAssistantAfterLastUser,
+  runEventMetadataByAnchorMessage,
 } from "@/lib/chat-ui";
 import {
   accountInitial,
@@ -127,6 +137,8 @@ import {
   formatUsageCost,
   formatUsageNumber,
   providerDisplay,
+  providerFallbackEnabled,
+  providerRouteReady,
 } from "@/lib/account-ui";
 import {
   mapRunEventsToChatActivities,
@@ -136,7 +148,6 @@ import {
   StrategySpecSchema,
   WebSearchModeSchema,
 } from "@/lib/backend-schemas";
-import { parseBacktestArtifactPreview } from "@/lib/backtest-report";
 import {
   getUiCopy,
   languageLabel,
@@ -145,13 +156,21 @@ import {
 } from "@/lib/i18n";
 import { useI18n } from "@/lib/language";
 import { useTheme, type ResolvedTheme, type ThemePreference } from "@/lib/theme";
+import { useStrategyChatRuntime } from "@/lib/use-strategy-chat-runtime";
+import {
+  StrategyAgentContextProvider,
+  useStrategyCopilotCapabilities,
+  type StrategyAgentWorkflow,
+} from "@/lib/copilot-agent-context";
+import { StrategyCopilotTools } from "@/lib/copilot-tools";
 import type {
   AccountUsageResponse,
   Artifact,
-  ArtifactPreviewResponse,
+  ArtifactListResponse,
   Conversation as ChatConversation,
   ConversationSidebarItem,
   MeResponse,
+  Message as BackendMessage,
   ProviderStatusResponse,
   ReadyResponse,
   Run,
@@ -162,10 +181,17 @@ import type {
   WebSearchMode,
 } from "@/lib/backend-schemas";
 import { useStrategyUiStore } from "@/lib/ui-store";
+import {
+  getArtifactPreviewForViewer,
+  useBrowserBackendClient,
+} from "@/lib/use-browser-backend-client";
 import { cn } from "@/lib/utils";
-import { errorMessageFromUnknown, runFailureMessage } from "@/lib/chat-stream";
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useChat } from "@ai-sdk/react";
+import {
+  errorMessageFromUnknown,
+  marketSnapshotFromPayload,
+  runFailureMessage,
+} from "@/lib/chat-stream";
+import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ArrowUp,
@@ -181,7 +207,9 @@ import {
   CreditCard,
   Download,
   ExternalLink,
+  FileStack,
   FileCode2,
+  FileText,
   Gauge,
   Globe2,
   ListChecks,
@@ -204,12 +232,10 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { DefaultChatTransport, type UIMessage } from "ai";
 import { useClerk, useUser } from "@clerk/nextjs";
 import Image from "next/image";
-import type { BundledLanguage } from "shiki";
+import { useRouter } from "next/navigation";
 import {
-  type ComponentProps,
   type ReactNode,
   useCallback,
   useEffect,
@@ -248,8 +274,9 @@ const starterSpec = `{
 }`;
 
 const MAX_PROGRESS_BUFFER_BYTES = 512 * 1024;
-const BROWSER_API_BASE_URL = "/api/backend";
 const WEB_SEARCH_STORAGE_KEY = "strategy-codebot-web-search";
+const NEW_CHAT_PENDING_PROMPT_KEY_PREFIX = "strategy-codebot-new-chat-prompt:";
+const NEW_CHAT_PENDING_PROMPT_TTL_MS = 5 * 60 * 1000;
 const WEB_SEARCH_MODE_NEXT: Record<WebSearchMode, WebSearchMode> = {
   auto: "on",
   off: "auto",
@@ -258,47 +285,12 @@ const WEB_SEARCH_MODE_NEXT: Record<WebSearchMode, WebSearchMode> = {
 
 type AccountDialog = "settings" | "language" | "appearance" | "help";
 type SettingsTab = "general" | "provider" | "usage" | "workspace";
-
-const artifactPreviewMarkdownComponents = {
-  table: ({ className, ...props }: ComponentProps<"table">) => (
-    <div className="w-full overflow-x-auto">
-      <table
-        className={cn("w-full border-collapse text-sm", className)}
-        {...props}
-      />
-    </div>
-  ),
-  th: ({ className, ...props }: ComponentProps<"th">) => (
-    <th
-      className={cn(
-        "bg-muted px-3 py-2 text-left font-semibold text-foreground",
-        className
-      )}
-      {...props}
-    />
-  ),
-  td: ({ className, ...props }: ComponentProps<"td">) => (
-    <td
-      className={cn("border-border border-t px-3 py-2 align-top", className)}
-      {...props}
-    />
-  ),
+type PendingInitialPrompt = {
+  clientRequestId: string;
+  createdAt: number;
+  text: string;
+  webSearch: WebSearchMode;
 };
-type ClerkBrowserWindow = Window & {
-  Clerk?: {
-    session?: {
-      getToken?: () => Promise<string | null>;
-    };
-  };
-};
-
-async function getBrowserClerkToken() {
-  if (typeof window === "undefined") {
-    return null;
-  }
-  const clerk = (window as ClerkBrowserWindow).Clerk;
-  return (await clerk?.session?.getToken?.().catch(() => null)) ?? null;
-}
 
 function readStoredWebSearchMode(): WebSearchMode {
   if (typeof window === "undefined") {
@@ -313,12 +305,68 @@ function readStoredWebSearchMode(): WebSearchMode {
   }
 }
 
-export function StrategyWorkspace() {
+function pendingInitialPromptStorageKey(conversationId: string) {
+  return `${NEW_CHAT_PENDING_PROMPT_KEY_PREFIX}${conversationId}`;
+}
+
+function writePendingInitialPrompt(conversationId: string, prompt: PendingInitialPrompt) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.sessionStorage.setItem(
+      pendingInitialPromptStorageKey(conversationId),
+      JSON.stringify(prompt)
+    );
+  } catch {
+    // Best-effort handoff only. The caller still routes to the conversation.
+  }
+}
+
+function takePendingInitialPrompt(conversationId: string): PendingInitialPrompt | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  const key = pendingInitialPromptStorageKey(conversationId);
+  try {
+    const raw = window.sessionStorage.getItem(key);
+    window.sessionStorage.removeItem(key);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as Partial<PendingInitialPrompt>;
+    if (
+      typeof parsed.text !== "string" ||
+      typeof parsed.clientRequestId !== "string" ||
+      typeof parsed.createdAt !== "number" ||
+      Date.now() - parsed.createdAt > NEW_CHAT_PENDING_PROMPT_TTL_MS
+    ) {
+      return null;
+    }
+    return {
+      clientRequestId: parsed.clientRequestId,
+      createdAt: parsed.createdAt,
+      text: parsed.text,
+      webSearch: WebSearchModeSchema.safeParse(parsed.webSearch).data ?? "auto",
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function StrategyWorkspace({
+  initialConversationId = null,
+}: {
+  initialConversationId?: string | null;
+}) {
+  const router = useRouter();
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { language, setLanguage } = useI18n();
   const { resolvedTheme, setTheme, theme } = useTheme();
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(
+    initialConversationId
+  );
   const [runMode, setRunMode] = useState<RunMode>("dry-run");
   const [specDraft, setSpecDraft] = useState(starterSpec);
   const [specDialogOpen, setSpecDialogOpen] = useState(false);
@@ -326,6 +374,8 @@ export function StrategyWorkspace() {
   const [renameTitle, setRenameTitle] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<ChatConversation | null>(null);
   const [runEvents, setRunEvents] = useState<RunEvent[]>([]);
+  const [autoChainContinuation, setAutoChainContinuation] =
+    useState<AutoChainContinuation | null>(null);
   const [inlineError, setInlineError] = useState<string | null>(null);
   const [accountDialog, setAccountDialog] = useState<AccountDialog | null>(null);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
@@ -334,55 +384,47 @@ export function StrategyWorkspace() {
     readStoredWebSearchMode()
   );
   const progressAbortRef = useRef<AbortController | null>(null);
+  const autoChainAbortRef = useRef<AbortController | null>(null);
   const stopChatRef = useRef<(() => void) | null>(null);
-  const lastOpenedWorkspaceRef = useRef<string | null>(null);
   const lastHydratedMessagesKeyRef = useRef<string | null>(null);
   const sendingConversationIdRef = useRef<string | null>(null);
   const promptSubmitPendingRef = useRef(false);
+  const consumedPendingInitialPromptRef = useRef<string | null>(null);
+  const setMessagesFromConversationStateRef = useRef<
+    ((messages: StrategyChatMessage[]) => void) | null
+  >(null);
   const [promptSubmitPending, setPromptSubmitPending] = useState(false);
   const [pendingPromptText, setPendingPromptText] = useState<string | null>(null);
   const {
     artifactPanelOpen,
     setArtifactPanelOpen,
+    selectedArtifactId,
+    setSelectedArtifactId,
   } = useStrategyUiStore();
+  const copilotCapabilities = useStrategyCopilotCapabilities();
 
-  const authenticatedFetch = useCallback<typeof fetch>(
-    async (input, init) => {
-      const headers = new Headers(init?.headers);
-      const token = await getBrowserClerkToken();
-      if (token) {
-        headers.set("Authorization", `Bearer ${token}`);
-      }
-      return fetch(input, {
-        ...init,
-        credentials: init?.credentials ?? "same-origin",
-        headers,
-      });
-    },
-    []
-  );
-
-  const client = useMemo(
-    () =>
-      new BackendClient({
-        baseUrl: BROWSER_API_BASE_URL,
-        fetcher: authenticatedFetch,
-      }),
-    [authenticatedFetch]
-  );
+  const client = useBrowserBackendClient();
 
   const stopRunProgress = useCallback(() => {
     progressAbortRef.current?.abort();
     progressAbortRef.current = null;
   }, []);
 
+  const stopAutoChainContinuation = useCallback(() => {
+    autoChainAbortRef.current?.abort();
+    autoChainAbortRef.current = null;
+    setAutoChainContinuation(null);
+  }, []);
+
   const handleSelectConversation = useCallback(
     (conversationId: string) => {
       stopRunProgress();
+      stopAutoChainContinuation();
       setRunEvents([]);
       setSelectedConversationId(conversationId);
+      router.push(`/c/${encodeURIComponent(conversationId)}`);
     },
-    [stopRunProgress]
+    [router, stopAutoChainContinuation, stopRunProgress]
   );
 
   const readiness = useQuery({
@@ -402,6 +444,15 @@ export function StrategyWorkspace() {
     queryKey: ["provider-status"],
     refetchInterval: 30000,
   });
+  const actionRegistry = useQuery({
+    queryFn: () => client.getActionRegistry(),
+    queryKey: ["action-registry"],
+    staleTime: 300000,
+  });
+  const actionRegistryByToolId = useMemo(
+    () => actionRegistryLookup(actionRegistry.data?.actions),
+    [actionRegistry.data?.actions]
+  );
   const accountUsage = useQuery({
     enabled: accountDialog === "settings",
     queryFn: () => client.getAccountUsage(),
@@ -457,7 +508,16 @@ export function StrategyWorkspace() {
 
   const state = useQuery({
     enabled: Boolean(activeConversationId),
-    queryFn: () => client.getConversationState(activeConversationId ?? ""),
+    queryFn: async () => {
+      try {
+        return await client.getConversationState(activeConversationId ?? "");
+      } catch (error) {
+        if (isConversationNotFoundError(error)) {
+          return null;
+        }
+        throw error;
+      }
+    },
     queryKey: ["conversation-state", activeConversationId],
   });
 
@@ -508,8 +568,14 @@ export function StrategyWorkspace() {
         )?.conversation;
         stopChatRef.current?.();
         stopRunProgress();
+        stopAutoChainContinuation();
         setRunEvents([]);
         setSelectedConversationId(nextConversation?.id ?? null);
+        if (nextConversation?.id) {
+          router.replace(`/c/${encodeURIComponent(nextConversation.id)}`);
+        } else {
+          router.replace("/");
+        }
       }
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["conversation-state"] }),
@@ -536,7 +602,8 @@ export function StrategyWorkspace() {
     onSuccess: async (run) => {
       setInlineError(null);
       setSpecDialogOpen(false);
-      setArtifactPanelOpen(true);
+      setArtifactPanelOpen(false);
+      stopAutoChainContinuation();
       setRunEvents([]);
       progressAbortRef.current?.abort();
       const progressAbort = new AbortController();
@@ -573,37 +640,15 @@ export function StrategyWorkspace() {
   const chatMessages = useMemo(
     () =>
       stateBelongsToActiveConversation
-        ? backendMessagesToUiMessages(state.data?.messages ?? [])
+        ? backendMessagesToStrategyMessages(state.data?.messages ?? [])
         : [],
     [state.data?.messages, stateBelongsToActiveConversation]
   );
 
-  const chatTransport = useMemo(
-    () =>
-      new DefaultChatTransport({
-        api: "/api/chat",
-        credentials: "same-origin",
-        fetch: authenticatedFetch,
-        prepareSendMessagesRequest: ({ body, messages }) => ({
-          body: {
-            ...body,
-            conversationId:
-              typeof body?.conversationId === "string"
-                ? body.conversationId
-                : activeConversationId,
-            language,
-            messages,
-            mode: "agent",
-            webSearch: webSearchMode,
-          },
-        }),
-      }),
-    [activeConversationId, authenticatedFetch, language, webSearchMode]
-  );
-
-  const chat = useChat({
-    id: activeConversationId ?? "strategy-codebot-empty",
-    messages: chatMessages,
+  const chat = useStrategyChatRuntime({
+    activeConversationId,
+    initialMessages: chatMessages,
+    language,
     onData: (part) => {
       if (part.type === "data-runEvent") {
         const parsed = part.data as RunEvent;
@@ -614,7 +659,14 @@ export function StrategyWorkspace() {
         if (parsed.type === "message.delta") {
           return;
         }
-        setRunEvents((events) => [...events.slice(-24), parsed]);
+        setAutoChainContinuation((current) =>
+          updateAutoChainContinuationFromRunEvent(current, parsed)
+        );
+        if (parsed.type === "chat.auto_chain.summary.completed") {
+          void queryClient.invalidateQueries({ queryKey: ["conversation-state", parsed.conversation_id] });
+          void queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] });
+        }
+        setRunEvents((events) => mergeRunEvents(events, [parsed], 60));
         if (parsed.type === "run.failed") {
           const event = { data: parsed as unknown as Record<string, unknown>, event: parsed.type };
           setInlineError(runFailureMessage(event, language));
@@ -639,8 +691,12 @@ export function StrategyWorkspace() {
         queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] }),
       ]);
     },
-    transport: chatTransport,
+    webSearchMode,
   });
+
+  useEffect(() => {
+    setMessagesFromConversationStateRef.current = chat.setMessagesFromConversationState;
+  }, [chat.setMessagesFromConversationState]);
 
   useEffect(() => {
     stopChatRef.current = () => {
@@ -652,12 +708,180 @@ export function StrategyWorkspace() {
   }, [chat]);
 
   useEffect(() => {
+    if (!autoChainContinuation) {
+      return;
+    }
+    if (autoChainContinuation.conversationId === activeConversationId) {
+      return;
+    }
+    autoChainAbortRef.current?.abort();
+    autoChainAbortRef.current = null;
+    setAutoChainContinuation(null);
+  }, [activeConversationId, autoChainContinuation]);
+
+  useEffect(() => {
+    if (!autoChainContinuation || autoChainContinuation.conversationId !== activeConversationId) {
+      return;
+    }
+    if (autoChainContinuation.status !== "queued" && autoChainContinuation.status !== "running") {
+      return;
+    }
+    const abort = new AbortController();
+    autoChainAbortRef.current?.abort();
+    autoChainAbortRef.current = abort;
+    void consumeAutoChainRunEvents(
+      client,
+      autoChainContinuation.childRunId,
+      (events) => {
+        setRunEvents((current) => mergeRunEvents(current, events, 60));
+        setAutoChainContinuation((current) => {
+          let next = current;
+          for (const event of events) {
+            next = updateAutoChainContinuationFromRunEvent(next, event);
+          }
+          return next;
+        });
+        for (const event of events) {
+          if (event.type === "run.completed") {
+            const pending = createAutoChainLocalEvent(
+              autoChainContinuation,
+              AUTO_CHAIN_SUMMARY_PENDING_EVENT,
+              "The report is ready. Waiting for the summary message to appear."
+            );
+            setRunEvents((current) => mergeRunEvents(current, [pending], 60));
+            void Promise.all([
+              queryClient.invalidateQueries({
+                queryKey: ["conversation-state", autoChainContinuation.conversationId],
+              }),
+              queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] }),
+            ]);
+          }
+          if (event.type === "run.failed") {
+            const failureEvent = { data: event as unknown as Record<string, unknown>, event: event.type };
+            setInlineError(runFailureMessage(failureEvent, language));
+          }
+        }
+      },
+      abort.signal
+    );
+    return () => {
+      abort.abort();
+      if (autoChainAbortRef.current === abort) {
+        autoChainAbortRef.current = null;
+      }
+    };
+  }, [
+    activeConversationId,
+    autoChainContinuation?.childRunId,
+    autoChainContinuation?.status,
+    client,
+    language,
+    queryClient,
+  ]);
+
+  useEffect(() => {
+    if (!autoChainContinuation || autoChainContinuation.conversationId !== activeConversationId) {
+      return;
+    }
+    if (autoChainContinuation.status !== "summary_pending") {
+      return;
+    }
+    let cancelled = false;
+    const continuation = autoChainContinuation;
+    async function pollSummary() {
+      const deadline = Date.now() + 120_000;
+      while (!cancelled && Date.now() < deadline) {
+        try {
+          const nextState = await client.getConversationState(continuation.conversationId);
+          if (cancelled) {
+            return;
+          }
+          queryClient.setQueryData(["conversation-state", continuation.conversationId], nextState);
+          const stateRunEvents = nextState.conversation_run_events.length
+            ? nextState.conversation_run_events
+            : nextState.latest_run_events;
+          if (
+            hasAutoChainSummaryCompletedEvent(stateRunEvents, continuation.childRunId) ||
+            hasAutoChainSummaryMessage(nextState.messages, continuation.childRunId)
+          ) {
+            if (cancelled) {
+              return;
+            }
+            setMessagesFromConversationStateRef.current?.(
+              backendMessagesToStrategyMessages(nextState.messages)
+            );
+            setAutoChainContinuation((current) =>
+              current?.childRunId === continuation.childRunId
+                ? { ...current, status: "summary_ready" }
+                : current
+            );
+            await queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] });
+            return;
+          }
+        } catch {
+          // Best-effort refresh; retry until the bounded deadline.
+        }
+        await delay(2000);
+      }
+      if (cancelled) {
+        return;
+      }
+      const timeoutEvent = createAutoChainLocalEvent(
+        continuation,
+        AUTO_CHAIN_SUMMARY_TIMEOUT_EVENT,
+        "The report is available, but the summary message is still being prepared."
+      );
+      setRunEvents((current) => mergeRunEvents(current, [timeoutEvent], 60));
+      setAutoChainContinuation((current) =>
+        current?.childRunId === continuation.childRunId
+          ? { ...current, status: "summary_timeout" }
+          : current
+      );
+    }
+    void pollSummary();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeConversationId,
+    autoChainContinuation?.status,
+    autoChainContinuation?.childRunId,
+    client,
+    queryClient,
+  ]);
+
+  useEffect(() => {
+    if (!activeConversationId || !state.isSuccess || state.data !== null) {
+      return;
+    }
+    stopChatRef.current?.();
+    stopRunProgress();
+    stopAutoChainContinuation();
+    setRunEvents([]);
+    setInlineError(null);
+    setSelectedConversationId(null);
+    lastHydratedMessagesKeyRef.current = "empty";
+    chat.setMessagesFromConversationState([]);
+    queryClient.removeQueries({ queryKey: ["conversation-state", activeConversationId] });
+    router.replace("/");
+  }, [
+    activeConversationId,
+    chat,
+    queryClient,
+    router,
+    state.data,
+    state.isSuccess,
+    stopAutoChainContinuation,
+    stopRunProgress,
+  ]);
+
+  useEffect(() => {
     if (!activeConversationId) {
       if (lastHydratedMessagesKeyRef.current === "empty") {
         return;
       }
       lastHydratedMessagesKeyRef.current = "empty";
-      chat.setMessages([]);
+      chat.setMessagesFromConversationState([]);
       return;
     }
     if (!state.isSuccess || !stateBelongsToActiveConversation) {
@@ -675,7 +899,7 @@ export function StrategyWorkspace() {
       return;
     }
     lastHydratedMessagesKeyRef.current = nextHydrationKey;
-    chat.setMessages(chatMessages);
+    chat.setMessagesFromConversationState(chatMessages);
   }, [
     activeConversationId,
     chat,
@@ -689,11 +913,41 @@ export function StrategyWorkspace() {
     if (chat.status === "submitted" || chat.status === "streaming") {
       return;
     }
+    if (activeConversationId && !stateBelongsToActiveConversation) {
+      return;
+    }
     const timeout = window.setTimeout(() => {
-      setRunEvents(state.data?.latest_run_events ?? []);
+      const hydratedRunEvents = mergeRunEvents(
+        state.data?.conversation_run_events ?? [],
+        state.data?.latest_run_events ?? [],
+        120
+      );
+      setRunEvents(hydratedRunEvents);
+      const hydratedContinuation = autoChainContinuationFromRunEvents(hydratedRunEvents);
+      setAutoChainContinuation((current) => {
+        if (!hydratedContinuation) {
+          return current?.conversationId === activeConversationId ? null : current;
+        }
+        if (
+          current?.childRunId === hydratedContinuation.childRunId &&
+          current.conversationId === hydratedContinuation.conversationId &&
+          current.sourceRunId === hydratedContinuation.sourceRunId &&
+          current.status === hydratedContinuation.status
+        ) {
+          return current;
+        }
+        return hydratedContinuation;
+      });
     }, 0);
     return () => window.clearTimeout(timeout);
-  }, [chat.status, state.data?.latest_run?.id, state.data?.latest_run_events]);
+  }, [
+    activeConversationId,
+    chat.status,
+    stateBelongsToActiveConversation,
+    state.data?.latest_run?.id,
+    state.data?.latest_run_events,
+    state.data?.conversation_run_events,
+  ]);
 
   useEffect(() => {
     if (readiness.error) {
@@ -716,6 +970,7 @@ export function StrategyWorkspace() {
   useEffect(
     () => () => {
       progressAbortRef.current?.abort();
+      autoChainAbortRef.current?.abort();
     },
     []
   );
@@ -724,16 +979,55 @@ export function StrategyWorkspace() {
     setLanguage(value);
   }, [setLanguage]);
 
-  const ensureConversation = useCallback(async () => {
-    if (activeConversationId) {
-      return activeConversationId;
-    }
-    const conversation = await client.createConversation({ title: null });
-    setInlineError(null);
-    handleSelectConversation(conversation.id);
-    await queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] });
-    return conversation.id;
-  }, [activeConversationId, client, handleSelectConversation, queryClient]);
+  const submitPromptToConversation = useCallback(
+    async ({
+      clientRequestId,
+      conversationId,
+      text,
+      webSearch,
+    }: {
+      clientRequestId: string;
+      conversationId: string;
+      text: string;
+      webSearch: WebSearchMode;
+    }) => {
+      promptSubmitPendingRef.current = true;
+      setPromptSubmitPending(true);
+      setPendingPromptText(text);
+      setInlineError(null);
+      chat.clearError();
+      const preserveAutoChainProgress =
+        autoChainContinuation?.conversationId === conversationId &&
+        !AUTO_CHAIN_TERMINAL_STATUSES.has(autoChainContinuation.status);
+      if (!preserveAutoChainProgress) {
+        setRunEvents([]);
+      }
+      console.info("[strategy-web-chat] submit", {
+        clientRequestId,
+        conversationId,
+        mode: "agent",
+        webSearch,
+      });
+      sendingConversationIdRef.current = conversationId;
+      try {
+        await chat.sendMessage(
+          { text },
+          {
+            body: { clientRequestId, conversationId, webSearch },
+          }
+        );
+      } catch (error) {
+        promptSubmitPendingRef.current = false;
+        setPromptSubmitPending(false);
+        setPendingPromptText(null);
+        sendingConversationIdRef.current = null;
+        setInlineError(errorMessage(error));
+        await queryClient.invalidateQueries({ queryKey: ["conversation-state"] });
+        chat.setMessagesFromConversationState(chatMessages);
+      }
+    },
+    [autoChainContinuation, chat, chatMessages, queryClient]
+  );
 
   const handlePromptSubmit = useCallback(
     async ({ text }: { text: string }) => {
@@ -748,13 +1042,24 @@ export function StrategyWorkspace() {
       setPromptSubmitPending(true);
       setPendingPromptText(submittedText);
       setInlineError(null);
-      setRunEvents([]);
       chat.clearError();
       const clientRequestId = crypto.randomUUID();
       let conversationId = activeConversationId;
       if (!conversationId) {
         try {
-          conversationId = await ensureConversation();
+          const conversation = await client.createConversation({ title: null });
+          conversationId = conversation.id;
+          writePendingInitialPrompt(conversationId, {
+            clientRequestId,
+            createdAt: Date.now(),
+            text: submittedText,
+            webSearch: webSearchMode,
+          });
+          setInlineError(null);
+          setSelectedConversationId(conversationId);
+          router.push(`/c/${encodeURIComponent(conversationId)}`);
+          await queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] });
+          return;
         } catch (error) {
           promptSubmitPendingRef.current = false;
           setPromptSubmitPending(false);
@@ -763,34 +1068,95 @@ export function StrategyWorkspace() {
           return;
         }
       }
-      console.info("[strategy-web-chat] submit", {
+      await submitPromptToConversation({
         clientRequestId,
         conversationId,
-        mode: "agent",
+        text: submittedText,
         webSearch: webSearchMode,
       });
-      sendingConversationIdRef.current = conversationId;
-      try {
-        await chat.sendMessage(
-          { text: submittedText },
-          {
-            body: { clientRequestId, conversationId, webSearch: webSearchMode },
-          }
-        );
-      } catch (error) {
-        promptSubmitPendingRef.current = false;
-        setPromptSubmitPending(false);
-        setPendingPromptText(null);
-        sendingConversationIdRef.current = null;
-        setInlineError(errorMessage(error));
-        await queryClient.invalidateQueries({ queryKey: ["conversation-state"] });
-        chat.setMessages(chatMessages);
-      }
     },
-    [activeConversationId, chat, chatMessages, ensureConversation, queryClient, webSearchMode]
+    [
+      activeConversationId,
+      chat,
+      client,
+      queryClient,
+      router,
+      submitPromptToConversation,
+      webSearchMode,
+    ]
   );
 
+  useEffect(() => {
+    if (
+      !activeConversationId ||
+      initialConversationId !== activeConversationId ||
+      chat.status !== "ready" ||
+      promptSubmitPendingRef.current ||
+      consumedPendingInitialPromptRef.current === activeConversationId
+    ) {
+      return;
+    }
+    const pendingPrompt = takePendingInitialPrompt(activeConversationId);
+    if (!pendingPrompt) {
+      return;
+    }
+    consumedPendingInitialPromptRef.current = activeConversationId;
+    void submitPromptToConversation({
+      clientRequestId: pendingPrompt.clientRequestId,
+      conversationId: activeConversationId,
+      text: pendingPrompt.text,
+      webSearch: pendingPrompt.webSearch,
+    });
+  }, [activeConversationId, chat.status, initialConversationId, submitPromptToConversation]);
+
   const latestRun = state.data?.latest_run ?? null;
+  const decideBacktestApproval = useMutation({
+    mutationFn: async ({
+      approvalId,
+      conversationId,
+      decision,
+    }: {
+      approvalId: string;
+      conversationId: string;
+      decision: "approved" | "rejected";
+    }) => {
+      const response = await client.decideBacktestApproval(conversationId, approvalId, {
+        decision,
+      });
+      const sourceRunId = latestRun?.id ?? `local-${approvalId}`;
+      const localEvents = backtestApprovalDecisionLocalEvents({
+        approvalId,
+        childRunId: response.run_id ?? null,
+        conversationId,
+        decision,
+        sourceRunId,
+      });
+      setRunEvents((current) => mergeRunEvents(current, localEvents, 60));
+      if (decision === "approved" && response.run_id) {
+        setAutoChainContinuation({
+          childRunId: response.run_id,
+          conversationId,
+          sourceRunId,
+          status: "queued",
+        });
+      }
+      if (decision === "rejected") {
+        setAutoChainContinuation(null);
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["conversation-state", conversationId] }),
+        queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] }),
+      ]);
+      return response;
+    },
+    onError: (error) => {
+      showToast({
+        description: errorMessage(error),
+        title: "Backtest approval failed",
+        variant: "error",
+      });
+    },
+  });
   const submitFeedback = useMutation({
     mutationFn: ({
       messageId,
@@ -831,12 +1197,47 @@ export function StrategyWorkspace() {
     },
     [chat]
   );
+  const initialArtifactCursor = state.data?.conversation_artifacts_next_cursor ?? null;
+  const olderConversationArtifacts = useInfiniteQuery({
+    enabled: false,
+    getNextPageParam: (lastPage: ArtifactListResponse) => lastPage.next_cursor,
+    initialPageParam: initialArtifactCursor,
+    queryFn: ({ pageParam }: { pageParam: string | null }) => {
+      if (!activeConversationId || !pageParam) {
+        return Promise.resolve({ items: [], next_cursor: null });
+      }
+      return client.listConversationArtifacts(activeConversationId, { cursor: pageParam });
+    },
+    queryKey: ["conversation-artifacts", activeConversationId, initialArtifactCursor],
+  });
+  const conversationArtifacts = useMemo(
+    () =>
+      dedupeArtifactsById([
+        ...(state.data?.conversation_artifacts ?? []),
+        ...((olderConversationArtifacts.data?.pages ?? []).flatMap((page) => page.items)),
+      ]),
+    [olderConversationArtifacts.data?.pages, state.data?.conversation_artifacts]
+  );
+  const hasOlderConversationArtifacts =
+    (olderConversationArtifacts.data?.pages.length ?? 0) === 0
+      ? Boolean(initialArtifactCursor)
+      : olderConversationArtifacts.hasNextPage;
   const visibleArtifacts = useMemo(
-    () => getUserFacingArtifacts(state.data?.latest_run_artifacts ?? []),
-    [state.data?.latest_run_artifacts]
+    () =>
+      getUserFacingArtifacts(
+        dedupeArtifactsById([
+          ...(state.data?.latest_run_artifacts ?? []),
+          ...conversationArtifacts,
+        ])
+      ),
+    [conversationArtifacts, state.data?.latest_run_artifacts]
   );
   const strategyProfile = state.data?.strategy_profile ?? null;
   const workspaceRunIntent = useMemo(() => responseIntentFromRunEvents(runEvents), [runEvents]);
+  const preferredDrawerArtifactKind = useMemo(
+    () => preferredArtifactKindFromRunEvents(runEvents),
+    [runEvents]
+  );
   const activeRunSignal =
     latestRun &&
     latestRun.status !== "completed" &&
@@ -848,6 +1249,19 @@ export function StrategyWorkspace() {
   const workspaceSignal = visibleArtifacts[0]?.id ?? activeRunSignal;
   const hasArtifactWorkspace = Boolean(activeRunSignal || visibleArtifacts.length > 0);
   const showArtifactWorkspace = hasArtifactWorkspace && artifactPanelOpen;
+  const renderArtifactWorkspace = hasArtifactWorkspace;
+  const latestMarketSnapshotForContext = useMemo(
+    () => marketSnapshotFromRunEvents(runEvents),
+    [runEvents]
+  );
+  const openArtifactDrawer = useCallback(() => {
+    const bestArtifact = getBestArtifactForDrawer(visibleArtifacts, {
+      preferredKind: preferredDrawerArtifactKind,
+    });
+    setSelectedArtifactId(bestArtifact?.id ?? null);
+    setArtifactPanelOpen(true);
+  }, [preferredDrawerArtifactKind, setArtifactPanelOpen, setSelectedArtifactId, visibleArtifacts]);
+
   const activeSidebarItem = sidebarItems.find(
     (item) => item.conversation.id === activeConversationId
   );
@@ -856,17 +1270,105 @@ export function StrategyWorkspace() {
     activeConversation?.title ?? getUiCopy(language).newChat;
   const conversationStateError =
     activeConversationId && state.error ? errorMessage(state.error) : null;
+  const currentWorkflow: StrategyAgentWorkflow = showArtifactWorkspace
+    ? "artifact_workspace"
+    : activeConversationId
+      ? "chat"
+      : "new_chat";
+  const copilotContextValue = useMemo(
+    () => ({
+      activeConversationId,
+      artifactPanelOpen,
+      currentWorkflow,
+      language,
+      latestMarketSnapshot: latestMarketSnapshotForContext,
+      providerReady: providerRouteReady(providerStatus.data),
+      selectedArtifactId,
+      strategyReadiness: strategyProfile?.snapshot.completeness ?? null,
+      tierLabel: me.data?.capability.tier_label ?? null,
+      userTier: me.data?.capability.tier ?? null,
+    }),
+    [
+      activeConversationId,
+      artifactPanelOpen,
+      currentWorkflow,
+      language,
+      latestMarketSnapshotForContext,
+      me.data,
+      providerStatus.data,
+      selectedArtifactId,
+      strategyProfile,
+    ]
+  );
+  const latestAssistantMessage = useMemo(
+    () => latestAssistantAfterLastUser(chat.messages),
+    [chat.messages]
+  );
+  const copilotSuggestionActions = latestAssistantMessage?.suggestions?.actions ?? [];
+  const copilotToolCallbacks = useMemo(
+    () => ({
+      focusComposer: () => {
+        document
+          .querySelector<HTMLTextAreaElement>("[data-strategy-composer-input]")
+          ?.focus();
+      },
+      insertStrategyBlock: ({
+        slot,
+        template,
+      }: {
+        slot: "entry" | "exit" | "market" | "risk";
+        template: string;
+      }) => {
+        window.dispatchEvent(
+          new CustomEvent("strategy:insert-composer-block", {
+            detail: { slot, template },
+          })
+        );
+      },
+      openArtifactWorkspace: openArtifactDrawer,
+      openCreateSpec: () => setSpecDialogOpen(true),
+      selectArtifact: (artifactId: string | null) => {
+        setSelectedArtifactId(artifactId);
+        if (artifactId) {
+          setArtifactPanelOpen(true);
+        }
+      },
+      useMarketSnapshotForStrategy: (symbol?: string) => {
+        window.dispatchEvent(
+          new CustomEvent("strategy:insert-composer-block", {
+            detail: {
+              slot: "market",
+              template: symbol
+                ? `Market context: ${symbol}`
+                : "Market context: use latest visible market snapshot",
+            },
+          })
+        );
+      },
+    }),
+    [openArtifactDrawer, setArtifactPanelOpen, setSelectedArtifactId]
+  );
 
   const requestCreateConversation = useCallback(() => {
     stopChatRef.current?.();
     stopRunProgress();
+    stopAutoChainContinuation();
     setInlineError(null);
     setRunEvents([]);
     setSelectedConversationId(null);
+    router.push("/");
     lastHydratedMessagesKeyRef.current = "empty";
-    chat.setMessages([]);
+    chat.setMessagesFromConversationState([]);
     setArtifactPanelOpen(false);
-  }, [chat, setArtifactPanelOpen, stopRunProgress]);
+    setSelectedArtifactId(null);
+  }, [
+    chat,
+    router,
+    setArtifactPanelOpen,
+    setSelectedArtifactId,
+    stopAutoChainContinuation,
+    stopRunProgress,
+  ]);
   const openRenameDialog = useCallback((conversation: ChatConversation) => {
     setRenameTarget(conversation);
     setRenameTitle(conversation.title ?? "New chat");
@@ -877,18 +1379,18 @@ export function StrategyWorkspace() {
 
   useEffect(() => {
     if (!workspaceSignal) {
-      lastOpenedWorkspaceRef.current = null;
       setArtifactPanelOpen(false);
-      return;
-    }
-    if (lastOpenedWorkspaceRef.current !== workspaceSignal) {
-      lastOpenedWorkspaceRef.current = workspaceSignal;
-      setArtifactPanelOpen(true);
     }
   }, [setArtifactPanelOpen, workspaceSignal]);
 
   return (
-    <main className="flex h-[100dvh] overflow-hidden bg-background text-foreground">
+    <StrategyAgentContextProvider value={copilotContextValue}>
+      <StrategyCopilotTools
+        callbacks={copilotToolCallbacks}
+        suggestions={copilotSuggestionActions}
+        toolsAvailable={copilotCapabilities.frontendTools}
+      />
+      <main className="flex h-[100dvh] overflow-hidden bg-background text-foreground">
       <ConversationSidebar
         accountUsage={accountUsage.data}
         conversations={sidebarItems}
@@ -900,6 +1402,7 @@ export function StrategyWorkspace() {
         onLanguageChange={handleLanguageChange}
         onOpenAccountDialog={openAccountDialog}
         onOpenSettingsTab={openSettingsTab}
+        onOpenArtifacts={() => router.push("/artifacts")}
         onRename={openRenameDialog}
         onSelect={handleSelectConversation}
         onToggleCollapsed={() => setSidebarCollapsed((collapsed) => !collapsed)}
@@ -918,56 +1421,107 @@ export function StrategyWorkspace() {
           onDelete={openDeleteDialog}
           onRename={openRenameDialog}
         />
-        <div
-          className={cn(
-            "grid min-h-0 overflow-hidden grid-cols-1",
-            showArtifactWorkspace && "lg:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]"
-          )}
-        >
-          <ChatColumn
-            artifacts={visibleArtifacts}
-            chatStatus={chat.status}
-            conversations={sidebarItems}
-            hasArtifactWorkspace={hasArtifactWorkspace}
-            isCreatingConversation={chat.status !== "ready" || promptSubmitPending}
-            isStartingChat={promptSubmitPending}
-            isLoadingConversation={Boolean(
-              activeConversationId &&
-                !state.isError &&
-                (state.isPending || !stateBelongsToActiveConversation)
+        <div className="flex min-h-0 min-w-0 overflow-hidden">
+          <div
+            className={cn(
+              "min-h-0 min-w-0 flex-none basis-full overflow-hidden transition-[flex-basis] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]",
+              renderArtifactWorkspace && (showArtifactWorkspace ? "lg:basis-1/2" : "lg:basis-full")
             )}
-            pendingUserText={pendingPromptText}
-            language={language}
-            disabled={chat.status !== "ready" || promptSubmitPending}
-            error={inlineError ?? conversationStateError}
-            messages={chat.messages}
-            onCreateConversation={requestCreateConversation}
-            onFeedback={handleAssistantFeedback}
-            onPromptSubmit={handlePromptSubmit}
-            onRegenerate={handleRegenerateMessage}
-            onSelectConversation={handleSelectConversation}
-            onViewArtifactWorkspace={() => setArtifactPanelOpen(true)}
-            onStop={() => void chat.stop()}
-            selectedConversationId={activeConversationId}
-            showArtifactWorkspace={showArtifactWorkspace}
-            runEvents={runEvents}
-            strategyProfile={strategyProfile}
-            webSearchMode={webSearchMode}
-            onWebSearchModeChange={updateWebSearchMode}
-          />
-          {showArtifactWorkspace && (
-            <ArtifactWorkspacePanel
+          >
+            <ChatColumn
+              actionRegistry={actionRegistryByToolId}
               artifacts={visibleArtifacts}
-              authKey={me.data?.capability.workspace_id ?? "workspace"}
-              cancelRun={(runId) => cancelRun.mutate(runId)}
-              client={client}
-              events={runEvents}
+              chatStatus={chat.status}
+              conversations={sidebarItems}
+              hasArtifactWorkspace={hasArtifactWorkspace}
+              isCreatingConversation={chat.status !== "ready" || promptSubmitPending}
+              isStartingChat={promptSubmitPending}
+              isLoadingConversation={Boolean(
+                activeConversationId &&
+                  !state.isError &&
+                  (state.isPending || !stateBelongsToActiveConversation)
+              )}
+              backendMessages={
+                stateBelongsToActiveConversation ? state.data?.messages ?? [] : []
+              }
+              conversationRunEvents={
+                stateBelongsToActiveConversation ? state.data?.conversation_run_events ?? [] : []
+              }
+              pendingUserText={pendingPromptText}
               language={language}
-              onClose={() => setArtifactPanelOpen(false)}
-              retryRun={(runId) => retryRun.mutate(runId)}
-              run={latestRun}
+              disabled={chat.status !== "ready" || promptSubmitPending}
+              error={inlineError ?? conversationStateError}
+              messages={chat.messages}
+              onCreateConversation={requestCreateConversation}
+              onFeedback={handleAssistantFeedback}
+              onBacktestApprovalDecision={async ({ approvalId, conversationId, decision }) => {
+                await decideBacktestApproval.mutateAsync({
+                  approvalId,
+                  conversationId,
+                  decision,
+                });
+              }}
+              onPromptSubmit={handlePromptSubmit}
+              onRegenerate={handleRegenerateMessage}
+              onSelectConversation={handleSelectConversation}
+              onSelectArtifact={(artifactId) => {
+                setSelectedArtifactId(artifactId);
+                setArtifactPanelOpen(true);
+              }}
+              onOpenCreateSpec={() => setSpecDialogOpen(true)}
+              onViewArtifactWorkspace={openArtifactDrawer}
+              onStop={() => void chat.stop()}
+              isBacktestApprovalSubmitting={decideBacktestApproval.isPending}
+              selectedConversationId={activeConversationId}
+              runEvents={runEvents}
               strategyProfile={strategyProfile}
+              webSearchMode={webSearchMode}
+              onWebSearchModeChange={updateWebSearchMode}
             />
+          </div>
+          {renderArtifactWorkspace && (
+            <div
+              className={cn(
+                "min-h-0 min-w-0 flex-none overflow-hidden transition-[flex-basis] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]",
+                showArtifactWorkspace ? "basis-full lg:basis-1/2" : "basis-full lg:basis-0"
+              )}
+            >
+              <ArtifactDrawerPanel
+                artifacts={visibleArtifacts}
+                authKey={me.data?.capability.workspace_id ?? "workspace"}
+                client={client}
+                language={language}
+                hasOlderArtifacts={hasOlderConversationArtifacts}
+                isLoadingOlderArtifacts={olderConversationArtifacts.isFetchingNextPage}
+                onLoadOlderArtifacts={() => void olderConversationArtifacts.fetchNextPage()}
+                onBacktestQueued={({ childRunId, conversationId, sourceRunId }) => {
+                  const continuation: AutoChainContinuation = {
+                    childRunId,
+                    conversationId,
+                    sourceRunId,
+                    status: "queued",
+                  };
+                  setAutoChainContinuation(continuation);
+                  setRunEvents((current) =>
+                    mergeRunEvents(
+                      current,
+                      [
+                        createAutoChainLocalEvent(
+                          continuation,
+                          "chat.auto_chain.waiting_for_backtest",
+                          "Waiting for the preview evidence to finish."
+                        ),
+                      ],
+                      60
+                    )
+                  );
+                }}
+                onClose={() => setArtifactPanelOpen(false)}
+                open={showArtifactWorkspace}
+                preferredArtifactKind={preferredDrawerArtifactKind}
+                runEvents={runEvents}
+              />
+            </div>
           )}
         </div>
       </section>
@@ -1050,12 +1604,14 @@ export function StrategyWorkspace() {
         }}
         open={Boolean(deleteTarget)}
       />
-    </main>
+      </main>
+    </StrategyAgentContextProvider>
   );
 }
 
-function ConversationSidebar({
+export function ConversationSidebar({
   accountUsage,
+  activeView = "chat",
   collapsed,
   conversations,
   isCreating,
@@ -1068,6 +1624,7 @@ function ConversationSidebar({
   onLanguageChange,
   onOpenAccountDialog,
   onOpenSettingsTab,
+  onOpenArtifacts,
   onRename,
   onSelect,
   onToggleCollapsed,
@@ -1077,6 +1634,7 @@ function ConversationSidebar({
   theme,
 }: {
   accountUsage?: AccountUsageResponse;
+  activeView?: "chat" | "artifacts";
   collapsed: boolean;
   conversations: ConversationSidebarItem[];
   isCreating: boolean;
@@ -1089,6 +1647,7 @@ function ConversationSidebar({
   onLanguageChange: (language: UiLanguagePreference) => void;
   onOpenAccountDialog: (dialog: AccountDialog) => void;
   onOpenSettingsTab: (tab: SettingsTab) => void;
+  onOpenArtifacts: () => void;
   onRename: (conversation: ChatConversation) => void;
   onSelect: (conversationId: string) => void;
   onToggleCollapsed: () => void;
@@ -1098,6 +1657,7 @@ function ConversationSidebar({
   theme: ThemePreference;
 }) {
   const t = getUiCopy(language);
+  const artifactsLabel = t.artifacts;
   return (
     <aside
       className={cn(
@@ -1137,6 +1697,12 @@ function ConversationSidebar({
             <SidebarRailButton
               icon={<Search className="size-4" />}
               label={t.searchChats}
+            />
+            <SidebarRailButton
+              active={activeView === "artifacts"}
+              icon={<FileStack className="size-4" />}
+              label={artifactsLabel}
+              onClick={onOpenArtifacts}
             />
             <SidebarRailButton
               disabled={!selectedConversationId}
@@ -1182,6 +1748,20 @@ function ConversationSidebar({
             >
               <MessageSquarePlus className="size-4" />
               {t.newChat}
+            </button>
+            <button
+              className={cn(
+                "flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                activeView === "artifacts"
+                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                  : "text-sidebar-foreground"
+              )}
+              onClick={onOpenArtifacts}
+              title={artifactsLabel}
+              type="button"
+            >
+              <FileStack className="size-4" />
+              {artifactsLabel}
             </button>
             <button
               className="flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium text-sidebar-foreground transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
@@ -1537,7 +2117,7 @@ function isActivePreference<T extends string>(current: T, expected: T) {
   return current === expected;
 }
 
-function conversationHydrationKey(conversationId: string, messages: UIMessage[]) {
+function conversationHydrationKey(conversationId: string, messages: StrategyChatMessage[]) {
   return [
     conversationId,
     ...messages.map(
@@ -1640,6 +2220,8 @@ function AccountDialogs({
   const userId = me?.user.id ?? t.localWorkspace;
   const providerUnavailable = providerStatus ? !providerStatus.available : false;
   const llmReadinessStatus = readiness?.checks.llm_provider?.status ?? readiness?.status;
+  const modelRouteReady = providerRouteReady(providerStatus);
+  const fallbackEnabled = providerFallbackEnabled(providerStatus);
 
   if (dialog === "settings") {
     const tabs: Array<{ icon: ReactNode; label: string; value: SettingsTab }> = [
@@ -1730,9 +2312,33 @@ function AccountDialogs({
                       </div>
                     )}
                     <AccountInfoRow label={t.providerStatus} value={provider.title} />
+                    <AccountInfoRow
+                      label={t.modelRoute}
+                      value={
+                        modelRouteReady
+                          ? providerStatus?.user_message ?? t.routeReady
+                          : providerStatus?.user_message ?? t.routeUnavailable
+                      }
+                    />
+                    <AccountInfoRow
+                      label={t.modelRoutingMode}
+                      value={providerStatus?.model_routing_mode ?? "-"}
+                    />
                     <AccountInfoRow label={t.readinessStatus} value={statusLabel(llmReadinessStatus, language)} />
                     <AccountInfoRow label={t.lastChecked} value={formatLastChecked(lastHealthCheckedAt, language)} />
                     <AccountInfoRow label={t.currentPlan} value={providerStatus?.tier_label ?? me?.capability.tier_label ?? t.workspace} />
+                    <AccountInfoRow
+                      label={t.fallbackEnabled}
+                      value={fallbackEnabled ? t.fallbackEnabled : t.fallbackDisabled}
+                    />
+                    <AccountInfoRow
+                      label={t.aiProvider}
+                      value={formatModeList(providerStatus?.available_gateways)}
+                    />
+                    <AccountInfoRow
+                      label={t.modelStageDefaults}
+                      value={formatStageDefaults(providerStatus?.selected_stage_defaults)}
+                    />
                     <AccountInfoRow label={t.runModes} value={formatModeList(providerStatus?.allowed_run_modes)} />
                   </div>
                 )}
@@ -1967,6 +2573,15 @@ function formatModeList(modes?: string[]) {
   return modes?.length ? modes.join(", ") : "-";
 }
 
+function formatStageDefaults(defaults?: Record<string, string>) {
+  if (!defaults || Object.keys(defaults).length === 0) {
+    return "-";
+  }
+  return Object.entries(defaults)
+    .map(([stage, route]) => `${stage}: ${route}`)
+    .join(", ");
+}
+
 function accountDialogTitle(dialog: AccountDialog | null, language: UiLanguagePreference = "en") {
   const t = getUiCopy(language);
   switch (dialog) {
@@ -2145,11 +2760,13 @@ function DeleteConversationDialog({
 }
 
 function SidebarRailButton({
+  active,
   disabled,
   icon,
   label,
   onClick,
 }: {
+  active?: boolean;
   disabled?: boolean;
   icon: ReactNode;
   label: string;
@@ -2158,7 +2775,12 @@ function SidebarRailButton({
   return (
     <button
       aria-label={label}
-      className="flex size-9 items-center justify-center rounded-[8px] text-sidebar-foreground/85 transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:cursor-not-allowed disabled:opacity-40"
+      className={cn(
+        "flex size-9 items-center justify-center rounded-[8px] transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground disabled:cursor-not-allowed disabled:opacity-40",
+        active
+          ? "bg-sidebar-accent text-sidebar-accent-foreground"
+          : "text-sidebar-foreground/85"
+      )}
       disabled={disabled}
       onClick={onClick}
       title={label}
@@ -2237,62 +2859,98 @@ function ReadinessStrip({
 }
 
 function ChatColumn({
+  actionRegistry,
   artifacts,
+  backendMessages,
   chatStatus,
+  conversationRunEvents,
   conversations,
   disabled,
   error,
   hasArtifactWorkspace,
   isCreatingConversation,
   isStartingChat,
+  isBacktestApprovalSubmitting,
   isLoadingConversation,
   language,
   messages,
+  onBacktestApprovalDecision,
   onCreateConversation,
   onFeedback,
   onPromptSubmit,
+  onOpenCreateSpec,
   onWebSearchModeChange,
   pendingUserText,
   onRegenerate,
   onSelectConversation,
+  onSelectArtifact,
   onStop,
   onViewArtifactWorkspace,
   selectedConversationId,
-  showArtifactWorkspace,
   runEvents,
   strategyProfile,
   webSearchMode,
 }: {
+  actionRegistry: ActionRegistryLookup;
   artifacts: Artifact[];
+  backendMessages: BackendMessage[];
   chatStatus: string;
+  conversationRunEvents: RunEvent[];
   conversations: ConversationSidebarItem[];
   disabled: boolean;
   error: string | null;
   hasArtifactWorkspace: boolean;
   isCreatingConversation: boolean;
   isStartingChat: boolean;
+  isBacktestApprovalSubmitting: boolean;
   isLoadingConversation: boolean;
   language: UiLanguagePreference;
-  messages: UIMessage[];
+  messages: StrategyChatMessage[];
+  onBacktestApprovalDecision: (input: {
+    approvalId: string;
+    conversationId: string;
+    decision: "approved" | "rejected";
+  }) => Promise<void>;
   onCreateConversation: () => void;
   onFeedback: (messageId: string, rating: "up" | "down") => Promise<void>;
+  onOpenCreateSpec: () => void;
   onPromptSubmit: (message: { text: string }) => Promise<void>;
   onWebSearchModeChange: (mode: WebSearchMode) => void;
   pendingUserText: string | null;
   onRegenerate: (messageId: string) => Promise<void>;
   onSelectConversation: (conversationId: string) => void;
+  onSelectArtifact: (artifactId: string) => void;
   onStop: () => void;
   onViewArtifactWorkspace: () => void;
   selectedConversationId: string | null;
-  showArtifactWorkspace: boolean;
   runEvents: RunEvent[];
   strategyProfile: StrategyProfile | null;
   webSearchMode: WebSearchMode;
 }) {
+  const [backtestStatusNowMs, setBacktestStatusNowMs] = useState(() => Date.now());
   const activities = useMemo(
-    () => mapRunEventsToChatActivities(runEvents, language),
-    [language, runEvents]
+    () => mapRunEventsToChatActivities(runEvents, language, actionRegistry),
+    [actionRegistry, language, runEvents]
   );
+  const backtestLiveStatus = useMemo(
+    () => backtestLiveStatusFromRunEvents(runEvents, backtestStatusNowMs),
+    [backtestStatusNowMs, runEvents]
+  );
+  const pendingBacktestApproval = useMemo(
+    () => pendingBacktestApprovalFromRunEvents(runEvents),
+    [runEvents]
+  );
+  useEffect(() => {
+    if (
+      !backtestLiveStatus ||
+      backtestLiveStatus.status === "completed" ||
+      backtestLiveStatus.status === "failed"
+    ) {
+      return;
+    }
+    const intervalId = window.setInterval(() => setBacktestStatusNowMs(Date.now()), 15_000);
+    return () => window.clearInterval(intervalId);
+  }, [backtestLiveStatus?.runId, backtestLiveStatus?.status]);
   const isChatWorking = chatStatus === "streaming" || chatStatus === "submitted";
   const renderableMessages = useMemo(
     () => messages.filter((message) => isRenderableMessage(message)),
@@ -2305,18 +2963,26 @@ function ChatColumn({
     }
     const alreadyRendered = renderableMessages.some(
       (message) =>
-        message.role === "user" && getMessageText(message).trim() === text
+        message.role === "user" && message.text.trim() === text
     );
     if (alreadyRendered) {
       return null;
     }
     return {
       id: "pending-user-message",
-      parts: [{ text, type: "text" }],
       role: "user",
-    } satisfies UIMessage;
+      text,
+      sources: [],
+      reasoningSummaries: [],
+      backtestReport: null,
+      inlineTables: [],
+      marketSnapshot: null,
+      suggestions: null,
+      responseIntent: null,
+      raw: null,
+    } satisfies StrategyChatMessage;
   }, [pendingUserText, renderableMessages]);
-  const displayMessages = useMemo(
+  const baseDisplayMessages = useMemo(
     () =>
       pendingUserMessage
         ? [...renderableMessages, pendingUserMessage]
@@ -2329,26 +2995,70 @@ function ChatColumn({
     () => marketSnapshotFromRunEvents(runEvents),
     [runEvents]
   );
-  const { latestAssistantMessage, latestUserMessageId } = useMemo(() => {
-    let assistant: UIMessage | null = null;
-    let userId: string | undefined;
-    for (let index = displayMessages.length - 1; index >= 0; index -= 1) {
-      const message = displayMessages[index];
-      if (!assistant && message.role === "assistant") {
-        assistant = message;
-      }
-      if (!userId && message.role === "user") {
-        userId = message.id;
-      }
-      if (assistant && userId) {
-        break;
-      }
+  const preferredDrawerArtifactKind = useMemo(
+    () => preferredArtifactKindFromRunEvents(conversationRunEvents),
+    [conversationRunEvents]
+  );
+  const waitingElapsedSeconds = useElapsedSeconds(isChatWorking || isStartingChat);
+  const waitingSlowState = useMemo(
+    () => slowProviderState(waitingElapsedSeconds, language),
+    [language, waitingElapsedSeconds]
+  );
+  const turnAssistantMessage = useMemo(
+    () => latestAssistantAfterLastUser(baseDisplayMessages),
+    [baseDisplayMessages]
+  );
+  const pendingAssistantMessage = useMemo(() => {
+    if (!(isChatWorking || isStartingChat) || turnAssistantMessage) {
+      return null;
     }
-    return { latestAssistantMessage: assistant, latestUserMessageId: userId };
-  }, [displayMessages]);
-  const latestAssistantMessageId = latestAssistantMessage?.id;
+    return {
+      id: "pending-assistant-message",
+      role: "assistant",
+      text: "",
+      sources: [],
+      reasoningSummaries: [],
+      backtestReport: null,
+      inlineTables: [],
+      marketSnapshot: null,
+      suggestions: null,
+      responseIntent: null,
+      raw: null,
+    } satisfies StrategyChatMessage;
+  }, [isChatWorking, isStartingChat, turnAssistantMessage]);
+  const displayMessages = useMemo(
+    () =>
+      pendingAssistantMessage
+        ? [...baseDisplayMessages, pendingAssistantMessage]
+        : baseDisplayMessages,
+    [baseDisplayMessages, pendingAssistantMessage]
+  );
+  const activeAssistantMessageId = (turnAssistantMessage ?? pendingAssistantMessage)?.id;
   const hasStreamingAssistantText = isChatWorking && hasAssistantText(messages);
-  const readyArtifact = artifacts[0] ?? null;
+  const artifactGroups = useMemo(
+    () => groupArtifactsByAnchorMessage({ artifacts, backendMessages }),
+    [artifacts, backendMessages]
+  );
+  const backtestSummaryRunIds = useMemo(
+    () =>
+      backtestSummaryRunIdsByAnchorMessage({
+        backendMessages,
+        events: conversationRunEvents,
+      }),
+    [backendMessages, conversationRunEvents]
+  );
+  const backtestResultArtifacts = useMemo(
+    () => backtestResultArtifactsByRunId(artifacts),
+    [artifacts]
+  );
+  const persistedRunMetadata = useMemo(
+    () =>
+      runEventMetadataByAnchorMessage({
+        backendMessages,
+        events: conversationRunEvents,
+      }),
+    [backendMessages, conversationRunEvents]
+  );
   const staticSuggestions = useMemo(() => getChatSuggestions(language), [language]);
   const fallbackSuggestionPayload = useMemo(
     () =>
@@ -2360,9 +3070,7 @@ function ChatColumn({
       }),
     [artifacts.length, language, latestRunIntent, strategyProfile]
   );
-  const streamedComposerBlocks = latestAssistantMessage
-    ? getMessageSuggestions(latestAssistantMessage)?.composer_blocks
-    : null;
+  const streamedComposerBlocks = turnAssistantMessage?.suggestions?.composer_blocks ?? null;
   const composerBlocks =
     streamedComposerBlocks && streamedComposerBlocks.length > 0
       ? streamedComposerBlocks
@@ -2399,42 +3107,99 @@ function ChatColumn({
               webSearchMode={webSearchMode}
             />
           ) : (
-            displayMessages.map((message) => (
-              <StrategyMessage
-                fallbackSources={message.id === latestAssistantMessageId ? runSources : []}
-                key={message.id}
-                language={language}
-                message={message}
-                onFeedback={onFeedback}
-                onRegenerate={onRegenerate}
-                onSuggestionSubmit={onPromptSubmit}
-                onViewArtifactWorkspace={onViewArtifactWorkspace}
-                fallbackSuggestions={
-                  message.id === latestAssistantMessageId ? fallbackSuggestionPayload.actions : []
-                }
-                fallbackMarketSnapshot={
-                  message.id === latestAssistantMessageId ? latestMarketSnapshot : null
-                }
-                fallbackResponseIntent={
-                  message.id === latestAssistantMessageId ? latestRunIntent : null
-                }
-                showStrategyProfile={
-                  latestAssistantMessageId
-                    ? message.id === latestAssistantMessageId
-                    : message.id === latestUserMessageId
-                }
-                strategyProfile={strategyProfile}
-              />
-            ))
+            displayMessages.map((message) => {
+              const persistedMetadata = persistedRunMetadata.get(message.id);
+              const mergedMetadata = persistedMetadata
+                ? mergeStrategyChatMessageMetadata(
+                    {
+                      backtestReport: message.backtestReport,
+                      inlineTables: message.inlineTables,
+                      marketSnapshot: message.marketSnapshot,
+                      reasoningSummaries: message.reasoningSummaries,
+                      responseIntent: message.responseIntent,
+                      sources: message.sources,
+                      suggestions: message.suggestions,
+                    },
+                    persistedMetadata
+                  )
+                : null;
+              const renderedMessage = mergedMetadata
+                ? {
+                    ...message,
+                    backtestReport: mergedMetadata.backtestReport,
+                    inlineTables: mergedMetadata.inlineTables,
+                    marketSnapshot: mergedMetadata.marketSnapshot,
+                    reasoningSummaries: mergedMetadata.reasoningSummaries,
+                    responseIntent: mergedMetadata.responseIntent,
+                    sources: mergedMetadata.sources,
+                    suggestions: mergedMetadata.suggestions,
+                  }
+                : message;
+              const anchoredArtifacts = artifactGroups.get(message.id) ?? [];
+              const summaryRunId = backtestSummaryRunIds.get(message.id) ?? null;
+              const messageArtifacts =
+                anchoredArtifacts.length > 0
+                  ? anchoredArtifacts
+                  : summaryRunId
+                    ? backtestResultArtifacts.get(summaryRunId) ?? []
+                    : [];
+              return (
+                <StrategyMessage
+                  actionRegistry={actionRegistry}
+                  artifact={getBestArtifactForDrawer(messageArtifacts, {
+                    preferredKind: summaryRunId ? "backtest_dashboard" : preferredDrawerArtifactKind,
+                  })}
+                  artifactCount={messageArtifacts.length}
+                  fallbackSources={
+                    renderedMessage.sources.length > 0
+                      ? []
+                      : renderedMessage.id === activeAssistantMessageId ? runSources : []
+                  }
+                  isTransient={renderedMessage.id === "pending-assistant-message"}
+                  key={renderedMessage.id}
+                  language={language}
+                  message={renderedMessage}
+                  onFeedback={onFeedback}
+                  onOpenCreateSpec={onOpenCreateSpec}
+                  onRegenerate={onRegenerate}
+                  onSuggestionSubmit={onPromptSubmit}
+                  onViewArtifactWorkspace={onViewArtifactWorkspace}
+                  suppressActionSuggestions={renderedMessage.id === activeAssistantMessageId && isChatWorking}
+                  fallbackSuggestions={
+                    renderedMessage.id === activeAssistantMessageId
+                      ? fallbackSuggestionPayload.actions
+                      : persistedMetadata?.suggestions?.actions ?? []
+                  }
+                  fallbackMarketSnapshot={
+                    renderedMessage.marketSnapshot ??
+                    persistedMetadata?.marketSnapshot ??
+                    (renderedMessage.id === activeAssistantMessageId ? latestMarketSnapshot : null)
+                  }
+                  waitingSlowState={waitingSlowState}
+                />
+              );
+            })
           )}
           <AssistantActivity
             activities={activities}
-            artifact={readyArtifact}
-            isWorking={(isChatWorking || isStartingChat) && !hasStreamingAssistantText}
+            isWorking={(isChatWorking || isStartingChat) && !hasStreamingAssistantText && !pendingAssistantMessage}
             language={language}
-            onViewArtifactWorkspace={onViewArtifactWorkspace}
-            showArtifactWorkspace={showArtifactWorkspace}
+            onSelectArtifact={onSelectArtifact}
           />
+          {pendingBacktestApproval && selectedConversationId ? (
+            <BacktestApprovalPanel
+              approval={pendingBacktestApproval}
+              disabled={isBacktestApprovalSubmitting}
+              onDecision={(decision) =>
+                onBacktestApprovalDecision({
+                  approvalId: pendingBacktestApproval.approvalId,
+                  conversationId: selectedConversationId,
+                  decision,
+                })
+              }
+            />
+          ) : null}
+          <BacktestRunStatusPanel status={backtestLiveStatus} />
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
@@ -2454,16 +3219,13 @@ function ChatColumn({
           <ChatPromptComposer
             chatStatus={chatStatus}
             disabled={disabled}
-            hasArtifactWorkspace={hasArtifactWorkspace}
             language={language}
             onPromptSubmit={onPromptSubmit}
             onWebSearchModeChange={onWebSearchModeChange}
             onStop={onStop}
-          onViewArtifactWorkspace={onViewArtifactWorkspace}
-          showArtifactWorkspace={showArtifactWorkspace}
-          suggestionBlocks={composerBlocks}
-          webSearchMode={webSearchMode}
-        />
+            suggestionBlocks={composerBlocks}
+            webSearchMode={webSearchMode}
+          />
         </div>
       </div>
     </section>
@@ -2586,73 +3348,59 @@ function EmptyChatStart({
 function ChatPromptComposer({
   chatStatus,
   disabled,
-  hasArtifactWorkspace,
   language,
   onPromptSubmit,
   onWebSearchModeChange,
   onStop,
-  onViewArtifactWorkspace,
-  showArtifactWorkspace,
   suggestionBlocks,
   webSearchMode,
 }: {
   chatStatus: string;
   disabled: boolean;
-  hasArtifactWorkspace: boolean;
   language: UiLanguagePreference;
   onPromptSubmit: (message: { text: string }) => Promise<void>;
   onWebSearchModeChange: (mode: WebSearchMode) => void;
   onStop: () => void;
-  onViewArtifactWorkspace: () => void;
-  showArtifactWorkspace: boolean;
   suggestionBlocks: ChatSuggestionItem[];
   webSearchMode: WebSearchMode;
 }) {
   const t = getUiCopy(language);
+  const [value, setValue] = useState("");
+  const isChatWorking = chatStatus === "streaming" || chatStatus === "submitted";
+  useEffect(() => {
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (!detail || typeof detail !== "object") {
+        return;
+      }
+      const record = detail as Record<string, unknown>;
+      const slot = record.slot;
+      const template = record.template;
+      if (
+        (slot === "entry" || slot === "exit" || slot === "market" || slot === "risk") &&
+        typeof template === "string" &&
+        template.trim()
+      ) {
+        setValue((previous) => insertOrUpdateStrategyBlock(previous, slot, template));
+      }
+    };
+    window.addEventListener("strategy:insert-composer-block", listener);
+    return () => window.removeEventListener("strategy:insert-composer-block", listener);
+  }, []);
   return (
-    <PromptInputProvider>
+    <>
       <SmartStrategyBlocks
+        composerValue={value}
+        onComposerValueChange={setValue}
         disabled={disabled}
         language={language}
         blocks={suggestionBlocks}
       />
-      <PromptInput
-        className="w-full"
-        inputGroupClassName={cn("border", strategyPromptInputShellClassName, "pb-2")}
-        onSubmit={onPromptSubmit}
-      >
-        <PromptInputBody>
-          <PromptInputTextarea
-            className={strategyPromptTextareaClassName}
-            disabled={disabled}
-            placeholder={t.signedOutPlaceholder}
-          />
-        </PromptInputBody>
-        <PromptInputFooter
-          align="block-end"
-          className="px-3 pb-3"
-        >
-          <WebSearchToggle
-            disabled={disabled}
-            language={language}
-            mode={webSearchMode}
-            onChange={onWebSearchModeChange}
-          />
-          <div className="flex items-center gap-2">
-            {hasArtifactWorkspace && !showArtifactWorkspace && (
-              <Button
-                className="rounded-full"
-                onClick={onViewArtifactWorkspace}
-                size="icon-sm"
-                type="button"
-                variant="outline"
-                title={t.viewArtifact}
-              >
-                <PanelRight className="size-3" />
-                <span className="sr-only">{t.viewArtifact}</span>
-              </Button>
-            )}
-            {chatStatus === "streaming" || chatStatus === "submitted" ? (
+      <StrategyComposer
+        disabled={disabled}
+        endAction={({ submitDisabled }) => (
+          <>
+            {isChatWorking ? (
               <Button
                 className="rounded-full"
                 onClick={onStop}
@@ -2668,7 +3416,7 @@ function ChatPromptComposer({
               <Button
                 aria-label={t.send}
                 className="rounded-full"
-                disabled={disabled}
+                disabled={submitDisabled}
                 size="icon-sm"
                 title={t.send}
                 type="submit"
@@ -2677,23 +3425,42 @@ function ChatPromptComposer({
                 <span className="sr-only">{t.send}</span>
               </Button>
             )}
-          </div>
-        </PromptInputFooter>
-      </PromptInput>
-    </PromptInputProvider>
+          </>
+        )}
+        onSubmit={async (text) => {
+          setValue("");
+          await onPromptSubmit({ text });
+        }}
+        onValueChange={setValue}
+        placeholder={t.signedOutPlaceholder}
+        requireText
+        startAction={
+          <WebSearchToggle
+            disabled={disabled}
+            language={language}
+            mode={webSearchMode}
+            onChange={onWebSearchModeChange}
+          />
+        }
+        value={value}
+      />
+    </>
   );
 }
 
 function SmartStrategyBlocks({
   blocks,
+  composerValue,
   disabled,
   language,
+  onComposerValueChange,
 }: {
   blocks: ChatSuggestionItem[];
+  composerValue: string;
   disabled: boolean;
   language: UiLanguagePreference;
+  onComposerValueChange: (value: string) => void;
 }) {
-  const { textInput } = usePromptInputController();
   const t = getUiCopy(language);
   const [feedback, setFeedback] = useState<{ label: string; previous: string } | null>(null);
   const chips = blocks;
@@ -2703,8 +3470,8 @@ function SmartStrategyBlocks({
   }
 
   const applyBlock = (block: ChatSuggestionItem, template: string, label: string) => {
-    const previous = textInput.value;
-    textInput.setInput(insertOrUpdateStrategyBlock(previous, block.slot, template));
+    const previous = composerValue;
+    onComposerValueChange(insertOrUpdateStrategyBlock(previous, block.slot, template));
     setFeedback({ label, previous });
   };
 
@@ -2746,7 +3513,7 @@ function SmartStrategyBlocks({
           <button
             className="text-[var(--together-accent-blue)] hover:underline"
             onClick={() => {
-              textInput.setInput(feedback.previous);
+              onComposerValueChange(feedback.previous);
               setFeedback(null);
             }}
             type="button"
@@ -2760,48 +3527,59 @@ function SmartStrategyBlocks({
 }
 
 function StrategyMessage({
+  actionRegistry,
+  artifact = null,
+  artifactCount = 0,
   fallbackMarketSnapshot = null,
-  fallbackResponseIntent = null,
   fallbackSources = [],
+  isTransient = false,
   language,
   message,
   onFeedback,
+  onOpenCreateSpec,
   onRegenerate,
   onSuggestionSubmit,
   onViewArtifactWorkspace,
   fallbackSuggestions = [],
-  showStrategyProfile,
-  strategyProfile,
+  suppressActionSuggestions = false,
+  waitingSlowState,
 }: {
+  actionRegistry: ActionRegistryLookup;
+  artifact?: Artifact | null;
+  artifactCount?: number;
   fallbackMarketSnapshot?: MarketSnapshot | null;
-  fallbackResponseIntent?: ResponseIntent | null;
   fallbackSources?: ChatMessageSource[];
+  isTransient?: boolean;
   language: UiLanguagePreference;
-  message: UIMessage;
+  message: StrategyChatMessage;
   onFeedback: (messageId: string, rating: "up" | "down") => Promise<void>;
+  onOpenCreateSpec: () => void;
   onRegenerate: (messageId: string) => Promise<void>;
   onSuggestionSubmit: (message: { text: string }) => Promise<void>;
   onViewArtifactWorkspace: () => void;
   fallbackSuggestions?: ChatSuggestionItem[];
-  showStrategyProfile: boolean;
-  strategyProfile: StrategyProfile | null;
+  suppressActionSuggestions?: boolean;
+  waitingSlowState?: ReturnType<typeof slowProviderState>;
 }) {
   const [actionState, setActionState] = useState<{
     kind: "idle" | "loading" | "success" | "error";
     message?: string;
   }>({ kind: "idle" });
   const [externalSource, setExternalSource] = useState<{ title: string; url: string } | null>(null);
-  const text = getMessageText(message);
-  const sources = mergeMessageSources(getMessageSources(message), fallbackSources);
-  const responseIntent = getMessageResponseIntent(message) ?? fallbackResponseIntent;
-  const marketSnapshot = getMessageMarketSnapshot(message) ?? fallbackMarketSnapshot;
-  const suggestionPayload = getMessageSuggestions(message);
+  const text = message.text;
+  const sources = mergeMessageSources(message.sources, fallbackSources);
+  const marketSnapshot = message.marketSnapshot ?? fallbackMarketSnapshot;
+  const backtestReport = message.backtestReport;
+  const inlineTables = message.inlineTables;
+  const suggestionPayload = message.suggestions;
+  const hasDashboardArtifact = artifact?.presentation.viewer_kind === "backtest_dashboard";
+  const dashboardPreviewSummary = hasDashboardArtifact ? artifact?.preview_summary ?? null : null;
   const suggestions =
-    suggestionPayload?.actions && suggestionPayload.actions.length > 0
+    suppressActionSuggestions
+      ? []
+      : suggestionPayload?.actions && suggestionPayload.actions.length > 0
       ? suggestionPayload.actions
       : fallbackSuggestions;
-  const renderStrategyProfile =
-    showStrategyProfile && shouldShowStrategyProfile(responseIntent) && strategyProfile;
   const t = getUiCopy(language);
   const { showToast } = useToast();
 
@@ -2882,6 +3660,66 @@ function StrategyMessage({
       </Dialog>
     );
   };
+  const reasoningNodes = message.reasoningSummaries.map((reasoning) => {
+    const isStreaming = reasoning.state === "streaming";
+    return (
+      <Reasoning
+        className="mb-2"
+        defaultOpen={false}
+        isStreaming={isStreaming}
+        key={reasoning.id}
+      >
+        <ReasoningTrigger
+          className="inline-flex h-8 max-w-full items-center gap-2 rounded-[4px] border border-border/70 bg-muted/20 px-3 text-muted-foreground text-sm"
+          getThinkingMessage={() => (
+            <span>{isStreaming ? t.slowProviderInitialTitle : t.modelReasoningTitle}</span>
+          )}
+        />
+        <ReasoningContent className="mt-2 text-muted-foreground text-sm">
+          {reasoning.text}
+        </ReasoningContent>
+      </Reasoning>
+    );
+  });
+  const normalBacktestReport = backtestReport?.kind === "report" ? backtestReport : null;
+  const backtestResultNode =
+    message.role === "assistant" && (normalBacktestReport || (hasDashboardArtifact && inlineTables.length === 0)) ? (
+      <BacktestResultInlineCard
+        previewSummary={dashboardPreviewSummary}
+        onBuildRobustness={() =>
+          void onSuggestionSubmit({
+            text:
+              actionToolPrompt("build_robustness_report", actionRegistry) ??
+              "Build a review-only robustness report for the current preview evidence. Summarize sample size, fees, slippage, drawdown, OOS concerns, and suspicious metrics.",
+          })
+        }
+        onOpenDashboard={onViewArtifactWorkspace}
+        onShowTrades={() =>
+          void onSuggestionSubmit({
+            text:
+              actionToolPrompt("query_backtest_trades", actionRegistry) ??
+              "Show me the trades for the latest completed backtest.",
+          })
+        }
+        report={normalBacktestReport}
+      />
+    ) : null;
+  const backtestReportNode =
+    message.role === "assistant" && backtestReport && backtestReport.kind !== "report" ? (
+      <BacktestReportCard
+        isSubmittingFeedback={false}
+        onFeedback={async () => undefined}
+        report={backtestReport}
+      />
+    ) : null;
+  const inlineTableNodes =
+    message.role === "assistant"
+      ? inlineTables.map((table, index) => (
+          <ChatInlineTableCard key={`${table.kind}-${table.run_id ?? "run"}-${index}`} table={table} />
+        ))
+      : [];
+  const suppressArtifactCard =
+    hasDashboardArtifact && (Boolean(backtestResultNode) || inlineTables.length > 0);
 
   return (
     <>
@@ -2923,67 +3761,60 @@ function StrategyMessage({
           </SourcesContent>
         </Sources>
       )}
-      <MessageContent className="rounded-[4px] border border-border bg-background px-4 py-3">
-        {message.parts.map((part, index) => {
-          if (part.type === "text") {
-            return (
-              <MessageMarkdown
-                content={part.text}
-                key={`${message.id}-${index}`}
-                linkSafety={{
-                  enabled: true,
-                  renderModal: renderExternalLinkModal,
-                }}
-              />
-            );
-          }
-          if (part.type === "reasoning") {
-            const reasoning = reasoningPartText(part);
-            if (!reasoning) {
-              return null;
-            }
-            const isStreaming = part.state === "streaming";
-            return (
-              <Reasoning
-                className="mb-3 rounded-[4px] border border-border/70 bg-muted/25 px-3 py-2"
-                defaultOpen={false}
-                isStreaming={isStreaming}
-                key={`${message.id}-${index}`}
-              >
-                <ReasoningTrigger
-                  getThinkingMessage={() => (
-                    <span>{isStreaming ? t.slowProviderInitialTitle : t.modelReasoningTitle}</span>
-                  )}
-                />
-                <ReasoningContent className="mt-2">{reasoning}</ReasoningContent>
-              </Reasoning>
-            );
-          }
-          return null;
-        })}
-        {message.role === "assistant" && marketSnapshot && (
-          <MarketSnapshotCard language={language} snapshot={marketSnapshot} />
-        )}
-        {renderStrategyProfile && (
-          <div className="mt-4 space-y-3 border-border border-t pt-4">
-            <StrategyBriefCard language={language} profile={strategyProfile} />
-            {message.role === "assistant" && (
-              <>
-                <StrategySnapshotCard language={language} profile={strategyProfile} />
-              </>
-            )}
-          </div>
-        )}
-      </MessageContent>
-      {message.role === "assistant" && suggestions.length > 0 && (
+      {text ? (
+        <MessageContent className="rounded-[4px] border border-border bg-background px-4 py-3">
+          <MessageMarkdown
+            content={text}
+            linkSafety={{
+              enabled: true,
+              renderModal: renderExternalLinkModal,
+            }}
+          />
+          {reasoningNodes}
+          {message.role === "assistant" && marketSnapshot && (
+            <MarketSnapshotCard language={language} snapshot={marketSnapshot} />
+          )}
+          {inlineTableNodes.map((node, index) => (
+            <div className="mt-4" key={index}>
+              {node}
+            </div>
+          ))}
+          {backtestResultNode && <div className="mt-4">{backtestResultNode}</div>}
+          {backtestReportNode && <div className="mt-4">{backtestReportNode}</div>}
+        </MessageContent>
+      ) : (
+        <>
+          {isTransient && waitingSlowState && (
+          <FirstTokenLoader slowState={waitingSlowState} />
+          )}
+          {reasoningNodes}
+          {message.role === "assistant" && marketSnapshot && (
+            <MarketSnapshotCard language={language} snapshot={marketSnapshot} />
+          )}
+          {inlineTableNodes}
+          {backtestResultNode}
+          {backtestReportNode}
+        </>
+      )}
+      {!isTransient && message.role === "assistant" && artifact && !suppressArtifactCard && (
+        <ArtifactTranscriptCard
+          artifact={artifact}
+          artifactCount={artifactCount}
+          language={language}
+          onOpen={onViewArtifactWorkspace}
+        />
+      )}
+      {!isTransient && message.role === "assistant" && suggestions.length > 0 && (
         <SuggestionRail
+          actionRegistry={actionRegistry}
           disabled={actionState.kind === "loading"}
+          onOpenCreateSpec={onOpenCreateSpec}
           onSubmit={onSuggestionSubmit}
           onViewArtifactWorkspace={onViewArtifactWorkspace}
           suggestions={suggestions}
         />
       )}
-      {message.role === "assistant" && (
+      {!isTransient && message.role === "assistant" && (
         <div className="space-y-1">
           <MessageActions>
             <MessageAction
@@ -3080,17 +3911,154 @@ function StrategyMessage({
   );
 }
 
+function ChatInlineTableCard({ table }: { table: ChatInlineTable }) {
+  if (table.kind !== "backtest_trades" || table.rows.length === 0) {
+    return null;
+  }
+  return (
+    <section className="overflow-hidden rounded-[6px] border border-border bg-[#101416] text-foreground">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-border border-b px-3 py-2">
+        <div className="min-w-0">
+          <p className="font-semibold text-sm">{table.title}</p>
+        </div>
+        <span className="rounded-full bg-muted px-2 py-1 font-medium text-[10px] uppercase tracking-wide">
+          {table.row_count ?? table.rows.length} rows
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-[760px] w-full border-collapse text-left text-xs">
+          <thead>
+            <tr className="border-border border-b text-muted-foreground">
+              {table.columns.map((column) => (
+                <th
+                  className={cn(
+                    "whitespace-nowrap px-3 py-2 font-medium",
+                    column.align === "right" && "text-right"
+                  )}
+                  key={column.key}
+                  scope="col"
+                >
+                  {column.label}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {table.rows.map((row, rowIndex) => (
+              <tr className="border-border/60 border-b last:border-b-0" key={rowIndex}>
+                {table.columns.map((column) => (
+                  <td
+                    className={cn(
+                      "whitespace-nowrap px-3 py-2 align-middle",
+                      column.align === "right" && "text-right",
+                      tableCellClass(column, row[column.key])
+                    )}
+                    key={column.key}
+                  >
+                    {formatInlineTableCell(column, row[column.key])}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {table.truncated ? (
+        <div className="border-border border-t px-3 py-2 text-muted-foreground text-xs">
+          Showing the first {table.rows.length} rows.
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function tableCellClass(column: ChatInlineTable["columns"][number], value: unknown) {
+  if (column.tone === "profit_loss") {
+    const numeric = typeof value === "number" ? value : Number(value);
+    if (Number.isFinite(numeric)) {
+      return numeric < 0 ? "font-semibold text-[#ff4050]" : "font-semibold text-[#00bfa5]";
+    }
+  }
+  if (column.tone === "side" && typeof value === "string") {
+    const side = value.toLowerCase();
+    if (side === "long") {
+      return "font-medium text-[#00bfa5]";
+    }
+    if (side === "short") {
+      return "font-medium text-[#ff4050]";
+    }
+  }
+  return "";
+}
+
+function formatInlineTableCell(column: ChatInlineTable["columns"][number], value: unknown) {
+  if (value === null || value === undefined || value === "") {
+    return "N/A";
+  }
+  if (column.key === "bucket" && typeof value === "string") {
+    return value.replaceAll("_", " ");
+  }
+  if (column.key === "pnl_cost") {
+    return formatSignedNumber(value, { maximumFractionDigits: 2 });
+  }
+  if (column.key === "pnl_percentage") {
+    const formatted = formatSignedNumber(value, { maximumFractionDigits: 2 });
+    return formatted === "N/A" ? formatted : `${formatted}%`;
+  }
+  if (column.key === "opened_at" || column.key === "closed_at") {
+    return formatCompactTimestamp(value);
+  }
+  if (typeof value === "number") {
+    return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  }
+  return String(value);
+}
+
+function formatSignedNumber(value: unknown, options: Intl.NumberFormatOptions = {}) {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return "N/A";
+  }
+  return numeric.toLocaleString(undefined, {
+    maximumFractionDigits: options.maximumFractionDigits ?? 2,
+    minimumFractionDigits: options.minimumFractionDigits,
+    signDisplay: "always",
+  });
+}
+
+function formatCompactTimestamp(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) {
+    return "N/A";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "short",
+  }).format(parsed);
+}
+
 function SuggestionRail({
+  actionRegistry,
   disabled,
+  onOpenCreateSpec,
   onSubmit,
   onViewArtifactWorkspace,
   suggestions,
 }: {
+  actionRegistry: ActionRegistryLookup;
   disabled: boolean;
+  onOpenCreateSpec: () => void;
   onSubmit: (message: { text: string }) => Promise<void>;
   onViewArtifactWorkspace: () => void;
   suggestions: ChatSuggestionItem[];
 }) {
+  const [pendingSuggestionId, setPendingSuggestionId] = useState<string | null>(null);
+  const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const visibleSuggestions = suggestions
     .filter((suggestion) => suggestion.kind !== "composer_block")
     .sort((left, right) => left.priority - right.priority)
@@ -3100,33 +4068,288 @@ function SuggestionRail({
     return null;
   }
 
-  const runSuggestion = (suggestion: ChatSuggestionItem) => {
-    if (suggestion.action === "open_artifact") {
-      onViewArtifactWorkspace();
+  const runSuggestion = async (suggestion: ChatSuggestionItem) => {
+    if (disabled || pendingSuggestionId || isSuggestionUnavailable(suggestion, actionRegistry)) {
       return;
     }
-    if (suggestion.action === "send_prompt" && suggestion.prompt) {
-      void onSubmit({ text: suggestion.prompt });
+    setPendingSuggestionId(suggestion.id);
+    setActionFeedback(null);
+    if (suggestion.action === "open_artifact") {
+      try {
+        onViewArtifactWorkspace();
+        setActionFeedback("Artifact workspace opened.");
+      } finally {
+        setPendingSuggestionId(null);
+      }
+      return;
     }
+    if (suggestion.action === "open_create_spec") {
+      try {
+        onOpenCreateSpec();
+        setActionFeedback("Create review artifact opened.");
+      } finally {
+        setPendingSuggestionId(null);
+      }
+      return;
+    }
+    if (suggestion.action === "insert_or_update_block" && suggestion.slot && suggestion.insert_template) {
+      try {
+        window.dispatchEvent(
+          new CustomEvent("strategy:insert-composer-block", {
+            detail: { slot: suggestion.slot, template: suggestion.insert_template },
+          })
+        );
+        setActionFeedback(`Added ${readableKey(suggestion.slot)} block.`);
+      } finally {
+        setPendingSuggestionId(null);
+      }
+      return;
+    }
+    const prompt = suggestionPromptText(suggestion, actionRegistry);
+    if (suggestion.action === "send_prompt" && prompt) {
+      try {
+        await onSubmit({ text: prompt });
+        setActionFeedback(`${suggestion.label} started.`);
+      } finally {
+        setPendingSuggestionId(null);
+      }
+      return;
+    }
+    setActionFeedback(suggestion.disabled_reason ?? "This action needs more context first.");
+    setPendingSuggestionId(null);
   };
 
   return (
-    <div className="flex flex-wrap gap-2 pt-1">
-      {visibleSuggestions.map((suggestion) => (
-        <Button
-          className="h-8 rounded-[4px] text-xs normal-case"
-          disabled={disabled || suggestion.enabled === false}
-          key={suggestion.id}
-          onClick={() => runSuggestion(suggestion)}
-          title={suggestion.disabled_reason}
-          type="button"
-          variant="outline"
-        >
-          {suggestion.label}
-        </Button>
-      ))}
+    <div className="space-y-2 pt-1">
+      <div className="flex flex-wrap gap-2">
+        {visibleSuggestions.map((suggestion) => (
+          isActionAwareSuggestion(suggestion) ? (
+            <ActionAwarenessCard
+              actionRegistry={actionRegistry}
+              disabled={disabled}
+              key={suggestion.id}
+              onRun={runSuggestion}
+              pending={pendingSuggestionId === suggestion.id}
+              suggestion={suggestion}
+            />
+          ) : (
+            <Button
+              className="h-8 rounded-[4px] text-xs normal-case"
+              disabled={disabled || pendingSuggestionId !== null || isSuggestionUnavailable(suggestion, actionRegistry)}
+              key={suggestion.id}
+              onClick={() => void runSuggestion(suggestion)}
+              title={suggestionTitle(suggestion, actionRegistry)}
+              type="button"
+              variant="outline"
+            >
+              {pendingSuggestionId === suggestion.id ? "Starting..." : suggestion.label}
+            </Button>
+          )
+        ))}
+      </div>
+      {actionFeedback ? (
+        <p className="text-muted-foreground text-xs">{actionFeedback}</p>
+      ) : null}
     </div>
   );
+}
+
+function ActionAwarenessCard({
+  actionRegistry,
+  disabled,
+  onRun,
+  pending,
+  suggestion,
+}: {
+  actionRegistry: ActionRegistryLookup;
+  disabled: boolean;
+  onRun: (suggestion: ChatSuggestionItem) => Promise<void>;
+  pending: boolean;
+  suggestion: ChatSuggestionItem;
+}) {
+  const requiredInputs = suggestion.required_inputs ?? [];
+  const displayLabel =
+    suggestion.label || actionToolLabel(suggestion.tool_id, actionRegistry) || "Action";
+  const blocked =
+    suggestion.enabled === false ||
+    suggestion.risk_level === "blocked" ||
+    isSuggestionUnavailable(suggestion, actionRegistry);
+  return (
+    <button
+      className={cn(
+        "min-w-[220px] max-w-sm flex-1 rounded-[6px] border border-border bg-background p-3 text-left transition hover:border-foreground/30",
+        !(disabled || blocked || pending) && "cursor-pointer",
+        (disabled || blocked || pending) && "cursor-not-allowed opacity-65 hover:border-border"
+      )}
+      disabled={disabled || blocked || pending}
+      onClick={() => void onRun(suggestion)}
+      title={suggestionTitle(suggestion, actionRegistry)}
+      type="button"
+    >
+      <div className="flex items-start gap-2">
+        <span className="mt-0.5 rounded-[4px] border border-border bg-muted p-1 text-muted-foreground">
+          {renderSuggestionIcon(suggestion)}
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 flex-1 truncate font-medium text-sm">{displayLabel}</span>
+            {suggestion.risk_level && (
+              <span className={cn("shrink-0 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wide", riskBadgeClass(suggestion.risk_level))}>
+                {riskLabel(suggestion.risk_level)}
+              </span>
+            )}
+            {pending && (
+              <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+                Working...
+              </span>
+            )}
+          </span>
+          {suggestion.reason && (
+            <span className="mt-1 block text-muted-foreground text-xs leading-5">
+              {suggestion.reason}
+            </span>
+          )}
+          {requiredInputs.length > 0 && (
+            <span className="mt-2 flex flex-wrap gap-1">
+              {requiredInputs.map((input) => (
+                <span
+                  className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
+                  key={input}
+                >
+                  {readableKey(input)}
+                </span>
+              ))}
+            </span>
+          )}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function isSuggestionUnavailable(
+  suggestion: ChatSuggestionItem,
+  actionRegistry?: ActionRegistryLookup
+) {
+  if (suggestion.enabled === false) {
+    return true;
+  }
+  if (suggestion.action === "send_prompt") {
+    return !suggestionPromptText(suggestion, actionRegistry);
+  }
+  if (suggestion.action === "insert_or_update_block") {
+    return !suggestion.slot || !suggestion.insert_template;
+  }
+  return false;
+}
+
+function isCodeArtifact(artifact: Artifact) {
+  return artifact.presentation.user_kind === "code";
+}
+
+function suggestionTitle(suggestion: ChatSuggestionItem, actionRegistry?: ActionRegistryLookup) {
+  if (suggestion.disabled_reason) {
+    return suggestion.disabled_reason;
+  }
+  if (suggestion.action === "send_prompt" && suggestion.prompt === "[REDACTED]") {
+    return toolActionPrompt(suggestion, actionRegistry) ?? suggestion.label;
+  }
+  return suggestion.reason ?? suggestion.label;
+}
+
+function suggestionPromptText(
+  suggestion: ChatSuggestionItem,
+  actionRegistry?: ActionRegistryLookup
+) {
+  if (suggestion.action !== "send_prompt") {
+    return null;
+  }
+  if (suggestion.prompt && suggestion.prompt !== "[REDACTED]") {
+    return suggestion.prompt;
+  }
+  return toolActionPrompt(suggestion, actionRegistry);
+}
+
+function toolActionPrompt(
+  suggestion: ChatSuggestionItem,
+  actionRegistry?: ActionRegistryLookup
+) {
+  return actionToolPrompt(suggestion.tool_id, actionRegistry);
+}
+
+function isActionAwareSuggestion(suggestion: ChatSuggestionItem) {
+  return Boolean(
+    suggestion.reason ||
+      suggestion.risk_level ||
+      suggestion.tool_id ||
+      suggestion.artifact_kind ||
+      suggestion.next_state ||
+      suggestion.required_inputs?.length
+  );
+}
+
+function renderSuggestionIcon(suggestion: ChatSuggestionItem) {
+  const iconKey = suggestion.presentation?.icon_key;
+  if (iconKey === "search") {
+    return <Search className="size-3.5" />;
+  }
+  if (iconKey === "play") {
+    return <Play className="size-3.5" />;
+  }
+  if (iconKey === "gauge") {
+    return <Gauge className="size-3.5" />;
+  }
+  if (iconKey === "checklist" || iconKey === "list") {
+    return <ListChecks className="size-3.5" />;
+  }
+  if (iconKey === "file_code") {
+    return <FileCode2 className="size-3.5" />;
+  }
+  if (iconKey === "globe") {
+    return <Globe2 className="size-3.5" />;
+  }
+  if (suggestion.tool_id === "market_research") {
+    return <Search className="size-3.5" />;
+  }
+  if (suggestion.tool_id === "run_backtest_preview" || suggestion.tool_id === "run_backtest_variant_lab") {
+    return <Play className="size-3.5" />;
+  }
+  if (suggestion.tool_id === "run_risk_gate" || suggestion.tool_id === "create_proposed_intent") {
+    return <Gauge className="size-3.5" />;
+  }
+  if (suggestion.tool_id === "build_robustness_report") {
+    return <ListChecks className="size-3.5" />;
+  }
+  if (suggestion.category === "code") {
+    return <FileCode2 className="size-3.5" />;
+  }
+  if (suggestion.category === "market") {
+    return <Globe2 className="size-3.5" />;
+  }
+  if (suggestion.category === "risk") {
+    return <Gauge className="size-3.5" />;
+  }
+  return <ListChecks className="size-3.5" />;
+}
+
+function riskBadgeClass(riskLevel: NonNullable<ChatSuggestionItem["risk_level"]>) {
+  if (riskLevel === "blocked") {
+    return "bg-red-500/10 text-red-700 dark:text-red-300";
+  }
+  if (riskLevel === "review_required") {
+    return "bg-amber-500/10 text-amber-700 dark:text-amber-300";
+  }
+  return "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+}
+
+function riskLabel(riskLevel: NonNullable<ChatSuggestionItem["risk_level"]>) {
+  if (riskLevel === "read_only") {
+    return "read only";
+  }
+  if (riskLevel === "review_required") {
+    return "review";
+  }
+  return "blocked";
 }
 
 function StrategyBriefCard({
@@ -3270,7 +4493,9 @@ function MiniPriceContext({ points }: { points: Array<{ label: string; value: nu
     })
     .join(" ");
   const areaPath = `${linePath} L 100 38 L 0 38 Z`;
-  const isUp = points.at(-1)!.value >= points[0]!.value;
+  const startValue = points[0]!.value;
+  const endValue = points.at(-1)!.value;
+  const isUp = endValue >= startValue;
   const chartColor = isUp ? "rgb(110 231 183)" : "rgb(253 164 175)";
   return (
     <div className="border-border/70 border-t px-3 py-3">
@@ -3293,9 +4518,8 @@ function MiniPriceContext({ points }: { points: Array<{ label: string; value: nu
         />
       </svg>
       <div className="mt-2 flex items-center justify-between font-mono text-[10px] text-muted-foreground">
-        <span>{formatCompactPrice(min)}</span>
-        <span>{points.length} points</span>
-        <span>{formatCompactPrice(max)}</span>
+        <span>{formatCompactPrice(startValue)}</span>
+        <span>{formatCompactPrice(endValue)}</span>
       </div>
     </div>
   );
@@ -3396,12 +4620,6 @@ function LedgerSection({ title, values }: { title: string; values: string[] }) {
   );
 }
 
-function reasoningPartText(part: UIMessage["parts"][number]) {
-  const record = part as { text?: unknown; content?: unknown; reasoning?: unknown };
-  const value = record.text ?? record.content ?? record.reasoning;
-  return typeof value === "string" ? value.trim() : "";
-}
-
 function mergeMessageSources(
   primarySources: ChatMessageSource[],
   fallbackSources: ChatMessageSource[]
@@ -3486,70 +4704,35 @@ function responseIntentFromRunEvents(events: RunEvent[]): ResponseIntent | null 
   return null;
 }
 
+function preferredArtifactKindFromRunEvents(events: RunEvent[]): string | null {
+  for (const event of [...events].reverse()) {
+    if (event.type !== "tool.completed" && event.type !== "tool.started") {
+      continue;
+    }
+    const payload = event.payload;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      continue;
+    }
+    const toolId = (payload as Record<string, unknown>).tool_id;
+    if (toolId === "build_robustness_report") {
+      return "robustness_report";
+    }
+    return null;
+  }
+  return null;
+}
+
 function marketSnapshotFromRunEvents(events: RunEvent[]): MarketSnapshot | null {
   for (const event of [...events].reverse()) {
     if (event.type !== "chat.market_snapshot") {
       continue;
     }
-    const snapshot = marketSnapshotFromUnknown(event.payload);
+    const snapshot = marketSnapshotFromPayload(event.payload);
     if (snapshot) {
       return snapshot;
     }
   }
   return null;
-}
-
-function marketSnapshotFromUnknown(value: unknown): MarketSnapshot | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return null;
-  }
-  const record = value as Record<string, unknown>;
-  const symbol = sourceText(record.symbol);
-  const label = sourceText(record.label);
-  const sourceItems = Array.isArray(record.sources) ? record.sources : [];
-  const sources = sourceItems
-    .map((item) => chatMessageSourceFromUnknown(item))
-    .filter((source): source is ChatMessageSource => Boolean(source));
-  if (!symbol || !label || sources.length === 0) {
-    return null;
-  }
-  return {
-    approximate: record.approximate === true,
-    change: numberFromUnknown(record.change),
-    change_percent: numberFromUnknown(record.change_percent),
-    currency: sourceText(record.currency) ?? null,
-    freshness: "source_backed",
-    generated_at: sourceText(record.generated_at) ?? null,
-    label,
-    price: sourceText(record.price) ?? null,
-    price_points: pricePointsFromUnknown(record.price_points),
-    provider: sourceText(record.provider) ?? null,
-    source_count: typeof record.source_count === "number" ? record.source_count : sources.length,
-    sources,
-    symbol,
-  };
-}
-
-function numberFromUnknown(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function pricePointsFromUnknown(value: unknown): Array<{ label: string; value: number }> {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.flatMap((item) => {
-    if (!item || typeof item !== "object" || Array.isArray(item)) {
-      return [];
-    }
-    const record = item as Record<string, unknown>;
-    const label = sourceText(record.label);
-    const numericValue = record.value;
-    if (!label || typeof numericValue !== "number" || !Number.isFinite(numericValue)) {
-      return [];
-    }
-    return [{ label, value: numericValue }];
-  });
 }
 
 function chatMessageSourceFromUnknown(value: unknown): ChatMessageSource | null {
@@ -3580,24 +4763,63 @@ function sourceText(value: unknown): string | undefined {
   return text || undefined;
 }
 
+function ArtifactTranscriptCard({
+  artifact,
+  artifactCount,
+  language,
+  onOpen,
+}: {
+  artifact: Artifact;
+  artifactCount: number;
+  language: UiLanguagePreference;
+  onOpen: () => void;
+}) {
+  const t = getUiCopy(language);
+  const artifactSummary = getArtifactUserSummary(artifact, language);
+
+  return (
+    <button
+      className="group relative mt-3 flex w-full cursor-pointer items-center gap-4 overflow-hidden rounded-[8px] border border-border bg-background px-4 py-3 text-left transition hover:border-foreground/30 hover:bg-muted/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      onClick={onOpen}
+      type="button"
+    >
+      <span className="flex size-9 shrink-0 items-center justify-center rounded-[6px] border border-border bg-muted/40">
+        {artifactSummary ? (
+          <ArtifactKindIcon kind={artifactSummary.kind} />
+        ) : (
+          <PanelRight className="size-4 text-muted-foreground" />
+        )}
+      </span>
+      <span className="min-w-0 flex-1 pr-16">
+        <span className="block truncate font-medium text-sm">{artifact.display_name}</span>
+        <span className="mt-0.5 block truncate text-muted-foreground text-xs">
+          {artifactCount > 1
+            ? `${artifactSummary?.label ?? t.artifactReady} · ${artifactCount} ${t.artifacts}`
+            : artifactSummary?.label ?? t.artifactReady}
+        </span>
+      </span>
+      <FileText
+        className="-right-2 -top-3 absolute hidden size-20 rotate-[-8deg] text-muted-foreground/70 transition group-hover:rotate-[-4deg] group-hover:text-muted-foreground sm:block"
+        strokeWidth={1.35}
+      />
+    </button>
+  );
+}
+
 function AssistantActivity({
   activities,
-  artifact,
   isWorking,
   language,
-  onViewArtifactWorkspace,
-  showArtifactWorkspace,
+  onSelectArtifact,
 }: {
   activities: ChatActivity[];
-  artifact: Artifact | null;
   isWorking: boolean;
   language: UiLanguagePreference;
-  onViewArtifactWorkspace: () => void;
-  showArtifactWorkspace: boolean;
+  onSelectArtifact?: (artifactId: string) => void;
 }) {
   const [activityOpen, setActivityOpen] = useState(false);
   const elapsedSeconds = useElapsedSeconds(isWorking);
-  if (!isWorking && activities.length === 0 && (!artifact || showArtifactWorkspace)) {
+  if (!isWorking && activities.length === 0) {
     return null;
   }
 
@@ -3652,33 +4874,28 @@ function AssistantActivity({
                       errorText={activity.errorText}
                       output={activity.output}
                     />
+                    {activity.artifactLinks && activity.artifactLinks.length > 0 ? (
+                      <div className="flex flex-wrap gap-2">
+                        {activity.artifactLinks.map((link) => (
+                          <Button
+                            className="h-7 rounded-[4px] px-2 text-[11px] uppercase tracking-[0.08em]"
+                            key={`${activity.id}-${link.artifactId}`}
+                            onClick={() => onSelectArtifact?.(link.artifactId)}
+                            size="sm"
+                            type="button"
+                            variant="outline"
+                          >
+                            {link.label}
+                          </Button>
+                        ))}
+                      </div>
+                    ) : null}
                   </ToolContent>
                 </Tool>
               ))}
             </div>
           )}
         </div>
-      )}
-      {artifact && !showArtifactWorkspace && (
-        <AiArtifact className="rounded-[4px]">
-          <ArtifactHeader>
-            <div className="min-w-0">
-              <ArtifactTitle className="truncate">{artifact.display_name}</ArtifactTitle>
-              <ArtifactDescription>{getUiCopy(language).reviewArtifactReady}.</ArtifactDescription>
-            </div>
-            <ArtifactActions>
-              <ArtifactAction
-                icon={PanelRight}
-                label={getUiCopy(language).viewArtifact}
-                onClick={onViewArtifactWorkspace}
-                tooltip={getUiCopy(language).viewArtifact}
-              />
-            </ArtifactActions>
-          </ArtifactHeader>
-          <ArtifactContent className="py-3 text-muted-foreground text-sm">
-            {getUiCopy(language).artifactReadyDescription}
-          </ArtifactContent>
-        </AiArtifact>
       )}
     </div>
   );
@@ -3746,742 +4963,519 @@ function MobileConversationBar({
   );
 }
 
-function ArtifactWorkspacePanel({
+type PendingBacktestApproval = {
+  approvalId: string;
+  boundary: string | null;
+  symbol: string | null;
+  timeframe: string | null;
+};
+
+function BacktestApprovalPanel({
+  approval,
+  disabled,
+  onDecision,
+}: {
+  approval: PendingBacktestApproval;
+  disabled: boolean;
+  onDecision: (decision: "approved" | "rejected") => Promise<void>;
+}) {
+  return (
+    <div className="space-y-2">
+      <BacktestPreviewHitlCard
+        approveLabel="Approve & run"
+        disabled={disabled}
+        onRespond={(response) => {
+          const approved =
+            response &&
+            typeof response === "object" &&
+            "approved" in response &&
+            (response as { approved?: unknown }).approved === true;
+          void onDecision(approved ? "approved" : "rejected");
+        }}
+        rejectLabel="Skip preview"
+        status="inProgress"
+        symbol={approval.symbol ?? undefined}
+        timeframe={approval.timeframe ?? undefined}
+      />
+      <p className="px-1 text-muted-foreground text-xs">
+        {approval.boundary ??
+          "Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, or a profitability claim."}
+      </p>
+    </div>
+  );
+}
+
+function BacktestRunStatusPanel({ status }: { status: BacktestLiveStatus | null }) {
+  if (!status || status.status === "completed") {
+    return null;
+  }
+  const progress = Math.max(0, Math.min(100, status.progressPct));
+  const windowProgress =
+    status.fetchWindowsCompleted !== null &&
+    status.fetchWindowsTotal !== null &&
+    status.fetchWindowsTotal > 0
+      ? `${status.fetchWindowsCompleted}/${status.fetchWindowsTotal} windows`
+      : null;
+  return (
+    <section className="rounded-[6px] border border-border/70 bg-background/70 p-3 text-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-medium text-foreground">{backtestLiveStageLabel(status)}</p>
+          <p className="mt-1 text-muted-foreground text-xs">{status.message}</p>
+        </div>
+        <span
+          className={cn(
+            "shrink-0 rounded-[4px] border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.08em]",
+            status.status === "failed" && "border-red-500/40 bg-red-500/10 text-red-300",
+            status.status !== "failed" && "border-border bg-secondary text-muted-foreground"
+          )}
+        >
+          {status.status}
+        </span>
+      </div>
+      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full bg-[var(--together-accent-blue)] transition-[width] duration-300"
+          style={{ width: `${progress}%` }}
+        />
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground text-xs">
+        <span>{progress}%</span>
+        {status.elapsedMs !== null && <span>Elapsed {formatDurationMs(status.elapsedMs)}</span>}
+        {status.etaMs !== null && status.etaMs > 0 && <span>ETA {formatDurationMs(status.etaMs)}</span>}
+        {windowProgress && <span>{windowProgress}</span>}
+        {status.isStale && <span className="text-amber-300">Status heartbeat delayed</span>}
+      </div>
+      <p className="mt-2 border-border/70 border-t pt-2 text-muted-foreground text-xs">
+        Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, or a profitability claim.
+      </p>
+    </section>
+  );
+}
+
+function pendingBacktestApprovalFromRunEvents(events: RunEvent[]): PendingBacktestApproval | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (
+      event.type === "backtest.preview.approved" ||
+      event.type === "backtest.preview.rejected" ||
+      event.type === "backtest.preview.queued" ||
+      event.type === "backtest.preview.failed"
+    ) {
+      return null;
+    }
+    if (event.type !== "backtest.preview.approval_required") {
+      continue;
+    }
+    const payload = runEventPayload(event);
+    const approvalId = stringFromPayload(payload, "approval_id");
+    if (!approvalId) {
+      return null;
+    }
+    return {
+      approvalId,
+      boundary: stringFromPayload(payload, "boundary"),
+      symbol: stringFromPayload(payload, "symbol"),
+      timeframe: stringFromPayload(payload, "timeframe"),
+    };
+  }
+  return null;
+}
+
+function backtestSummaryRunIdsByAnchorMessage({
+  backendMessages,
+  events,
+}: {
+  backendMessages: BackendMessage[];
+  events: RunEvent[];
+}) {
+  const grouped = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "tool.completed") {
+      continue;
+    }
+    const payload = runEventPayload(event);
+    if (payload.tool_id !== "get_backtest_summary") {
+      continue;
+    }
+    const output = payload.output;
+    const runId =
+      output && typeof output === "object" && !Array.isArray(output)
+        ? stringFromPayload(output as Record<string, unknown>, "run_id") ??
+          stringFromPayload(
+            ((output as Record<string, unknown>).summary as Record<string, unknown>) ?? {},
+            "run_id"
+          )
+        : null;
+    if (!runId) {
+      continue;
+    }
+    const anchorId = runEventAssistantAnchorMessageId({ backendMessages, event });
+    if (anchorId) {
+      grouped.set(anchorId, runId);
+    }
+  }
+  return grouped;
+}
+
+function runEventAssistantAnchorMessageId({
+  backendMessages,
+  event,
+}: {
+  backendMessages: BackendMessage[];
+  event: RunEvent;
+}) {
+  const eventTime = Date.parse(event.created_at);
+  if (!Number.isFinite(eventTime)) {
+    return null;
+  }
+  const sortedMessages = [...backendMessages].sort(
+    (left, right) => Date.parse(left.created_at) - Date.parse(right.created_at)
+  );
+  for (const message of sortedMessages) {
+    const messageTime = Date.parse(message.created_at);
+    if (!Number.isFinite(messageTime) || messageTime < eventTime) {
+      continue;
+    }
+    return message.role === "assistant" ? message.id : null;
+  }
+  return null;
+}
+
+function backtestResultArtifactsByRunId(artifacts: Artifact[]) {
+  const grouped = new Map<string, Artifact[]>();
+  for (const artifact of artifacts) {
+    if (
+      artifact.presentation.viewer_kind !== "backtest_dashboard" &&
+      artifact.presentation.viewer_kind !== "backtest_report"
+    ) {
+      continue;
+    }
+    if (!artifact.run_id) {
+      continue;
+    }
+    grouped.set(artifact.run_id, [...(grouped.get(artifact.run_id) ?? []), artifact]);
+  }
+  return grouped;
+}
+
+function dedupeArtifactsById(artifacts: Artifact[]) {
+  const seen = new Set<string>();
+  return artifacts.filter((artifact) => {
+    if (seen.has(artifact.id)) {
+      return false;
+    }
+    seen.add(artifact.id);
+    return true;
+  });
+}
+
+function backtestApprovalDecisionLocalEvents({
+  approvalId,
+  childRunId,
+  conversationId,
+  decision,
+  sourceRunId,
+}: {
+  approvalId: string;
+  childRunId: string | null;
+  conversationId: string;
+  decision: "approved" | "rejected";
+  sourceRunId: string;
+}): RunEvent[] {
+  const createdAt = new Date().toISOString();
+  const status = decision === "approved" ? "approved" : "rejected";
+  const decisionEvent: RunEvent = {
+    conversation_id: conversationId,
+    created_at: createdAt,
+    event_id: `local-backtest-preview-${status}-${approvalId}`,
+    payload: { approval_id: approvalId, status },
+    request_id: null,
+    run_id: sourceRunId,
+    sequence: Number.MAX_SAFE_INTEGER - 2,
+    trace_id: null,
+    type: decision === "approved" ? "backtest.preview.approved" : "backtest.preview.rejected",
+  };
+  if (decision !== "approved" || !childRunId) {
+    return [decisionEvent];
+  }
+  return [
+    decisionEvent,
+    {
+      conversation_id: conversationId,
+      created_at: createdAt,
+      event_id: `local-backtest-preview-queued-${approvalId}`,
+      payload: { approval_id: approvalId, child_run_id: childRunId, status: "queued" },
+      request_id: null,
+      run_id: sourceRunId,
+      sequence: Number.MAX_SAFE_INTEGER - 1,
+      trace_id: null,
+      type: "backtest.preview.queued",
+    },
+    {
+      conversation_id: conversationId,
+      created_at: createdAt,
+      event_id: `local-backtest-waiting-${childRunId}`,
+      payload: {
+        approval_id: approvalId,
+        child_run_id: childRunId,
+        message: "Waiting for the preview evidence to finish.",
+      },
+      request_id: null,
+      run_id: sourceRunId,
+      sequence: Number.MAX_SAFE_INTEGER,
+      trace_id: null,
+      type: "chat.auto_chain.waiting_for_backtest",
+    },
+  ];
+}
+
+function runEventPayload(event: RunEvent): Record<string, unknown> {
+  return event.payload && typeof event.payload === "object" && !Array.isArray(event.payload)
+    ? event.payload
+    : {};
+}
+
+function stringFromPayload(payload: Record<string, unknown>, key: string): string | null {
+  const value = payload[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function formatDurationMs(value: number): string {
+  const seconds = Math.max(0, Math.round(value / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function ArtifactDrawerPanel({
   artifacts,
   authKey,
-  cancelRun,
   client,
-  events,
+  hasOlderArtifacts = false,
+  isLoadingOlderArtifacts = false,
   language,
+  onBacktestQueued,
   onClose,
-  retryRun,
-  run,
-  strategyProfile,
+  onLoadOlderArtifacts,
+  open,
+  preferredArtifactKind,
+  runEvents,
 }: {
   artifacts: Artifact[];
   authKey: string;
-  cancelRun: (runId: string) => void;
   client: BackendClient;
-  events: RunEvent[];
+  hasOlderArtifacts?: boolean;
+  isLoadingOlderArtifacts?: boolean;
   language: UiLanguagePreference;
+  onBacktestQueued?: (payload: {
+    childRunId: string;
+    conversationId: string;
+    sourceRunId: string;
+  }) => void;
   onClose: () => void;
-  retryRun: (runId: string) => void;
-  run: Run | null;
-  strategyProfile: StrategyProfile | null;
+  onLoadOlderArtifacts?: () => void;
+  open: boolean;
+  preferredArtifactKind?: string | null;
+  runEvents: RunEvent[];
 }) {
-  const {
-    artifactWorkspaceTab,
-    selectedArtifactId,
-    setArtifactWorkspaceTab,
-    setSelectedArtifactId,
-  } = useStrategyUiStore();
-  const grouped = useMemo(() => groupArtifactsByKind(artifacts), [artifacts]);
-  const activeArtifact = getArtifactForGroupedTab(artifacts, grouped, selectedArtifactId, artifactWorkspaceTab);
-  const strategyArtifact = getArtifactForGroupedTab(artifacts, grouped, selectedArtifactId, "strategy");
-  const codeArtifact = getArtifactForGroupedTab(artifacts, grouped, selectedArtifactId, "code");
-  const riskArtifact = getArtifactForGroupedTab(artifacts, grouped, selectedArtifactId, "risk");
+  const queryClient = useQueryClient();
+  const { showToast } = useToast();
+  const { selectedArtifactId, setSelectedArtifactId } = useStrategyUiStore();
   const t = getUiCopy(language);
-  const activeSummary = activeArtifact ? getArtifactUserSummary(activeArtifact, language) : null;
-  const artifactTitle =
-    activeArtifact?.display_name ??
-    (run ? runStatusSummary(run.status, language) : t.reviewWorkspaceTitle);
-  const tabs = ARTIFACT_WORKSPACE_TABS.map((value) => [value, artifactTabLabel(value, language)] as const);
-  const canRetry = run && ["failed", "blocked", "cancelled", "completed"].includes(run.status);
+  const appliedPreferredArtifactRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!preferredArtifactKind) {
+      appliedPreferredArtifactRef.current = null;
+      return;
+    }
+    const preferred = artifacts.find((artifact) => artifact.kind === preferredArtifactKind);
+    const preferredKey = preferred ? `${preferredArtifactKind}:${preferred.id}` : null;
+    if (!preferred || appliedPreferredArtifactRef.current === preferredKey) {
+      return;
+    }
+    appliedPreferredArtifactRef.current = preferredKey;
+    if (selectedArtifactId !== preferred.id) {
+      setSelectedArtifactId(preferred.id);
+    }
+  }, [artifacts, preferredArtifactKind, selectedArtifactId, setSelectedArtifactId]);
+  const activeArtifact =
+    artifacts.find((artifact) => artifact.id === selectedArtifactId) ??
+    getBestArtifactForDrawer(artifacts, { preferredKind: preferredArtifactKind });
+  const preview = useQuery({
+    enabled: open && Boolean(activeArtifact),
+    queryFn: async () => {
+      return getArtifactPreviewForViewer(client, activeArtifact!);
+    },
+    queryKey: [
+      activeArtifact?.presentation.viewer_kind === "backtest_dashboard" ? "artifact-content" : "artifact-preview",
+      authKey,
+      activeArtifact?.id,
+    ],
+  });
+  const approvalMutation = useMutation({
+    mutationFn: ({
+      approvalId,
+      conversationId,
+      decision,
+    }: {
+      approvalId: string;
+      conversationId: string;
+      decision: "approved" | "rejected";
+    }) => client.decideBacktestApproval(conversationId, approvalId, { decision }),
+    onError: (error) => {
+      showToast({
+        title: "Backtest approval failed",
+        description: errorMessageFromUnknown(error),
+        variant: "error",
+      });
+    },
+    onSuccess: async (result) => {
+      showToast({
+        title:
+          result.status === "queued"
+            ? "Backtest preview queued."
+            : "Backtest preview skipped.",
+      });
+      if (result.status === "queued" && result.run_id) {
+        onBacktestQueued?.({
+          childRunId: result.run_id,
+          conversationId: result.conversation_id,
+          sourceRunId: preview.data?.run_id ?? result.run_id,
+        });
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ["conversation-state", result.conversation_id] }),
+        queryClient.invalidateQueries({ queryKey: ["conversation-sidebar"] }),
+        preview.data
+          ? queryClient.invalidateQueries({ queryKey: ["artifact-preview", authKey, preview.data.id] })
+          : Promise.resolve(),
+      ]);
+    },
+  });
+  const content = preview.data ? artifactPreviewContent(preview.data) : "";
+
+  const handleCopy = async () => {
+    if (!content) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch {
+      // Keep the artifact chrome minimal; copy failures remain non-blocking.
+    }
+  };
 
   return (
-    <aside className="fixed inset-0 z-40 grid h-[100dvh] min-h-0 grid-rows-[auto_1fr] overflow-hidden border-l border-border bg-background lg:relative lg:inset-auto lg:z-auto lg:h-full">
-      <div className="border-b border-border p-4">
+    <aside
+      className={cn(
+        "fixed inset-0 z-40 h-[100dvh] min-h-0 min-w-0 overflow-hidden border-l border-border bg-background shadow-2xl transition-[opacity,transform] duration-300 ease-out will-change-transform lg:relative lg:inset-auto lg:z-auto lg:h-full lg:shadow-none",
+        open
+          ? "translate-x-0 opacity-100"
+          : "pointer-events-none translate-x-4 opacity-0 lg:translate-x-2"
+      )}
+    >
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-20 p-3">
         <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              {activeSummary ? (
-                <ArtifactKindIcon kind={activeSummary.kind} />
-              ) : (
-                <PanelRight className="size-4 shrink-0 text-muted-foreground" />
-              )}
-              <p className="truncate font-medium text-sm tracking-[-0.01em]">{artifactTitle}</p>
-            </div>
-            <p className="mt-1 text-muted-foreground text-xs">
-              {activeSummary?.description ??
-                t.reviewOnlyBoundary}
-            </p>
-          </div>
+          {artifacts.length > 1 || hasOlderArtifacts ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  className="pointer-events-auto bg-background/80 shadow-sm backdrop-blur hover:bg-muted"
+                  size="icon-sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  <ListChecks className="size-4" />
+                  <span className="sr-only">{t.artifacts}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="w-72">
+                {artifacts.map((artifact) => {
+                  const summary = getArtifactUserSummary(artifact, language);
+                  return (
+                    <DropdownMenuItem
+                      className="items-start gap-3"
+                      key={artifact.id}
+                      onClick={() => setSelectedArtifactId(artifact.id)}
+                    >
+                      <ArtifactKindIcon kind={summary.kind} />
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm">{artifact.display_name}</span>
+                        <span className="block text-muted-foreground text-xs">{summary.label}</span>
+                      </span>
+                    </DropdownMenuItem>
+                  );
+                })}
+                {hasOlderArtifacts && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={isLoadingOlderArtifacts}
+                      onClick={(event) => {
+                        event.preventDefault();
+                        onLoadOlderArtifacts?.();
+                      }}
+                    >
+                      {isLoadingOlderArtifacts ? "Loading older artifacts..." : "Load older artifacts"}
+                    </DropdownMenuItem>
+                  </>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <span aria-hidden="true" className="size-8" />
+          )}
           <div className="flex shrink-0 items-center gap-2">
-            {run && <StatusPill status={run.status} />}
-            <Button onClick={onClose} size="icon-sm" type="button" variant="ghost">
+            <Button
+              className="pointer-events-auto bg-background/80 shadow-sm backdrop-blur hover:bg-muted"
+              disabled={!content}
+              onClick={() => void handleCopy()}
+              size="sm"
+              type="button"
+              variant="outline"
+            >
+              {t.copy}
+            </Button>
+            <Button
+              className="pointer-events-auto bg-background/80 shadow-sm backdrop-blur hover:bg-muted"
+              onClick={onClose}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            >
               <X className="size-4" />
               <span className="sr-only">{t.closeArtifactWorkspace}</span>
             </Button>
           </div>
         </div>
-        <div className="mt-4 flex flex-wrap gap-1 rounded-[4px] border border-border bg-muted p-1">
-          {tabs.map(([value, label]) => (
-            <button
-              className={cn(
-                "together-mono-label rounded-[3.25px] px-2 py-1 text-[10px] transition",
-                artifactWorkspaceTab === value
-                  ? "bg-background text-foreground"
-                  : "text-muted-foreground hover:bg-background/70"
-              )}
-              key={value}
-              onClick={() => setArtifactWorkspaceTab(value)}
-              type="button"
-            >
-              {label}
-            </button>
-          ))}
-        </div>
       </div>
-      <div className="min-h-0 space-y-4 overflow-y-auto overscroll-contain p-4">
-        {run && run.status !== "completed" && (
-          <UserProgressView cancelRun={cancelRun} events={events} language={language} retryRun={retryRun} run={run} />
-        )}
-        {artifacts.length > 1 && (
-          <ArtifactSwitcher
-            artifacts={artifacts}
-            language={language}
-            selectedArtifactId={activeArtifact?.id ?? null}
-            setSelectedArtifactId={setSelectedArtifactId}
-          />
-        )}
-        {artifactWorkspaceTab === "strategy" && (
-          <StrategyWorkspaceSummary
-            artifact={strategyArtifact}
-            authKey={authKey}
-            client={client}
-            language={language}
-            profile={strategyProfile}
-            run={run}
-          />
-        )}
-        {artifactWorkspaceTab === "code" && (
-          <CodeReviewWorkspace
-            artifact={codeArtifact}
-            authKey={authKey}
-            client={client}
-            language={language}
-            profile={strategyProfile}
-          />
-        )}
-        {artifactWorkspaceTab === "risk" && (
-          <RiskReviewWorkspace
-            artifact={riskArtifact}
-            authKey={authKey}
-            client={client}
-            language={language}
-            profile={strategyProfile}
-          />
-        )}
-        {artifactWorkspaceTab === "validation" && (
-          <ReviewNotes
-            artifacts={grouped.validation.length > 0 ? grouped.validation : grouped.notes}
-            authKey={authKey}
-            client={client}
-            language={language}
-          />
-        )}
-        {artifactWorkspaceTab === "changes" && (
-          <ChangesWorkspace artifacts={artifacts} language={language} profile={strategyProfile} />
-        )}
-        <div className="flex flex-wrap gap-2">
-          {run && canRetry && (
-            <Button onClick={() => retryRun(run.id)} size="sm" type="button" variant="outline">
+      <div className="h-full min-h-0 overflow-y-auto overscroll-contain px-5 pt-14 pb-6 md:px-8 lg:px-10">
+        {preview.isLoading && <PreviewLoading label={t.artifactPreviewLoading} />}
+        {preview.error && (
+          <div className="space-y-2">
+            <ErrorBlock message={errorMessage(preview.error)} />
+            <Button onClick={() => void preview.refetch()} size="sm" type="button" variant="outline">
               <RefreshCcw className="size-3" />
-              {run.status === "completed" ? t.regenerate : t.tryAgain}
+              {t.tryAgain}
             </Button>
-          )}
-        </div>
+          </div>
+        )}
+        {preview.data && (
+          <ArtifactPreviewContent
+            onBacktestApprovalDecision={({ approvalId, conversationId, decision }) =>
+              approvalMutation.mutate({ approvalId, conversationId, decision })
+            }
+            preview={preview.data}
+            approvalDecisionPending={approvalMutation.isPending}
+            runEvents={runEvents}
+          />
+        )}
       </div>
     </aside>
-  );
-}
-
-function StrategyWorkspaceSummary({
-  artifact,
-  authKey,
-  client,
-  language,
-  profile,
-  run,
-}: {
-  artifact: Artifact | null;
-  authKey: string;
-  client: BackendClient;
-  language: UiLanguagePreference;
-  profile: StrategyProfile | null;
-  run: Run | null;
-}) {
-  const t = getUiCopy(language);
-  if (!profile && !artifact) {
-    return (
-      <EmptyInspector
-        icon={<Gauge className="size-5" />}
-        text={run ? emptyArtifactText(run.status, language) : t.noStrategyContext}
-      />
-    );
-  }
-  return (
-    <div className="space-y-4">
-      {profile && (
-        <>
-          <StrategyBriefCard language={language} profile={profile} />
-          <StrategySnapshotCard language={language} profile={profile} />
-          <AssumptionsLedger language={language} profile={profile} />
-        </>
-      )}
-      {artifact && (
-        <ArtifactPreview artifact={artifact} authKey={authKey} client={client} language={language} />
-      )}
-    </div>
-  );
-}
-
-function CodeReviewWorkspace({
-  artifact,
-  authKey,
-  client,
-  language,
-  profile,
-}: {
-  artifact: Artifact | null;
-  authKey: string;
-  client: BackendClient;
-  language: UiLanguagePreference;
-  profile: StrategyProfile | null;
-}) {
-  const t = getUiCopy(language);
-  return (
-    <div className="space-y-4">
-      {profile?.code_outline.length ? (
-        <div className="rounded-[4px] border border-border p-3">
-          <div className="mb-3 flex items-center gap-2">
-            <Braces className="size-4 text-muted-foreground" />
-            <p className="font-medium text-sm">{t.codeOutline}</p>
-          </div>
-          <div className="grid gap-2">
-            {profile.code_outline.map((item) => (
-              <div
-                className="flex items-center justify-between gap-3 rounded-[4px] border border-border bg-muted/20 px-3 py-2 text-sm"
-                key={item.id}
-              >
-                <span>{item.label}</span>
-                <span className="text-muted-foreground text-xs">{item.kind}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : (
-        <EmptyInspector icon={<Braces className="size-5" />} text={t.noCodeOutline} />
-      )}
-      {artifact ? (
-        <ArtifactPreview artifact={artifact} authKey={authKey} client={client} language={language} />
-      ) : (
-        <EmptyInspector icon={<FileCode2 className="size-5" />} text={t.noCodeArtifact} />
-      )}
-    </div>
-  );
-}
-
-function RiskReviewWorkspace({
-  artifact,
-  authKey,
-  client,
-  language,
-  profile,
-}: {
-  artifact: Artifact | null;
-  authKey: string;
-  client: BackendClient;
-  language: UiLanguagePreference;
-  profile: StrategyProfile | null;
-}) {
-  const t = getUiCopy(language);
-  const riskRules = profile?.brief.risk_rules ?? [];
-  return (
-    <div className="space-y-4">
-      <div className="rounded-[4px] border border-border p-3">
-        <div className="mb-3 flex items-center gap-2">
-          <Gauge className="size-4 text-muted-foreground" />
-          <p className="font-medium text-sm">{t.riskReviewTab}</p>
-        </div>
-        {riskRules.length > 0 ? (
-          <ul className="space-y-2 text-sm">
-            {riskRules.map((rule) => (
-              <li className="flex gap-2" key={rule}>
-                <span className="mt-2 size-1 rounded-full bg-muted-foreground" />
-                <span>{rule}</span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-muted-foreground text-sm">{nextActionLabel("add_risk_rules", language)}</p>
-        )}
-      </div>
-      {artifact && (
-        <ArtifactPreview artifact={artifact} authKey={authKey} client={client} language={language} />
-      )}
-    </div>
-  );
-}
-
-function ChangesWorkspace({
-  artifacts,
-  language,
-  profile,
-}: {
-  artifacts: Artifact[];
-  language: UiLanguagePreference;
-  profile: StrategyProfile | null;
-}) {
-  const t = getUiCopy(language);
-  return (
-    <div className="space-y-4">
-      <div className="rounded-[4px] border border-border p-3">
-        <div className="mb-3 flex items-center gap-2">
-          <ListChecks className="size-4 text-muted-foreground" />
-          <p className="font-medium text-sm">{t.changesTab}</p>
-        </div>
-        {artifacts.length > 0 ? (
-          <div className="grid gap-2">
-            {artifacts.map((artifact) => (
-              <div
-                className="rounded-[4px] border border-border bg-muted/20 px-3 py-2"
-                key={artifact.id}
-              >
-                <p className="truncate font-medium text-sm">{artifact.display_name}</p>
-                <p className="text-muted-foreground text-xs">
-                  {new Date(artifact.created_at).toLocaleString(languageLocale(language))}
-                </p>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <p className="text-muted-foreground text-sm">{t.noDetailsAvailable}</p>
-        )}
-      </div>
-      {profile && <StrategySnapshotCard language={language} profile={profile} />}
-    </div>
-  );
-}
-
-function ArtifactSwitcher({
-  artifacts,
-  language,
-  selectedArtifactId,
-  setSelectedArtifactId,
-}: {
-  artifacts: Artifact[];
-  language: UiLanguagePreference;
-  selectedArtifactId: string | null;
-  setSelectedArtifactId: (artifactId: string | null) => void;
-}) {
-  return (
-    <div className="grid gap-1">
-      {artifacts.map((artifact) => (
-        <ArtifactSwitcherItem
-          artifact={artifact}
-          isSelected={selectedArtifactId === artifact.id}
-          key={artifact.id}
-          language={language}
-          onSelect={() => setSelectedArtifactId(artifact.id)}
-        />
-      ))}
-    </div>
-  );
-}
-
-function ArtifactSwitcherItem({
-  artifact,
-  isSelected,
-  language,
-  onSelect,
-}: {
-  artifact: Artifact;
-  isSelected: boolean;
-  language: UiLanguagePreference;
-  onSelect: () => void;
-}) {
-  const summary = getArtifactUserSummary(artifact, language);
-  return (
-    <button
-      className={cn(
-        "flex w-full items-center gap-3 rounded-[4px] border border-border px-3 py-2 text-left transition hover:bg-muted",
-        isSelected && "border-foreground/30 bg-muted"
-      )}
-      onClick={onSelect}
-      type="button"
-    >
-      <ArtifactKindIcon kind={summary.kind} />
-      <div className="min-w-0 flex-1">
-        <p className="truncate font-medium text-sm">{artifact.display_name}</p>
-        <p className="text-muted-foreground text-xs">{summary.label}</p>
-      </div>
-    </button>
-  );
-}
-
-function ArtifactPreview({
-  artifact,
-  authKey,
-  client,
-  language,
-}: {
-  artifact: Artifact;
-  authKey: string;
-  client: BackendClient;
-  language: UiLanguagePreference;
-}) {
-  const t = getUiCopy(language);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [actionMessage, setActionMessage] = useState<string | null>(null);
-  const [isDownloading, setIsDownloading] = useState(false);
-  const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
-  const preview = useQuery({
-    queryFn: () => client.getArtifactPreview(artifact.id, { maxBytes: 50000 }),
-    queryKey: ["artifact-preview", authKey, artifact.id],
-  });
-
-  if (preview.isLoading) {
-    return <PreviewLoading label={t.artifactPreviewLoading} />;
-  }
-  if (preview.error) {
-    return (
-      <div className="space-y-2">
-        <ErrorBlock message={errorMessage(preview.error)} />
-        <Button onClick={() => void preview.refetch()} size="sm" type="button" variant="outline">
-          <RefreshCcw className="size-3" />
-          {t.tryAgain}
-        </Button>
-      </div>
-    );
-  }
-  if (!preview.data) {
-    return null;
-  }
-  const content =
-    typeof preview.data.preview === "string"
-      ? preview.data.preview
-      : JSON.stringify(preview.data.preview, null, 2);
-
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setActionError(null);
-      setActionMessage(t.copied);
-    } catch {
-      setActionError(t.copyArtifactFailure);
-      setActionMessage(null);
-    }
-  };
-
-  const handleDownload = async () => {
-    try {
-      setIsDownloading(true);
-      const raw = await client.getArtifactContent(artifact.id);
-      const rawContent =
-        typeof raw.content === "string" ? raw.content : JSON.stringify(raw.content, null, 2);
-      const blob = new Blob([rawContent], { type: "text/plain;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = `${artifact.display_name.replace(/[^a-z0-9._-]+/gi, "-").toLowerCase()}.txt`;
-      link.click();
-      URL.revokeObjectURL(url);
-      setActionError(null);
-      setActionMessage(t.downloadStarted);
-    } catch (error) {
-      setActionError(errorMessage(error));
-      setActionMessage(null);
-    } finally {
-      setIsDownloading(false);
-    }
-  };
-
-  const handleReportFeedback = async (rating: "up" | "down") => {
-    if (!artifact.conversation_id) {
-      setActionError("Report feedback target is missing a conversation.");
-      setActionMessage(null);
-      return;
-    }
-    try {
-      setIsSubmittingFeedback(true);
-      await client.createFeedback({
-        conversation_id: artifact.conversation_id,
-        run_id: artifact.run_id,
-        artifact_id: artifact.id,
-        rating,
-        category: "backtest_report",
-        correction:
-          rating === "up"
-            ? "Backtest report reviewed as useful."
-            : "Backtest report needs strategy iteration.",
-      });
-      setActionError(null);
-      setActionMessage(rating === "up" ? "Feedback saved." : "Feedback saved for iteration.");
-    } catch (error) {
-      setActionError(errorMessage(error));
-      setActionMessage(null);
-    } finally {
-      setIsSubmittingFeedback(false);
-    }
-  };
-
-  return (
-    <ArtifactPreviewContent
-      actionError={actionError}
-      actionMessage={actionMessage}
-      isDownloading={isDownloading}
-      isSubmittingFeedback={isSubmittingFeedback}
-      onCopy={handleCopy}
-      onDownload={handleDownload}
-      onReportFeedback={handleReportFeedback}
-      preview={preview.data}
-      language={language}
-    />
-  );
-}
-
-function ArtifactPreviewContent({
-  actionError,
-  actionMessage,
-  isDownloading,
-  isSubmittingFeedback,
-  language,
-  onCopy,
-  onDownload,
-  onReportFeedback,
-  preview,
-}: {
-  actionError: string | null;
-  actionMessage: string | null;
-  isDownloading: boolean;
-  isSubmittingFeedback: boolean;
-  language: UiLanguagePreference;
-  onCopy: () => Promise<void>;
-  onDownload: () => Promise<void>;
-  onReportFeedback: (rating: "up" | "down") => Promise<void>;
-  preview: ArtifactPreviewResponse;
-}) {
-  const t = getUiCopy(language);
-  const content =
-    typeof preview.preview === "string"
-      ? preview.preview
-      : JSON.stringify(preview.preview, null, 2);
-  const codeLanguage = artifactLanguage(preview);
-  const backtestReport = parseBacktestArtifactPreview(preview.kind, preview.preview);
-  return (
-    <div className="relative space-y-2">
-      <div className="absolute top-2 right-2 z-10 flex gap-1 rounded-[4px] border border-border bg-background/90 p-1 shadow-sm backdrop-blur">
-        {preview.raw_available && (
-          <Button
-            disabled={isDownloading}
-            onClick={() => void onDownload()}
-            size="icon-sm"
-            title={isDownloading ? t.downloading : t.downloadRaw}
-            type="button"
-            variant="ghost"
-          >
-            {isDownloading ? (
-              <RefreshCcw className="size-4 animate-spin" />
-            ) : (
-              <Download className="size-4" />
-            )}
-            <span className="sr-only">{isDownloading ? t.downloading : t.downloadRaw}</span>
-          </Button>
-        )}
-        <Button
-          onClick={() => void onCopy()}
-          size="icon-sm"
-          title={t.copy}
-          type="button"
-          variant="ghost"
-        >
-          <Clipboard className="size-4" />
-          <span className="sr-only">{t.copy}</span>
-        </Button>
-      </div>
-      <div className="min-w-0 pr-20">
-          <p className="truncate font-medium text-sm">{preview.display_name}</p>
-          {preview.truncated && (
-            <span className="together-mono-label mt-1 inline-flex rounded-[3.25px] border px-2 py-0.5 text-[10px] text-muted-foreground">
-              {t.truncated}
-            </span>
-          )}
-      </div>
-      {actionError && <ErrorBlock message={actionError} />}
-      {actionMessage && !actionError && (
-        <p className="px-1 text-muted-foreground text-xs">{actionMessage}</p>
-      )}
-      {backtestReport && (
-        <BacktestReportCard
-          isSubmittingFeedback={isSubmittingFeedback}
-          onFeedback={onReportFeedback}
-          report={backtestReport}
-        />
-      )}
-      {codeLanguage === "markdown" && !backtestReport ? (
-        <MessageResponse
-          className="text-sm"
-          components={
-            artifactPreviewMarkdownComponents as MessageResponseProps["components"]
-          }
-          tableStyle="plain"
-        >
-          {content}
-        </MessageResponse>
-      ) : (
-        <CodeBlock
-          className="max-h-[420px]"
-          code={content}
-          language={codeLanguage}
-          showLineNumbers
-        />
-      )}
-    </div>
-  );
-}
-
-function UserProgressView({
-  cancelRun,
-  events,
-  language,
-  retryRun,
-  run,
-}: {
-  cancelRun: (runId: string) => void;
-  events: RunEvent[];
-  language: UiLanguagePreference;
-  retryRun: (runId: string) => void;
-  run: Run;
-}) {
-  const [open, setOpen] = useState(false);
-  const steps = mapRunEventsToUserSteps(events, run.status, language);
-  const currentStep = currentProgressStep(steps);
-  const isActive = !["completed", "failed", "blocked", "cancelled"].includes(run.status);
-  const canRetry = ["failed", "blocked", "cancelled"].includes(run.status);
-
-  return (
-    <div className="rounded-[4px] border border-border bg-background">
-      <div className="flex items-center justify-between gap-3 px-3 py-2">
-        <button
-          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          onClick={() => setOpen((value) => !value)}
-          type="button"
-        >
-          <span
-            className={cn(
-              "size-2 rounded-full border",
-              isActive ? "border-foreground bg-background" : "border-foreground bg-foreground"
-            )}
-          />
-          <div className="min-w-0">
-            <p className="truncate font-medium text-sm">{runStatusSummary(run.status, language)}</p>
-            {currentStep && (
-              <p className="truncate text-muted-foreground text-xs">{currentStep.label}</p>
-            )}
-          </div>
-          <ChevronDown
-            className={cn(
-              "ml-auto size-4 shrink-0 text-muted-foreground transition-transform",
-              open && "rotate-180"
-            )}
-          />
-        </button>
-        <div className="flex shrink-0 gap-1">
-          {isActive && (
-            <Button onClick={() => cancelRun(run.id)} size="sm" type="button" variant="outline">
-              <X className="size-3" />
-              {getUiCopy(language).cancel}
-            </Button>
-          )}
-          {canRetry && (
-            <Button onClick={() => retryRun(run.id)} size="sm" type="button" variant="outline">
-              <RefreshCcw className="size-3" />
-              {getUiCopy(language).tryAgain}
-            </Button>
-          )}
-        </div>
-      </div>
-      {open && (
-        <div className="space-y-3 border-t border-border p-3">
-          {steps.map((step) => (
-            <div className="flex items-center gap-3" key={step.label}>
-              <span
-                className={cn(
-                  "size-2 rounded-full border",
-                  step.state === "done" && "border-foreground bg-foreground",
-                  step.state === "current" && "border-foreground bg-background",
-                  step.state === "waiting" && "border-border bg-muted"
-                )}
-              />
-              <span
-                className={cn(
-                  "text-sm",
-                  step.state === "waiting" ? "text-muted-foreground" : "text-foreground"
-                )}
-              >
-                {step.label}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ReviewNotes({
-  artifacts,
-  authKey,
-  client,
-  language,
-}: {
-  artifacts: Artifact[];
-  authKey: string;
-  client: BackendClient;
-  language: UiLanguagePreference;
-}) {
-  const t = getUiCopy(language);
-  const previews = useQueries({
-    queries: artifacts.map((artifact) => ({
-      queryFn: () => client.getArtifactPreview(artifact.id, { maxBytes: 50000 }),
-      queryKey: ["artifact-preview", authKey, artifact.id],
-    })),
-  });
-
-  if (artifacts.length === 0) {
-    return <EmptyInspector icon={<Clipboard className="size-5" />} text={t.noReviewNotes} />;
-  }
-  if (previews.some((preview) => preview.isLoading)) {
-    return <PreviewLoading label={t.loadingReviewNotes} />;
-  }
-  const firstError = previews.find((preview) => preview.error);
-  if (firstError?.error) {
-    return (
-      <div className="space-y-2">
-        <ErrorBlock message={errorMessage(firstError.error)} />
-        <Button
-          onClick={() => previews.forEach((preview) => void preview.refetch())}
-          size="sm"
-          type="button"
-          variant="outline"
-        >
-          <RefreshCcw className="size-3" />
-          {t.tryAgain}
-        </Button>
-      </div>
-    );
-  }
-  const markdown = mergedReviewNotes(
-    previews
-      .map((preview) => preview.data)
-      .filter((preview): preview is ArtifactPreviewResponse => Boolean(preview)),
-    language
-  );
-  return (
-    <div className="rounded-[4px] border border-border bg-background p-3 text-sm">
-      <MessageResponse>{markdown}</MessageResponse>
-    </div>
   );
 }
 
@@ -4510,84 +5504,6 @@ function ArtifactKindIcon({ kind }: { kind: ArtifactUserKind }) {
     return <FileCode2 className={className} />;
   }
   return <Clipboard className={className} />;
-}
-
-function emptyArtifactText(status: Run["status"], language: UiLanguagePreference = "en") {
-  const t = getUiCopy(language);
-  if (status === "failed" || status === "blocked") {
-    return t.couldNotCreateArtifact;
-  }
-  if (status === "cancelled") {
-    return t.artifactCreationCancelled;
-  }
-  return t.preparingReviewArtifact;
-}
-
-function mergedReviewNotes(previews: ArtifactPreviewResponse[], language: UiLanguagePreference = "en") {
-  const t = getUiCopy(language);
-  if (previews.length === 0) {
-    return t.noReviewNotes;
-  }
-  const sections = previews.map((preview) => {
-    const summary = getArtifactUserSummary(preview, language);
-    const heading =
-      summary.kind === "validation"
-        ? t.boundaryChecks
-        : summary.kind === "risk"
-          ? t.riskNotes
-          : t.reviewSummary;
-    return `## ${heading}\n\n${previewToReadableMarkdown(preview.preview, language)}`;
-  });
-  return [
-    t.reviewNotesHeading,
-    "",
-    ...sections.flatMap((section) => [section, ""]),
-    t.suggestedNextStepsHeading,
-    "",
-    t.reviewArtifactsBeforeUseStep,
-    t.confirmAssumptionsStep,
-    t.treatAsDraftStep,
-  ].join("\n");
-}
-
-function previewToReadableMarkdown(value: unknown, language: UiLanguagePreference = "en"): string {
-  const t = getUiCopy(language);
-  if (typeof value === "string") {
-    return value.trim() || t.noDetailsAvailable;
-  }
-  if (!value || typeof value !== "object") {
-    return t.noDetailsAvailable;
-  }
-  if (Array.isArray(value)) {
-    return value.length
-      ? value.map((item) => `- ${inlineReadableValue(item, language)}`).join("\n")
-      : t.noDetailsAvailable;
-  }
-  const entries = Object.entries(value as Record<string, unknown>).filter(
-    ([, entryValue]) => entryValue !== null && entryValue !== undefined
-  );
-  if (entries.length === 0) {
-    return t.noDetailsAvailable;
-  }
-  return entries
-    .map(([key, entryValue]) => `- **${readableKey(key)}:** ${inlineReadableValue(entryValue, language)}`)
-    .join("\n");
-}
-
-function inlineReadableValue(value: unknown, language: UiLanguagePreference = "en"): string {
-  const t = getUiCopy(language);
-  if (Array.isArray(value)) {
-    return value.map((item) => inlineReadableValue(item, language)).join(", ") || t.none;
-  }
-  if (value && typeof value === "object") {
-    return Object.entries(value as Record<string, unknown>)
-      .map(([key, entryValue]) => `${readableKey(key)}: ${inlineReadableValue(entryValue, language)}`)
-      .join("; ");
-  }
-  if (typeof value === "boolean") {
-    return value ? t.yes : t.no;
-  }
-  return String(value ?? t.none);
 }
 
 function readableKey(key: string) {
@@ -4676,15 +5592,6 @@ function CreateFromSpecDialog({
   );
 }
 
-function EmptyInspector({ icon, text }: { icon: React.ReactNode; text: string }) {
-  return (
-    <div className="flex min-h-32 flex-col items-center justify-center rounded-[4px] border border-dashed border-border p-4 text-center text-muted-foreground text-sm">
-      {icon}
-      <p className="mt-2">{text}</p>
-    </div>
-  );
-}
-
 function buildFallbackSuggestionPayload({
   artifactAvailable,
   intent,
@@ -4705,17 +5612,7 @@ function buildFallbackSuggestionPayload({
   const actions: ChatSuggestionItem[] = [];
   const ready = strategyProfile?.snapshot.completeness === "ready_for_artifact";
 
-  if (artifactAvailable) {
-    actions.push({
-      action: "open_artifact",
-      category: "code",
-      enabled: true,
-      id: "fallback-view-artifact",
-      kind: "artifact_action",
-      label: t.viewArtifact,
-      priority: 1,
-    });
-  } else if (intent === "market_snapshot" || intent === "market_research") {
+  if (!artifactAvailable && (intent === "market_snapshot" || intent === "market_research")) {
     actions.push({
       action: "send_prompt",
       category: "strategy",
@@ -5071,30 +5968,68 @@ function SidebarSkeleton() {
   );
 }
 
-function artifactLanguage(preview: ArtifactPreviewResponse): BundledLanguage | "markdown" {
-  if (preview.mime_type === "text/markdown") {
-    return "markdown";
-  }
-  if (preview.language === "json" || preview.mime_type === "application/json") {
-    return "json";
-  }
-  if (preview.language === "pine" || preview.kind.includes("pine")) {
-    return "javascript";
-  }
-  if (preview.language === "mql5" || preview.kind.includes("mql5")) {
-    return "c";
-  }
-  return "json";
-}
-
 async function consumeRunProgress(
   client: BackendClient,
   runId: string,
   setRunEvents: (updater: (events: RunEvent[]) => RunEvent[]) => void,
   signal: AbortSignal
 ) {
+  await consumeRunEventStream({
+    onEvents: (events) => setRunEvents((current) => mergeRunEvents(current, events, 30)),
+    oversizedFrameMessage: "Run progress stream frame exceeded the maximum size.",
+    signal,
+    stream: () => client.streamRunProgress(runId, { signal }),
+  });
+}
+
+async function consumeAutoChainRunEvents(
+  client: BackendClient,
+  runId: string,
+  onEvents: (events: RunEvent[]) => void,
+  signal: AbortSignal
+) {
+  let lastEventId: string | undefined;
+  let terminal = false;
+  while (!signal.aborted && !terminal) {
+    let receivedEvents = false;
+    await consumeRunEventStream({
+      onEvents: (events) => {
+        if (!events.length) {
+          return;
+        }
+        receivedEvents = true;
+        lastEventId = events.at(-1)?.event_id ?? lastEventId;
+        terminal = events.some((event) =>
+          ["run.completed", "run.failed", "run.cancelled"].includes(event.type)
+        );
+        onEvents(events);
+      },
+      oversizedFrameMessage: "Auto-chain run event stream frame exceeded the maximum size.",
+      signal,
+      stopOnTerminalRunEvent: true,
+      stream: () => client.streamRunEvents(runId, { lastEventId, signal }),
+    });
+    if (!terminal && !signal.aborted) {
+      await delay(receivedEvents ? 750 : 1500);
+    }
+  }
+}
+
+async function consumeRunEventStream({
+  onEvents,
+  oversizedFrameMessage,
+  signal,
+  stopOnTerminalRunEvent = false,
+  stream,
+}: {
+  onEvents: (events: RunEvent[]) => void;
+  oversizedFrameMessage: string;
+  signal: AbortSignal;
+  stopOnTerminalRunEvent?: boolean;
+  stream: () => Promise<Response>;
+}) {
   try {
-    const response = await client.streamRunProgress(runId, { signal });
+    const response = await stream();
     if (!response.body) {
       return;
     }
@@ -5111,20 +6046,29 @@ async function consumeRunProgress(
         buffer += decoder.decode(value, { stream: true });
         if (buffer.length > MAX_PROGRESS_BUFFER_BYTES) {
           shouldCancelReader = true;
-          throw new Error("Run progress stream frame exceeded the maximum size.");
+          throw new Error(oversizedFrameMessage);
         }
         const { frames, remaining } = splitCompleteSseFrames(buffer);
         buffer = remaining;
         for (const chunk of frames) {
           const events = parseBackendSseEvents(chunk);
           if (events.length > 0) {
-            setRunEvents((current) => [...current, ...events].slice(-30));
+            onEvents(events);
+          }
+          if (
+            stopOnTerminalRunEvent &&
+            events.some((event) =>
+              ["run.completed", "run.failed", "run.cancelled"].includes(event.type)
+            )
+          ) {
+            shouldCancelReader = true;
+            return;
           }
         }
       }
       const finalEvents = parseBackendSseEvents(buffer);
       if (finalEvents.length > 0) {
-        setRunEvents((current) => [...current, ...finalEvents].slice(-30));
+        onEvents(finalEvents);
       }
     } finally {
       if (signal.aborted || shouldCancelReader) {
@@ -5136,8 +6080,12 @@ async function consumeRunProgress(
     if (signal.aborted) {
       return;
     }
-    // Progress streaming is supplemental; the run state query remains authoritative.
+    // Run-event streaming is supplemental; state queries remain authoritative.
   }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function errorMessage(error: unknown) {
@@ -5145,6 +6093,10 @@ function errorMessage(error: unknown) {
     return error.message;
   }
   return errorMessageFromUnknown(error);
+}
+
+function isConversationNotFoundError(error: unknown) {
+  return error instanceof BackendClientError && error.status === 404;
 }
 
 function parseStrategySpecDraft(value: string): StrategySpec {

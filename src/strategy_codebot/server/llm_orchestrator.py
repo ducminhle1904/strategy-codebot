@@ -1,25 +1,45 @@
-from collections.abc import Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from dataclasses import dataclass, field, replace
 import json
+import logging
+import os
 import re
 from typing import Any
 
+from strategy_codebot.server.action_registry import action_registry_payload
+from strategy_codebot.server.action_registry import available_registry_tool_ids
+from strategy_codebot.server.agent_logging import agent_log
+from strategy_codebot.server.artifact_kinds import BACKTEST_REPORT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import BACKTEST_RUN_METADATA_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import RISK_GATE_REPORT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
 from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
+from strategy_codebot.server.backtest_auto_chain import BACKTEST_AUTO_CHAIN_EVENTS
+from strategy_codebot.server.backtest_auto_chain import BacktestAutoChainPlanner
+from strategy_codebot.server.backtest_summary_text import format_backtest_summary_text
 from strategy_codebot.server.conversation_context import ConversationContextBuilder
 from strategy_codebot.server.llm_clients import LLMClient, LLMClientEvent, ResponsesClient
 from strategy_codebot.server.llm_clients import LLM_EVENT_MESSAGE_DELTA
 from strategy_codebot.server.llm_clients import LLM_EVENT_SOURCES
 from strategy_codebot.server.llm_clients import LLM_EVENT_TOOL_CALL
 from strategy_codebot.server.llm_clients import LLM_EVENT_USAGE
+from strategy_codebot.server.llm_json import extract_json_object
 from strategy_codebot.server.llm_tools import ToolExecutionContext
 from strategy_codebot.server.llm_tools import TOOL_DEFINITIONS
 from strategy_codebot.server.llm_tools import compact_tool_output
 from strategy_codebot.server.llm_tools import execute_tool
 from strategy_codebot.server.llm_tools import provider_tools
 from strategy_codebot.server.llm_tools import validate_tool_arguments
+from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
 from strategy_codebot.server.market_data import MarketDataGateway
 from strategy_codebot.server.market_data import market_data_context
+from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
+from strategy_codebot.server.model_routing import MODEL_STAGE_BALANCED_REVIEW
+from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
+from strategy_codebot.server.model_routing import MODEL_STAGE_REPAIR
+from strategy_codebot.server.model_routing import PROVIDER_ROUTE_EVENT
 from strategy_codebot.server.observability import StageTimer
 from strategy_codebot.server.observability import append_stage_event
 from strategy_codebot.server.observability import append_stage_started_event
@@ -30,8 +50,9 @@ from strategy_codebot.server.policy import PolicyFinding
 from strategy_codebot.server.policy import PolicySubject
 from strategy_codebot.server.policy import evaluate_policy
 from strategy_codebot.server.policy import policy_finding_payload
-from strategy_codebot.server.provider_errors import log_provider_exception
-from strategy_codebot.server.provider_errors import provider_run_failed_payload
+from strategy_codebot.server.provider_errors import log_run_exception
+from strategy_codebot.server.provider_errors import run_failed_payload
+from strategy_codebot.server.tool_errors import tool_failure_fields
 from strategy_codebot.server.redaction import redact_text
 from strategy_codebot.server.redaction import redact_value
 from strategy_codebot.server.repository import AssistantRunRecord
@@ -48,20 +69,49 @@ from strategy_codebot.server.streaming import transient_delta_event
 from strategy_codebot.server.streaming import transient_reasoning_event
 from strategy_codebot.server.token_estimation import estimate_tokens as _token_estimate
 
+logger = logging.getLogger(__name__)
+
 SAFE_REASONING_EVENT = "model.reasoning.delta"
 SUGGESTIONS_EVENT = "chat.suggestions.updated"
+CLASSIFIER_TIMEOUT_SECONDS_ENV = "STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS"
+DEFAULT_CLASSIFIER_TIMEOUT_SECONDS = 25.0
+ACTION_PLANNER_ENABLED_ENV = "STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED"
 RESPONSE_INTENTS = {
     "artifact_generation",
+    "backtest_preview",
     "capability_help",
     "docs_research",
     "general_chat",
     "market_research",
     "market_snapshot",
+    "pine_generation",
     "strategy_building",
 }
 SUGGESTION_SLOTS = {"entry", "exit", "market", "risk"}
 RESPONSE_INTENT_FALLBACK_CONFIDENCE = 0.35
 RESPONSE_INTENT_LLM_MIN_CONFIDENCE = 0.6
+SEMANTIC_ACTION_MIN_CONFIDENCE = 0.65
+CHAT_INTENT_DECISION_MIN_CONFIDENCE = 0.65
+CHAT_INTENT_ACTIONS = {"answer", "call_tool", "suggest_actions", "ask_clarification", "start_auto_chain"}
+CHAT_INTENT_MODEL_STAGES = {
+    DEFAULT_MODEL_STAGE,
+    MODEL_STAGE_BALANCED_REVIEW,
+    MODEL_STAGE_PINE_CODE_GENERATION,
+    MODEL_STAGE_REPAIR,
+}
+SEMANTIC_ACTIONS = {
+    "build_robustness_report",
+    "create_proposed_intent",
+    "get_backtest_summary",
+    "market_research",
+    "query_backtest_trades",
+    "repair",
+    "review_assumptions",
+    "review_risk",
+    "run_backtest_preview",
+    "run_backtest_variant_lab",
+    "run_risk_gate",
+}
 SAFE_REASONING_LABELS = {
     "artifact": {
         "en": "Preparing the review artifact.",
@@ -100,6 +150,12 @@ class RunBudget:
     output_tokens: int = 0
     blocked: bool = False
     completed_tool_ids: list[str] = field(default_factory=list)
+    completed_tool_results: list[dict[str, Any]] = field(default_factory=list)
+    auto_chain_started: bool = False
+    auto_chain_steps_completed: int = 0
+    auto_chain_failure_text: str | None = None
+    auto_chain_allowed: bool = False
+    auto_chain_source: str = "none"
 
     def allow_tool(self) -> bool:
         return self.executed_tool_calls < self.max_tool_calls
@@ -130,6 +186,86 @@ class IntentClassification:
         }
 
 
+@dataclass(frozen=True)
+class DomainScopeDecision:
+    allowed: bool
+    scope: str
+    reason: str
+    confidence: float
+
+    def payload(self) -> dict[str, Any]:
+        return {
+            "domain_scope": self.scope,
+            "domain_scope_allowed": self.allowed,
+            "domain_scope_confidence": round(max(0.0, min(1.0, self.confidence)), 3),
+            "domain_scope_reason": self.reason,
+        }
+
+
+def _run_optional_classifier(
+    classifier_name: str,
+    classify: Callable[[], Any],
+    fallback: Any,
+    *,
+    log_context: dict[str, Any] | None = None,
+) -> Any:
+    timeout_seconds = _classifier_timeout_seconds()
+    if timeout_seconds <= 0:
+        return classify()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"strategy-{classifier_name}")
+    future = executor.submit(classify)
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError:
+        agent_log(
+            logger,
+            "warn",
+            "agent.classifier.timeout",
+            component="llm_orchestrator",
+            classifier=classifier_name,
+            timeout_seconds=round(timeout_seconds, 3),
+            **(log_context or {}),
+        )
+        try:
+            return replace(fallback, source="timeout_fallback")
+        except TypeError:
+            return fallback
+    except Exception:
+        agent_log(
+            logger,
+            "error",
+            "agent.classifier.failed",
+            component="llm_orchestrator",
+            classifier=classifier_name,
+            **(log_context or {}),
+        )
+        return fallback
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _classifier_timeout_seconds() -> float:
+    raw = os.getenv(CLASSIFIER_TIMEOUT_SECONDS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_CLASSIFIER_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return DEFAULT_CLASSIFIER_TIMEOUT_SECONDS
+    return max(0.0, timeout)
+
+
+def _action_planner_enabled() -> bool:
+    raw = os.getenv(ACTION_PLANNER_ENABLED_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _should_run_action_planner(message_content: str, *, context_text: str, artifact_kinds: set[str]) -> bool:
+    return True
+
+
 class ResponseIntentClassifier:
     def __init__(self, client: LLMClient) -> None:
         self.client = client
@@ -140,17 +276,23 @@ class ResponseIntentClassifier:
             return deterministic
         if not _has_intent_classifier_signal(message_content):
             return IntentClassification("general_chat", 0.75, "deterministic")
-        return self._classify_with_llm(message_content)
+        return _run_optional_classifier(
+            "response_intent",
+            lambda: self._classify_with_llm(message_content),
+            IntentClassification("general_chat", RESPONSE_INTENT_FALLBACK_CONFIDENCE, "fallback"),
+        )
 
     def _classify_with_llm(self, message_content: str) -> IntentClassification:
         try:
             chunks: list[str] = []
-            for event in self.client.stream(
+            for event in _stream_client(
+                self.client,
                 messages=[
                     {"role": "system", "content": _intent_classifier_system_prompt()},
                     {"role": "user", "content": message_content[:2000]},
                 ],
                 tools=[],
+                routing_context={"stage": DEFAULT_MODEL_STAGE},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -164,6 +306,294 @@ class ResponseIntentClassifier:
         if confidence < RESPONSE_INTENT_LLM_MIN_CONFIDENCE:
             return IntentClassification("general_chat", confidence, "fallback")
         return IntentClassification(intent, confidence, "llm")
+
+
+@dataclass(frozen=True)
+class SemanticActionClassification:
+    intent: str
+    confidence: float
+    source: str
+    suggested_actions: tuple[str, ...] = ()
+    reason: str | None = None
+    missing_inputs: tuple[str, ...] = ()
+
+    def is_active(self) -> bool:
+        return self.source != "none" and self.confidence >= SEMANTIC_ACTION_MIN_CONFIDENCE and bool(self.suggested_actions)
+
+    def context_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "semantic_action_confidence": round(max(0.0, min(1.0, self.confidence)), 3),
+            "semantic_action_intent": self.intent,
+            "semantic_action_source": self.source,
+        }
+        if self.suggested_actions:
+            payload["semantic_suggested_actions"] = list(self.suggested_actions)
+        return payload
+
+
+@dataclass(frozen=True)
+class ActionPlanDecision:
+    decision: str
+    intent_id: str
+    confidence: float
+    source: str
+    tool_id: str | None = None
+    arguments: dict[str, Any] | None = None
+    suggested_actions: tuple[str, ...] = ()
+    reason: str | None = None
+
+    def is_active(self) -> bool:
+        return self.source != "none" and self.confidence >= SEMANTIC_ACTION_MIN_CONFIDENCE
+
+    def semantic_classification(self) -> SemanticActionClassification:
+        return SemanticActionClassification(
+            self.intent_id,
+            self.confidence,
+            "planner",
+            suggested_actions=self.suggested_actions,
+            reason=self.reason,
+        )
+
+    def payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action_plan_confidence": round(max(0.0, min(1.0, self.confidence)), 3),
+            "action_plan_decision": self.decision,
+            "action_plan_intent": self.intent_id,
+            "action_plan_source": self.source,
+        }
+        if self.tool_id:
+            payload["action_plan_tool_id"] = self.tool_id
+        if self.suggested_actions:
+            payload["action_plan_suggested_actions"] = list(self.suggested_actions)
+        if self.reason:
+            payload["reason"] = self.reason
+        return payload
+
+
+@dataclass(frozen=True)
+class ChatIntentDecision:
+    response_intent: str
+    action: str
+    model_stage: str
+    confidence: float
+    source: str
+    tool_id: str | None = None
+    auto_chain: bool = False
+    current_context_required: bool = False
+    missing_inputs: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+    used_signals: tuple[str, ...] = ()
+
+    def should_start_auto_chain(self) -> bool:
+        return (
+            self.source != "none"
+            and self.confidence >= CHAT_INTENT_DECISION_MIN_CONFIDENCE
+            and (self.auto_chain or self.action == "start_auto_chain")
+        )
+
+    def payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "action": self.action,
+            "auto_chain": self.auto_chain,
+            "confidence": round(max(0.0, min(1.0, self.confidence)), 3),
+            "current_context_required": self.current_context_required,
+            "intent": self.response_intent,
+            "model_stage": self.model_stage,
+            "safe": True,
+            "source": self.source,
+        }
+        if self.tool_id:
+            payload["tool_id"] = self.tool_id
+        if self.missing_inputs:
+            payload["missing_inputs"] = list(self.missing_inputs)
+        if self.reasons:
+            payload["reasons"] = list(self.reasons)
+        if self.used_signals:
+            payload["used_signals"] = list(self.used_signals)
+        return payload
+
+
+class ChatIntentDecisionPlanner:
+    def __init__(self, client: LLMClient) -> None:
+        self.client = client
+
+    def decide(
+        self,
+        message_content: str,
+        *,
+        context_text: str,
+        artifact_kinds: set[str],
+        web_search: str,
+        language: str,
+        log_context: dict[str, Any] | None = None,
+    ) -> ChatIntentDecision:
+        regex_evidence = _chat_regex_evidence(message_content)
+        registry_payload = action_registry_payload(
+            artifact_kinds=artifact_kinds,
+            context_text=f"{context_text}\n{message_content}",
+            web_search=web_search,
+        )
+        available_tools = {
+            str(item.get("tool_id"))
+            for item in registry_payload
+            if item.get("available") is True and isinstance(item.get("tool_id"), str)
+        }
+        fallback = _fallback_chat_intent_decision(
+            message_content,
+            web_search=web_search,
+            regex_evidence=regex_evidence,
+        )
+        return _run_optional_classifier(
+            "chat_intent_decision",
+            lambda: self._decide_with_llm(
+                message_content,
+                context_text=context_text,
+                artifact_kinds=artifact_kinds,
+                web_search=web_search,
+                language=language,
+                regex_evidence=regex_evidence,
+                registry_payload=registry_payload,
+                available_tools=available_tools,
+                fallback=fallback,
+            ),
+            fallback,
+            log_context=log_context,
+        )
+
+    def _decide_with_llm(
+        self,
+        message_content: str,
+        *,
+        context_text: str,
+        artifact_kinds: set[str],
+        web_search: str,
+        language: str,
+        regex_evidence: dict[str, bool],
+        registry_payload: list[dict[str, Any]],
+        available_tools: set[str],
+        fallback: ChatIntentDecision,
+    ) -> ChatIntentDecision:
+        prompt = {
+            "user_message": message_content[:2000],
+            "language": language,
+            "artifact_kinds": sorted(artifact_kinds),
+            "context_excerpt": context_text[-3000:],
+            "web_search": web_search,
+            "regex_evidence": regex_evidence,
+            "actions": registry_payload,
+            "boundaries": [
+                "Regex evidence is a hint only; decide from the user's semantic intent.",
+                "Choose start_auto_chain only when the user asks to generate or preview local backtest evidence.",
+                "Use current_context_required for current market/docs/provider/model information, not for current preview evidence.",
+                "Never plan paper/live trading, broker execution, profitability claims, or approval bypasses.",
+            ],
+        }
+        try:
+            chunks: list[str] = []
+            for event in _stream_client(
+                self.client,
+                messages=[
+                    {"role": "system", "content": _chat_intent_decision_system_prompt()},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                tools=[],
+                routing_context={"stage": DEFAULT_MODEL_STAGE},
+            ):
+                if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
+                    chunks.append(event.text)
+            decoded = _parse_chat_intent_decision_json(
+                "".join(chunks),
+                available_tools=available_tools,
+                regex_evidence=regex_evidence,
+            )
+        except Exception:
+            return fallback
+        return decoded or fallback
+
+
+class ActionPlanner:
+    def __init__(self, client: LLMClient) -> None:
+        self.client = client
+
+    def plan(
+        self,
+        message_content: str,
+        *,
+        response_intent: str,
+        context_text: str,
+        artifact_kinds: set[str],
+        web_search: str,
+        regex_evidence: dict[str, bool] | None = None,
+        log_context: dict[str, Any] | None = None,
+    ) -> ActionPlanDecision:
+        registry_payload = action_registry_payload(
+            artifact_kinds=artifact_kinds,
+            context_text=f"{context_text}\n{message_content}",
+            web_search=web_search,
+        )
+        available_tools = {
+            item.get("tool_id")
+            for item in registry_payload
+            if item.get("available") is True and isinstance(item.get("tool_id"), str)
+        }
+        if not available_tools:
+            return ActionPlanDecision("answer", "none", 0.0, "none")
+        return _run_optional_classifier(
+            "action_planner",
+            lambda: self._plan_with_llm(
+                message_content,
+                response_intent=response_intent,
+                context_text=context_text,
+                artifact_kinds=artifact_kinds,
+                regex_evidence=regex_evidence or _chat_regex_evidence(message_content),
+                registry_payload=registry_payload,
+                available_tools={str(tool_id) for tool_id in available_tools},
+            ),
+            ActionPlanDecision("answer", "none", 0.0, "fallback"),
+            log_context=log_context,
+        )
+
+    def _plan_with_llm(
+        self,
+        message_content: str,
+        *,
+        response_intent: str,
+        context_text: str,
+        artifact_kinds: set[str],
+        regex_evidence: dict[str, bool],
+        registry_payload: list[dict[str, Any]],
+        available_tools: set[str],
+    ) -> ActionPlanDecision:
+        prompt = {
+            "user_message": message_content[:1600],
+            "response_intent_hint": response_intent,
+            "artifact_kinds": sorted(artifact_kinds),
+            "context_excerpt": context_text[-2400:],
+            "regex_evidence": regex_evidence,
+            "actions": registry_payload,
+            "boundaries": [
+                "Local backtest preview artifacts are review-only evidence.",
+                "Do not claim TradingView proof, broker proof, live trading evidence, or profitability.",
+                "Only choose call_tool for an available action whose tool_id exactly matches the user's request.",
+            ],
+        }
+        try:
+            chunks: list[str] = []
+            for event in _stream_client(
+                self.client,
+                messages=[
+                    {"role": "system", "content": _action_planner_system_prompt()},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                tools=[],
+                routing_context={"stage": DEFAULT_MODEL_STAGE},
+            ):
+                if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
+                    chunks.append(event.text)
+            decoded = _parse_action_plan_json("".join(chunks), available_tools=available_tools)
+        except Exception:
+            return ActionPlanDecision("answer", "none", 0.0, "fallback")
+        return decoded or ActionPlanDecision("answer", "none", 0.0, "fallback")
 
 
 @dataclass
@@ -184,12 +614,14 @@ class LLMOrchestrator:
         try:
             self.security_controls.check_model_call(auth, model=self.client.model)
             chunks: list[str] = []
-            for event in self.client.stream(
+            for event in _stream_client(
+                self.client,
                 messages=[
                     {"role": "system", "content": _title_system_prompt()},
                     {"role": "user", "content": prompt},
                 ],
                 tools=[],
+                routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": DEFAULT_MODEL_STAGE},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -207,22 +639,99 @@ class LLMOrchestrator:
         current_message_id: str | None = None,
         language: str = "en",
         request_id: str | None = None,
+        trace_id: str | None = None,
         web_search: str = "auto",
     ) -> Iterator[str]:
         language = _normalize_language(language)
         web_search = _normalize_web_search(web_search)
-        run = self.repository.create_run(auth, conversation_id, status="running", request_id=request_id)
+        run = self.repository.create_run(
+            auth,
+            conversation_id,
+            status="running",
+            request_id=request_id,
+            trace_id=trace_id,
+        )
         if run is None:
             return
+        agent_log(
+            logger,
+            "info",
+            "agent.run.started",
+            component="llm_orchestrator",
+            conversation_id=conversation_id,
+            language=language,
+            request_id=run.request_id,
+            run_id=run.id,
+            trace_id=run.trace_id,
+            user_tier=auth.user_tier,
+            web_search=web_search,
+        )
         budget = self._new_budget()
         accumulated_text: list[str] = []
         terminal_status: str | None = None
         context_builder = ConversationContextBuilder(self.repository)
-        response_classification = ResponseIntentClassifier(self.client).classify(
-            message_content,
-            web_search=web_search,
+        artifact_kinds = _conversation_user_artifact_kinds(self.repository, auth, conversation_id, current_run_id=run.id)
+        domain_scope = _classify_domain_scope(message_content, artifact_kinds=artifact_kinds)
+        if not domain_scope.allowed:
+            yield from self._domain_scope_blocked(
+                auth=auth,
+                run=run,
+                conversation_id=conversation_id,
+                domain_scope=domain_scope,
+                language=language,
+            )
+            return
+        system_prompt = _system_prompt(language, web_search=web_search)
+        conversation_context = context_builder.build(
+            auth=auth,
+            conversation_id=conversation_id,
+            current_message_id=current_message_id,
+            current_user_message=message_content,
+            system_prompt=system_prompt,
         )
-        response_intent = response_classification.intent
+        backtest_live_context = _latest_backtest_live_context(self.repository, auth, conversation_id)
+        if backtest_live_context is not None:
+            conversation_context = replace(
+                conversation_context,
+                messages=_insert_system_context(conversation_context.messages, backtest_live_context),
+                estimated_input_tokens=conversation_context.estimated_input_tokens
+                + _token_estimate(backtest_live_context),
+                prior_context_text=f"{conversation_context.prior_context_text}\n{backtest_live_context}",
+            )
+        suggestion_context_text = conversation_context.prior_context_text
+        context_guard_message = _missing_current_context_message(
+            message_content,
+            conversation_context.prior_context_text,
+            language,
+        )
+        chat_decision = (
+            ChatIntentDecision(
+                response_intent="artifact_generation",
+                action="ask_clarification",
+                model_stage=MODEL_STAGE_PINE_CODE_GENERATION,
+                confidence=1.0,
+                source="deterministic_safety",
+                missing_inputs=("current_strategy_context",),
+                reasons=("The user referenced current strategy context but none is available.",),
+            )
+            if context_guard_message is not None
+            else ChatIntentDecisionPlanner(self.client).decide(
+                message_content,
+                context_text=suggestion_context_text,
+                artifact_kinds=artifact_kinds,
+                web_search=web_search,
+                language=language,
+                log_context={
+                    "conversation_id": conversation_id,
+                    "request_id": run.request_id,
+                    "run_id": run.id,
+                    "trace_id": run.trace_id,
+                },
+            )
+        )
+        response_intent = chat_decision.response_intent
+        budget.auto_chain_allowed = chat_decision.should_start_auto_chain()
+        budget.auto_chain_source = chat_decision.source if budget.auto_chain_allowed else "none"
         response_state: dict[str, Any] = {
             "market_snapshot_emitted": False,
             "market_data_emitted": False,
@@ -238,27 +747,65 @@ class LLMOrchestrator:
             else None
         )
         market_context = market_data_context(market_snapshot)
-        system_prompt = _system_prompt(language, web_search=web_search)
         if market_context is not None:
-            system_prompt = f"{system_prompt}\n\n<market_data>\n{market_context}\n</market_data>"
-        conversation_context = context_builder.build(
-            auth=auth,
-            conversation_id=conversation_id,
-            current_message_id=current_message_id,
-            current_user_message=message_content,
-            system_prompt=system_prompt,
-        )
+            conversation_context = replace(
+                conversation_context,
+                messages=_insert_system_context(conversation_context.messages, f"<market_data>\n{market_context}\n</market_data>"),
+                estimated_input_tokens=conversation_context.estimated_input_tokens + _token_estimate(market_context),
+                prior_context_text=f"{conversation_context.prior_context_text}\n{market_context}",
+            )
+            suggestion_context_text = conversation_context.prior_context_text
         artifact_available = response_intent in {
             "artifact_generation",
+            "backtest_preview",
+            "pine_generation",
             "strategy_building",
-        } and _conversation_has_user_artifact(self.repository, auth, conversation_id, current_run_id=run.id)
+        } and bool(artifact_kinds)
+        action_plan = (
+            ActionPlanner(self.client).plan(
+                message_content,
+                response_intent=response_intent,
+                context_text=suggestion_context_text,
+                artifact_kinds=artifact_kinds,
+                web_search=web_search,
+                regex_evidence={key: value for key, value in _chat_regex_evidence(message_content).items()},
+                log_context={
+                    "conversation_id": conversation_id,
+                    "request_id": run.request_id,
+                    "run_id": run.id,
+                    "trace_id": run.trace_id,
+                },
+            )
+            if _action_planner_enabled() and context_guard_message is None
+            else ActionPlanDecision("answer", "none", 0.0, "none")
+        )
         suggestions_payload = _suggestions_payload(
             response_intent=response_intent,
             message_content=message_content,
-            context_text=conversation_context.prior_context_text,
+            context_text=suggestion_context_text,
             language=language,
             artifact_available=artifact_available,
+            artifact_kinds=artifact_kinds,
+            web_search=web_search,
+            action_plan=action_plan,
         )
+        if action_plan.source != "none":
+            agent_log(
+                logger,
+                "info",
+                "agent.action_plan",
+                component="llm_orchestrator",
+                confidence=round(max(0.0, min(1.0, action_plan.confidence)), 3),
+                conversation_id=conversation_id,
+                decision=action_plan.decision,
+                intent_id=action_plan.intent_id,
+                request_id=run.request_id,
+                run_id=run.id,
+                source=action_plan.source,
+                tool_id=action_plan.tool_id,
+                trace_id=run.trace_id,
+            )
+            self.repository.append_run_event(auth, run.id, "chat.action_plan", action_plan.payload())
         self.repository.append_run_event(
             auth,
             run.id,
@@ -269,6 +816,7 @@ class LLMOrchestrator:
                 "estimated_input_tokens": conversation_context.estimated_input_tokens,
                 "truncated": conversation_context.truncated,
                 "web_search": web_search,
+                "backtest_live_status_included": backtest_live_context is not None,
             },
         )
         try:
@@ -276,7 +824,7 @@ class LLMOrchestrator:
                 auth,
                 run,
                 "chat.response_intent",
-                response_classification.payload(),
+                chat_decision.payload(),
             )
             if market_snapshot is not None:
                 response_state["market_snapshot_emitted"] = True
@@ -287,20 +835,28 @@ class LLMOrchestrator:
                         (market_snapshot.quote.source,) if market_snapshot.quote.source is not None else ()
                     )
                 ]
+                agent_log(
+                    logger,
+                    "info",
+                    "market.snapshot.emitted",
+                    component="llm_orchestrator",
+                    conversation_id=conversation_id,
+                    point_count=len(market_snapshot.points),
+                    provider=market_snapshot.quote.provider,
+                    request_id=run.request_id,
+                    run_id=run.id,
+                    symbol=market_snapshot.quote.symbol,
+                    trace_id=run.trace_id,
+                )
                 yield self._append_frame(auth, run, "market_data.snapshot", {"provider": market_snapshot.quote.provider})
                 yield self._append_frame(
                     auth,
                     run,
                     "chat.market_snapshot",
                     market_snapshot.to_chat_payload(),
-                )
+            )
             yield self._append_frame(auth, run, SUGGESTIONS_EVENT, suggestions_payload)
             yield self._safe_reasoning_frame(auth, run, "context", language)
-            context_guard_message = _missing_current_context_message(
-                message_content,
-                conversation_context.prior_context_text,
-                language,
-            )
             if context_guard_message is not None:
                 yield self._safe_reasoning_frame(auth, run, "finalizing", language)
                 self.repository.create_message(auth, conversation_id, context_guard_message, role="assistant")
@@ -316,9 +872,51 @@ class LLMOrchestrator:
                 yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
                 return
 
-            model_timer = StageTimer()
-            self.security_controls.check_model_call(auth, model=self.client.model)
-            append_stage_started_event(self.repository, auth, run, "model")
+            planned_tool_call = _direct_action_plan_tool_args(
+                action_plan,
+                artifact_kinds=artifact_kinds,
+                context_text=suggestion_context_text,
+                web_search=web_search,
+            )
+            direct_tool_name: str | None = None
+            direct_tool_args: dict[str, Any] | None = None
+            if planned_tool_call is not None:
+                direct_tool_name, direct_tool_args = planned_tool_call
+            if direct_tool_name is not None and direct_tool_args is not None:
+                yield from self._execute_tool_call(
+                    auth,
+                    run,
+                    direct_tool_name,
+                    direct_tool_args,
+                    budget,
+                    response_intent=response_intent,
+                    user_message=message_content,
+                    context_text=suggestion_context_text,
+                    web_search=web_search,
+                    language=language,
+                )
+                if not budget.blocked:
+                    tool_only_text = _tool_only_success_message(
+                        budget.completed_tool_ids,
+                        language,
+                        tool_results=budget.completed_tool_results,
+                    )
+                    self.repository.create_message(auth, conversation_id, tool_only_text, role="assistant")
+                    yield self._safe_reasoning_frame(auth, run, "finalizing", language)
+                    yield self._append_frame(
+                        auth,
+                        run,
+                        LLM_EVENT_MESSAGE_DELTA,
+                        {"text": tool_only_text, "compact": True, "source": "direct_backtest_trade_query"},
+                    )
+                terminal_status = "blocked" if budget.blocked else "completed"
+                completed = self.repository.set_run_status(auth, run.id, terminal_status)
+                append_stage_event(self.repository, auth, completed or run, "response_finalization", 0, status=terminal_status)
+                yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
+                if terminal_status == "completed":
+                    self._maybe_compact_conversation(auth, conversation_id, run.id, language=language)
+                return
+
             active_tools = (
                 []
                 if market_snapshot is not None
@@ -326,8 +924,18 @@ class LLMOrchestrator:
                     web_search,
                     message_content,
                     response_intent=response_intent,
+                    current_context_required=chat_decision.current_context_required,
                 )
             )
+            model_stage = _model_stage_for_chat(
+                message_content,
+                response_intent=response_intent,
+                active_tools=active_tools,
+                decision_model_stage=chat_decision.model_stage,
+            )
+            model_timer = StageTimer()
+            self.security_controls.check_model_call(auth, model=self.client.model)
+            append_stage_started_event(self.repository, auth, run, "model")
             yield self._append_frame(
                 auth,
                 run,
@@ -336,12 +944,19 @@ class LLMOrchestrator:
                     "mode": "agent",
                     "model": self.client.model,
                     "tier": auth.user_tier,
+                    "model_tier": auth.user_tier,
+                    "model_stage": model_stage,
                     "web_search": web_search,
                     "web_search_enabled": _has_web_search_tool(active_tools),
                 },
             )
             yield self._safe_reasoning_frame(auth, run, "model", language)
-            for event in self.client.stream(messages=conversation_context.messages, tools=active_tools):
+            for event in _stream_client(
+                self.client,
+                messages=conversation_context.messages,
+                tools=active_tools,
+                routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": model_stage},
+            ):
                 yield from self._handle_client_event(
                     auth,
                     run,
@@ -353,6 +968,8 @@ class LLMOrchestrator:
                     response_state=response_state,
                     stream_transient_delta=True,
                     user_message=message_content,
+                    context_text=suggestion_context_text,
+                    web_search=web_search,
                     language=language,
                 )
                 if budget.blocked:
@@ -360,6 +977,25 @@ class LLMOrchestrator:
             append_stage_event(self.repository, auth, run, "model", model_timer.elapsed_ms())
             if accumulated_text and not budget.blocked:
                 final_text = "".join(accumulated_text)
+                final_text = _maybe_backtest_summary_response(
+                    final_text,
+                    budget.completed_tool_ids,
+                    budget.completed_tool_results,
+                    language,
+                )
+                final_text = _maybe_backtest_trades_response(
+                    final_text,
+                    budget.completed_tool_ids,
+                    budget.completed_tool_results,
+                    language,
+                )
+                final_text = _maybe_auto_chain_final_response(
+                    final_text,
+                    budget.completed_tool_ids,
+                    budget.completed_tool_results,
+                    language,
+                    auto_chain_started=budget.auto_chain_started,
+                )
                 if response_intent == "market_snapshot" and not response_state.get("market_snapshot_emitted"):
                     final_text = _market_snapshot_source_required_message(language)
                 if (
@@ -395,7 +1031,11 @@ class LLMOrchestrator:
                     {"text": final_text, "compact": True},
                 )
             elif budget.executed_tool_calls > 0 and not budget.blocked:
-                tool_only_text = _tool_only_success_message(budget.completed_tool_ids, language)
+                tool_only_text = budget.auto_chain_failure_text or _tool_only_success_message(
+                    budget.completed_tool_ids,
+                    language,
+                    tool_results=budget.completed_tool_results,
+                )
                 self.repository.create_message(auth, conversation_id, tool_only_text, role="assistant")
                 yield self._safe_reasoning_frame(auth, run, "finalizing", language)
                 yield self._append_frame(
@@ -424,10 +1064,10 @@ class LLMOrchestrator:
         except Exception as exc:
             terminal_status = "failed"
             failed = self.repository.set_run_status(auth, run.id, "failed")
-            failure_payload = provider_run_failed_payload(exc)
+            failure_payload = run_failed_payload(exc)
             failure_text = _failure_assistant_message(failure_payload, language)
             self.repository.create_message(auth, conversation_id, failure_text, role="assistant")
-            log_provider_exception(exc, run_id=run.id, trace_id=run.trace_id)
+            log_run_exception(exc, run_id=run.id, trace_id=run.trace_id)
             append_stage_event(self.repository, auth, failed or run, "model", 0, status="failed")
             yield self._append_frame(
                 auth,
@@ -455,7 +1095,12 @@ class LLMOrchestrator:
             return
         chunks: list[str] = []
         try:
-            for event in self.client.stream(messages=summary_messages, tools=[]):
+            for event in _stream_client(
+                self.client,
+                messages=summary_messages,
+                tools=[],
+                routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": MODEL_STAGE_BALANCED_REVIEW},
+            ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
             summary = " ".join("".join(chunks).split()).strip()
@@ -493,8 +1138,15 @@ class LLMOrchestrator:
         conversation_id: str,
         strategy_spec: dict[str, Any],
         request_id: str | None = None,
+        trace_id: str | None = None,
     ) -> RunnerIntegrationResult | None:
-        run = self.repository.create_run(auth, conversation_id, status="running", request_id=request_id)
+        run = self.repository.create_run(
+            auth,
+            conversation_id,
+            status="running",
+            request_id=request_id,
+            trace_id=trace_id,
+        )
         if run is None:
             return None
         budget = self._new_budget()
@@ -518,7 +1170,12 @@ class LLMOrchestrator:
             return self._finish_blocked_run(auth, run, stage="model", duration_ms=0)
         try:
             accumulated_text: list[str] = []
-            for event in self.client.stream(messages=messages, tools=provider_tools()):
+            for event in _stream_client(
+                self.client,
+                messages=messages,
+                tools=provider_tools(),
+                routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": DEFAULT_MODEL_STAGE},
+            ):
                 for _frame in self._handle_client_event(
                     auth,
                     run,
@@ -536,12 +1193,12 @@ class LLMOrchestrator:
             raise
         except Exception as exc:
             failed = self.repository.set_run_status(auth, run.id, "failed")
-            log_provider_exception(exc, run_id=run.id, trace_id=run.trace_id)
+            log_run_exception(exc, run_id=run.id, trace_id=run.trace_id)
             self.repository.append_run_event(
                 auth,
                 run.id,
                 "run.failed",
-                provider_run_failed_payload(exc),
+                run_failed_payload(exc),
             )
             append_stage_event(self.repository, auth, failed or run, "model", 0, status="failed")
             return RunnerIntegrationResult(run=failed or run, artifacts=[])
@@ -568,10 +1225,12 @@ class LLMOrchestrator:
         response_state: dict[str, Any] | None = None,
         stream_transient_delta: bool,
         user_message: str | None = None,
+        context_text: str = "",
+        web_search: str = "auto",
         language: str = "en",
     ) -> Iterator[str]:
         if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
-            redacted_text = redact_text(event.text)
+            redacted_text = _sanitize_user_facing_model_text(redact_text(event.text))
             finding = _first_policy_finding(
                 surface=output_surface,
                 payload=redacted_text,
@@ -596,6 +1255,7 @@ class LLMOrchestrator:
             return
         if event.type == LLM_EVENT_USAGE:
             budget.add_usage(event.input_tokens, event.output_tokens)
+            model_metadata = _model_metadata_from_event(event)
             self.repository.create_usage_ledger(
                 auth,
                 run_id=run.id,
@@ -608,7 +1268,12 @@ class LLMOrchestrator:
                 auth,
                 run,
                 "model.usage",
-                _usage_payload(event.model or self.client.model, event.input_tokens, event.output_tokens),
+                _usage_payload(
+                    event.model or self.client.model,
+                    event.input_tokens,
+                    event.output_tokens,
+                    metadata=model_metadata,
+                ),
             )
             try:
                 budget.check_usage()
@@ -619,6 +1284,9 @@ class LLMOrchestrator:
             except BudgetExceeded as exc:
                 budget.blocked = True
                 yield from self._policy_blocked(auth, run, None, budget_policy_finding(exc), language=language)
+            return
+        if event.type == PROVIDER_ROUTE_EVENT:
+            yield self._append_frame(auth, run, PROVIDER_ROUTE_EVENT, event.arguments or {})
             return
         if event.type == LLM_EVENT_SOURCES:
             sources = _normalize_web_sources((event.arguments or {}).get("sources"))
@@ -654,7 +1322,12 @@ class LLMOrchestrator:
                 event.tool_name or "",
                 event.arguments or {},
                 budget,
+                response_intent=response_intent,
+                user_message=user_message,
+                context_text=context_text,
+                web_search=web_search,
                 language=language,
+                auto_chain_allowed=budget.auto_chain_allowed,
             )
             return
         raise RuntimeError(f"Unsupported LLM event type: {event.type}")
@@ -667,7 +1340,12 @@ class LLMOrchestrator:
         arguments: dict[str, Any],
         budget: RunBudget,
         *,
+        response_intent: str | None = None,
+        user_message: str | None = None,
+        context_text: str = "",
+        web_search: str = "auto",
         language: str = "en",
+        auto_chain_allowed: bool = False,
     ) -> Iterator[str]:
         block = self._gate_tool(auth, run, tool_name, arguments, budget)
         if block is not None:
@@ -675,6 +1353,18 @@ class LLMOrchestrator:
             yield from self._policy_blocked(auth, run, tool_name, block, language=language)
             return
 
+        agent_log(
+            logger,
+            "info",
+            "tool.started",
+            component="llm_orchestrator",
+            conversation_id=run.conversation_id,
+            input_keys=sorted(arguments.keys()),
+            request_id=run.request_id,
+            run_id=run.id,
+            tool_id=tool_name,
+            trace_id=run.trace_id,
+        )
         tool_call = self.repository.create_tool_call(
             auth,
             run.id,
@@ -708,6 +1398,24 @@ class LLMOrchestrator:
                 self.repository.complete_tool_call(auth, tool_call.id, status="completed", output_json=compact_output)
             budget.executed_tool_calls += 1
             budget.completed_tool_ids.append(tool_name)
+            budget.completed_tool_results.append(_tool_success_result(tool_name, arguments, output))
+            output_status, row_count, artifact_kind = _tool_log_summary(compact_output)
+            agent_log(
+                logger,
+                "info",
+                "tool.completed",
+                component="llm_orchestrator",
+                artifact_kind=artifact_kind,
+                conversation_id=run.conversation_id,
+                duration_ms=tool_timer.elapsed_ms(),
+                output_status=output_status,
+                request_id=run.request_id,
+                row_count=row_count,
+                run_id=run.id,
+                status="completed",
+                tool_id=tool_name,
+                trace_id=run.trace_id,
+            )
             self.repository.create_usage_ledger(
                 auth,
                 run_id=run.id,
@@ -728,14 +1436,64 @@ class LLMOrchestrator:
                     "tool_user_summary": user_summary,
                 },
             )
+            if tool_name == "create_backtest_plan" and output.get("requires_user_approval") is True:
+                backtest_config = output.get("backtest_config") if isinstance(output.get("backtest_config"), dict) else {}
+                yield self._append_frame(
+                    auth,
+                    run,
+                    "backtest.preview.approval_required",
+                    {
+                        "approval_id": output.get("approval_id"),
+                        "artifact_id": output.get("artifact_id"),
+                        "requires_user_approval": True,
+                        "status": output.get("approval_status", "pending"),
+                        "symbol": backtest_config.get("symbol"),
+                        "timeframe": backtest_config.get("timeframe"),
+                        "boundary": (
+                            "Local sandbox preview only; not TradingView proof, broker proof, "
+                            "live trading evidence, or a profitability claim."
+                        ),
+                    },
+                )
+            refreshed_suggestions = _post_tool_suggestions_payload(
+                repository=self.repository,
+                auth=auth,
+                run=run,
+                tool_name=tool_name,
+                tool_result=budget.completed_tool_results[-1],
+                response_intent=response_intent,
+                message_content=user_message or "",
+                context_text=context_text,
+                language=language,
+                web_search=web_search,
+            )
+            if refreshed_suggestions is not None:
+                yield self._append_frame(auth, run, SUGGESTIONS_EVENT, refreshed_suggestions)
+            if auto_chain_allowed:
+                yield from self._run_backtest_auto_chain(
+                    auth,
+                    run,
+                    budget,
+                    response_intent=response_intent,
+                    user_message=user_message or "",
+                    context_text=context_text,
+                    web_search=web_search,
+                    language=language,
+                )
             append_stage_event(self.repository, auth, run, "tool", tool_timer.elapsed_ms())
         except Exception as exc:
+            failure_fields = tool_failure_fields(exc)
+            failed_output = {
+                "error": exc.__class__.__name__,
+                "message": redact_text(str(exc)),
+                **failure_fields,
+            }
             if tool_call is not None:
                 self.repository.complete_tool_call(
                     auth,
                     tool_call.id,
                     status="failed",
-                    output_json={"error": exc.__class__.__name__, "message": redact_text(str(exc))},
+                    output_json=failed_output,
                 )
             error_payload = {
                 "tool_id": tool_name,
@@ -744,10 +1502,103 @@ class LLMOrchestrator:
                 "error": exc.__class__.__name__,
                 "message": redact_text(str(exc)),
                 "output_summary": f"Tool failed: {exc.__class__.__name__}",
+                **failure_fields,
             }
+            agent_log(
+                logger,
+                "error",
+                "tool.completed",
+                component="llm_orchestrator",
+                failure_code=failure_fields.get("code") if isinstance(failure_fields.get("code"), str) else None,
+                conversation_id=run.conversation_id,
+                duration_ms=tool_timer.elapsed_ms(),
+                error_class=exc.__class__.__name__,
+                output_status="failed",
+                request_id=run.request_id,
+                run_id=run.id,
+                status="failed",
+                tool_id=tool_name,
+                trace_id=run.trace_id,
+            )
             yield self._append_frame(auth, run, "tool.completed", error_payload)
             append_stage_event(self.repository, auth, run, "tool", tool_timer.elapsed_ms(), status="failed")
             raise
+
+    def _run_backtest_auto_chain(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        budget: RunBudget,
+        *,
+        response_intent: str | None,
+        user_message: str,
+        context_text: str,
+        web_search: str,
+        language: str,
+    ) -> Iterator[str]:
+        planner = BacktestAutoChainPlanner(
+            enabled=os.getenv("STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED", "1") == "1",
+            max_steps=_int_env("STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_MAX_STEPS", 4),
+        )
+        while budget.allow_tool():
+            step = planner.next_step(
+                message_content=user_message,
+                completed_tool_ids=budget.completed_tool_ids,
+                completed_tool_results=budget.completed_tool_results,
+                auto_steps_completed=budget.auto_chain_steps_completed,
+                start_allowed=budget.auto_chain_allowed,
+            )
+            if step is None:
+                return
+            if not budget.auto_chain_started:
+                budget.auto_chain_started = True
+                yield self._append_frame(
+                    auth,
+                    run,
+                    BACKTEST_AUTO_CHAIN_EVENTS["started"],
+                    {"source": budget.auto_chain_source, "trigger": "chat_intent_decision"},
+                )
+            try:
+                yield from self._execute_tool_call(
+                    auth,
+                    run,
+                    step.tool_id,
+                    step.arguments,
+                    budget,
+                    response_intent=response_intent,
+                    user_message=user_message,
+                    context_text=context_text,
+                    web_search=web_search,
+                    language=language,
+                    auto_chain_allowed=False,
+                )
+            except Exception as exc:
+                message = redact_text(str(exc))
+                budget.auto_chain_failure_text = _auto_chain_failure_message(step.tool_id, message, language)
+                yield self._append_frame(
+                    auth,
+                    run,
+                    BACKTEST_AUTO_CHAIN_EVENTS["failed"],
+                    {"tool_id": step.tool_id, "reason": step.reason, "error": exc.__class__.__name__, "message": message},
+                )
+                return
+            budget.auto_chain_steps_completed += 1
+            latest_result = budget.completed_tool_results[-1] if budget.completed_tool_results else {}
+            payload: dict[str, Any] = {"tool_id": step.tool_id, "reason": step.reason}
+            if isinstance(latest_result.get("run_id"), str):
+                payload["child_run_id"] = latest_result["run_id"]
+            yield self._append_frame(auth, run, BACKTEST_AUTO_CHAIN_EVENTS["step_completed"], payload)
+            if step.tool_id == "run_backtest_preview":
+                yield self._append_frame(
+                    auth,
+                    run,
+                    BACKTEST_AUTO_CHAIN_EVENTS["waiting"],
+                    {
+                        "child_run_id": latest_result.get("run_id"),
+                        "status": latest_result.get("status", "queued"),
+                    },
+                )
+                return
 
     def _gate_tool(
         self,
@@ -853,6 +1704,38 @@ class LLMOrchestrator:
             {"text": _safe_blocked_message(language), "compact": True},
         )
 
+    def _domain_scope_blocked(
+        self,
+        *,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        conversation_id: str,
+        domain_scope: DomainScopeDecision,
+        language: str,
+    ) -> Iterator[str]:
+        response_payload = {
+            "confidence": domain_scope.confidence,
+            "intent": "general_chat",
+            "safe": True,
+            "source": "domain_scope_guard",
+            **domain_scope.payload(),
+        }
+        suggestions_payload = _domain_scope_suggestions_payload(language, domain_scope)
+        message = _domain_scope_blocked_message(language)
+        yield self._append_frame(auth, run, "chat.response_intent", response_payload)
+        yield self._append_frame(auth, run, SUGGESTIONS_EVENT, suggestions_payload)
+        self.repository.create_message(auth, conversation_id, message, role="assistant")
+        yield self._append_frame(
+            auth,
+            run,
+            LLM_EVENT_MESSAGE_DELTA,
+            {"text": message, "compact": True, "source": "domain_scope_guard"},
+        )
+        terminal_status = "completed"
+        completed = self.repository.set_run_status(auth, run.id, terminal_status)
+        append_stage_event(self.repository, auth, completed or run, "domain_scope_guard", 0, status=terminal_status)
+        yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
+
     def _finish_blocked_run(
         self,
         auth: AuthContext,
@@ -868,9 +1751,37 @@ class LLMOrchestrator:
         return RunnerIntegrationResult(run=final_run, artifacts=[])
 
     def _append_frame(self, auth: AuthContext, run: AssistantRunRecord, event_type: str, payload: dict) -> str:
-        event = self.repository.append_run_event(auth, run.id, event_type, redact_value(payload))
+        event = self.repository.append_run_event(auth, run.id, event_type, _redact_event_payload(event_type, payload))
         if event is None:
             raise RuntimeError(f"Unable to append run event {event_type}")
+        if event_type in {"artifact.created", "run.completed", "run.failed"}:
+            log_event = {
+                "artifact.created": "artifact.created",
+                "run.completed": "agent.run.finished",
+                "run.failed": "agent.run.failed",
+            }[event_type]
+            agent_log(
+                logger,
+                "error" if event_type == "run.failed" else "info",
+                log_event,
+                component="llm_orchestrator",
+                artifact_kind=payload.get("artifact_kind") if isinstance(payload.get("artifact_kind"), str) else None,
+                conversation_id=run.conversation_id,
+                error_class=(
+                    payload.get("failure_class")
+                    if isinstance(payload.get("failure_class"), str)
+                    else payload.get("error")
+                    if isinstance(payload.get("error"), str)
+                    else None
+                ),
+                failure_code=payload.get("code") if isinstance(payload.get("code"), str) else None,
+                output_status=payload.get("status") if isinstance(payload.get("status"), str) else None,
+                request_id=run.request_id,
+                run_id=run.id,
+                trace_id=run.trace_id,
+            )
+        if event_type == "run.completed" and payload.get("status") == "completed" and self.artifact_store is not None:
+            KnowledgeLearningService(self.repository, self.artifact_store).maybe_extract_run_candidates(auth, run)
         return sse_frame(event)
 
     def _safe_reasoning_frame(self, auth: AuthContext, run: AssistantRunRecord, phase: str, language: str = "en") -> str:
@@ -882,6 +1793,87 @@ class LLMOrchestrator:
             max_total_tokens=self.budget_config.max_total_tokens,
             max_output_tokens=self.budget_config.max_output_tokens,
         )
+
+
+def _redact_event_payload(event_type: str, payload: dict) -> dict:
+    redacted = redact_value(payload)
+    if event_type != SUGGESTIONS_EVENT or not isinstance(redacted, dict):
+        return redacted
+
+    # Suggestion prompts are user-facing button actions, not hidden model prompts.
+    # Keep redaction for every other event so internal prompts/context stay protected.
+    for section in ("actions", "composer_blocks"):
+        source_items = payload.get(section)
+        redacted_items = redacted.get(section)
+        if not isinstance(source_items, list) or not isinstance(redacted_items, list):
+            continue
+        for source_item, redacted_item in zip(source_items, redacted_items, strict=False):
+            _restore_user_facing_prompt(source_item, redacted_item)
+    return redacted
+
+
+def _restore_user_facing_prompt(source: Any, target: Any) -> None:
+    if not isinstance(source, dict) or not isinstance(target, dict):
+        return
+    prompt = source.get("prompt")
+    if isinstance(prompt, str):
+        target["prompt"] = redact_text(prompt)
+    source_variants = source.get("variants")
+    target_variants = target.get("variants")
+    if not isinstance(source_variants, list) or not isinstance(target_variants, list):
+        return
+    for source_variant, target_variant in zip(source_variants, target_variants, strict=False):
+        _restore_user_facing_prompt(source_variant, target_variant)
+
+
+def _stream_client(
+    client: LLMClient,
+    *,
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]],
+    routing_context: dict[str, Any],
+) -> Iterator[LLMClientEvent]:
+    try:
+        yield from client.stream(messages=messages, tools=tools, routing_context=routing_context)
+    except TypeError as exc:
+        if "routing_context" not in str(exc):
+            raise
+        yield from client.stream(messages=messages, tools=tools)
+
+
+def _model_stage_for_chat(
+    message_content: str,
+    *,
+    response_intent: str | None,
+    active_tools: list[dict[str, Any]],
+    decision_model_stage: str | None = None,
+) -> str:
+    if decision_model_stage in CHAT_INTENT_MODEL_STAGES:
+        return decision_model_stage
+    lowered = message_content.lower()
+    tool_names = {
+        str(tool.get("function", {}).get("name") or tool.get("name") or "")
+        for tool in active_tools
+        if isinstance(tool, dict)
+    }
+    if "repair" in lowered or response_intent == "artifact_generation":
+        return MODEL_STAGE_REPAIR
+    if response_intent in {"market_research", "docs_research"}:
+        return MODEL_STAGE_BALANCED_REVIEW
+    if tool_names & {"create_backtest_plan", "run_backtest_preview", "run_backtest_variant_lab"}:
+        return MODEL_STAGE_PINE_CODE_GENERATION
+    if response_intent in {"backtest_preview", "pine_generation"}:
+        return MODEL_STAGE_PINE_CODE_GENERATION
+    if re.search(r"\b(backtest|pine|pinescript|pineforge|strategy\.entry|strategy\.exit|generate strategy|btc/usdt)\b", lowered):
+        return MODEL_STAGE_PINE_CODE_GENERATION
+    return DEFAULT_MODEL_STAGE
+
+
+def _model_metadata_from_event(event: LLMClientEvent) -> dict[str, Any]:
+    arguments = event.arguments or {}
+    keys = ("model_tier", "model_stage", "provider_route", "fallback_used", "attempt_count")
+    return {key: arguments[key] for key in keys if key in arguments}
+
 
 def _first_policy_finding(
     *,
@@ -922,13 +1914,22 @@ def _allow_chat_output_reference_url(
     )
 
 
-def _usage_payload(model: str, input_tokens: int, output_tokens: int) -> dict[str, Any]:
-    return {
+def _usage_payload(
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "model": model,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
+    if metadata:
+        payload.update(metadata)
+    return payload
 
 
 def _safe_reasoning_payload(phase: str, language: str = "en") -> dict[str, Any]:
@@ -954,10 +1955,6 @@ def _reasoning_phase_for_tool(tool_name: str) -> str:
         "create_backtest_plan",
         "run_backtest_preview",
         "run_backtest_variant_lab",
-        "create_pinets_preview_plan",
-        "create_signals_market_context_plan",
-        "create_graph_pipeline_plan",
-        "create_sidekick_export_plan",
     }:
         return "artifact"
     return "tool"
@@ -971,6 +1968,246 @@ def _normalize_web_search(web_search: str | None) -> str:
     return web_search if web_search in {"off", "auto", "on"} else "auto"
 
 
+def _classify_domain_scope(
+    message_content: str,
+    *,
+    artifact_kinds: set[str] | None = None,
+) -> DomainScopeDecision:
+    normalized = " ".join(message_content.lower().split())
+    artifact_kinds = artifact_kinds or set()
+    if not normalized:
+        return DomainScopeDecision(True, "product_help", "empty_or_whitespace", 0.8)
+    if _is_trading_or_product_domain_request(normalized):
+        return DomainScopeDecision(True, "trading_or_product", "domain_signal", 0.95)
+    if _is_artifact_context_followup_request(normalized, artifact_kinds):
+        return DomainScopeDecision(True, "context_followup", "artifact_context_signal", 0.86)
+    if _is_small_talk_or_context_followup(normalized):
+        return DomainScopeDecision(True, "context_followup", "small_talk_or_context_followup", 0.72)
+    if _is_explicit_off_topic_request(normalized):
+        return DomainScopeDecision(False, "off_topic", "explicit_off_topic_request", 0.9)
+    if _looks_like_general_task_request(normalized):
+        return DomainScopeDecision(False, "off_topic", "general_task_without_trading_context", 0.78)
+    return DomainScopeDecision(True, "context_followup", "ambiguous_short_followup", 0.62)
+
+
+def _is_trading_or_product_domain_request(normalized: str) -> bool:
+    domain_terms = (
+        "action awareness",
+        "artifact",
+        "backtest",
+        "backtest kit",
+        "broker boundary",
+        "crypto",
+        "drawdown",
+        "fees",
+        "forex",
+        "indicator",
+        "knowledge",
+        "market research",
+        "mql5",
+        "openrouter",
+        "orderintent",
+        "out-of-sample",
+        "oos",
+        "pine",
+        "price action",
+        "proposed intent",
+        "risk gate",
+        "robustness",
+        "review-only",
+        "sample size",
+        "slippage",
+        "strategy",
+        "trade log",
+        "trades",
+        "trading",
+        "tradingview",
+        "variant lab",
+        "web search",
+        "win rate",
+        "bot boundary",
+        "chiến lược",
+        "giao dịch",
+        "quản trị rủi ro",
+        "rủi ro",
+        "thị trường",
+        "vào lệnh",
+    )
+    market_terms = ("btc", "bitcoin", "eth", "ethereum", "xau", "gold", "usdt")
+    capability_terms = ("what can you do", "strategy codebot", "bạn làm được gì", "khả năng", "hỗ trợ app")
+    return any(term in normalized for term in domain_terms + market_terms + capability_terms)
+
+
+def _is_artifact_context_followup_request(normalized: str, artifact_kinds: set[str]) -> bool:
+    if not artifact_kinds:
+        return False
+    has_strategy_context = any(
+        _artifact_kind_matches(
+            kind,
+            (
+                BACKTEST_REPORT_ARTIFACT_KIND,
+                BACKTEST_RUN_METADATA_ARTIFACT_KIND,
+                ROBUSTNESS_REPORT_ARTIFACT_KIND,
+                RISK_GATE_REPORT_ARTIFACT_KIND,
+                "backtest_dashboard",
+                "backtest_trades",
+                "backtest_equity_curve",
+                "pine",
+                "strategy",
+            ),
+        )
+        for kind in artifact_kinds
+    )
+    if not has_strategy_context:
+        return False
+    context_terms = (
+        "current evidence",
+        "current preview",
+        "current report",
+        "current result",
+        "current results",
+        "preview evidence",
+        "review the result",
+        "the evidence",
+        "the preview",
+        "the report",
+        "the result",
+        "the results",
+        "this evidence",
+        "this preview",
+        "this report",
+        "this result",
+    )
+    return any(term in normalized for term in context_terms)
+
+
+def _is_small_talk_or_context_followup(normalized: str) -> bool:
+    small_talk = {
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "ok",
+        "okay",
+        "chào",
+        "cảm ơn",
+        "oke",
+    }
+    if normalized in small_talk:
+        return True
+    followup_terms = (
+        "what next",
+        "what should i do next",
+        "what did i mention",
+        "cái này",
+        "giờ sao",
+        "làm gì tiếp",
+        "nên làm gì",
+    )
+    return any(term in normalized for term in followup_terms)
+
+
+def _is_explicit_off_topic_request(normalized: str) -> bool:
+    if any(term in normalized for term in ("pine script", "trading script", "strategy code", "mql5")):
+        return False
+    off_topic_terms = (
+        "cover letter",
+        "essay",
+        "homework",
+        "javascript",
+        "legal contract",
+        "marketing copy",
+        "math problem",
+        "medical",
+        "poem",
+        "python script",
+        "react component",
+        "recipe",
+        "resume",
+        "song lyrics",
+        "sql query",
+        "travel itinerary",
+        "viết email",
+        "làm thơ",
+        "nấu ăn",
+        "du lịch",
+        "bài tập",
+        "hợp đồng",
+    )
+    return any(term in normalized for term in off_topic_terms)
+
+
+def _looks_like_general_task_request(normalized: str) -> bool:
+    request_terms = (
+        "build",
+        "create",
+        "draft",
+        "explain",
+        "generate",
+        "how do i",
+        "how to",
+        "summarize",
+        "translate",
+        "what is",
+        "write",
+        "dịch",
+        "giải thích",
+        "là gì",
+        "tạo",
+        "tóm tắt",
+        "viết",
+    )
+    return len(normalized.split()) >= 3 and any(term in normalized for term in request_terms)
+
+
+def _domain_scope_blocked_message(language: str = "en") -> str:
+    if _normalize_language(language) == "vi":
+        return (
+            "Mình chỉ hỗ trợ các việc trong Strategy Codebot: trading strategy/spec, Pine/MQL5 artifact, "
+            "backtest preview, risk/robustness review, market research có citation, và các boundary review-only. "
+            "Bạn có thể chuyển yêu cầu này thành một câu hỏi liên quan đến trading strategy hoặc workflow trong app."
+        )
+    return (
+        "I can only help inside Strategy Codebot: trading strategy/spec work, Pine/MQL5 artifacts, backtest previews, "
+        "risk/robustness review, citation-backed market research, and review-only workflow boundaries. "
+        "Please reframe the request as a trading-strategy or app-workflow question."
+    )
+
+
+def _domain_scope_suggestions_payload(language: str, domain_scope: DomainScopeDecision) -> dict[str, Any]:
+    return {
+        "actions": [
+            _suggestion_action(
+                "show-strategy-format",
+                _copy(language, "Cho mình mẫu spec", "Show a spec example"),
+                _copy(
+                    language,
+                    "Cho mình một mẫu strategy spec ngắn để bắt đầu trong Strategy Codebot.",
+                    "Show me a short strategy spec example to start inside Strategy Codebot.",
+                ),
+                "strategy",
+                priority=1,
+                reason=_copy(language, "Yêu cầu hiện tại nằm ngoài domain của app.", "The current request is outside the app domain."),
+                risk_level="read_only",
+            )
+        ],
+        "composer_blocks": [],
+        "context": {
+            "artifact_available": False,
+            "artifact_kinds": [],
+            "domain_scope": domain_scope.scope,
+            "domain_scope_allowed": domain_scope.allowed,
+            "domain_scope_reason": domain_scope.reason,
+            "intent": "general_chat",
+            "missing_fields": [],
+            "readiness": "domain_scope_blocked",
+        },
+        "safe": True,
+        "version": 1,
+    }
+
+
 def _suggestions_payload(
     *,
     response_intent: str,
@@ -978,9 +2215,15 @@ def _suggestions_payload(
     context_text: str,
     language: str,
     artifact_available: bool = False,
+    artifact_kinds: set[str] | None = None,
+    web_search: str = "auto",
+    semantic_action: SemanticActionClassification | None = None,
+    action_plan: ActionPlanDecision | None = None,
 ) -> dict[str, Any]:
     language = _normalize_language(language)
     combined_context = f"{context_text}\n{message_content}".lower()
+    normalized_message = message_content.lower()
+    artifact_kinds = artifact_kinds or set()
     missing_fields = _strategy_missing_fields(combined_context)
     readiness = "ready_for_artifact" if not missing_fields else "needs_detail"
     actions: list[dict[str, Any]] = []
@@ -990,151 +2233,114 @@ def _suggestions_payload(
         else []
     )
 
-    if response_intent == "market_snapshot":
-        symbol = _market_symbol_from_text(message_content) or "ETH"
-        actions.extend(
-            [
-                _suggestion_action(
-                    "compare-market",
-                    _copy(language, "So sánh với BTC", "Compare with BTC"),
-                    _copy(
-                        language,
-                        f"So sánh bối cảnh hiện tại của {symbol} với BTC.",
-                        f"Compare the current {symbol} context with BTC.",
-                    ),
-                    "market",
-                    priority=1,
-                ),
-                _suggestion_action(
-                    "use-market-for-strategy",
-                    _copy(language, "Dùng cho strategy", "Use for strategy"),
-                    _copy(
-                        language,
-                        f"Dùng {symbol} làm market context và giúp mình xây strategy review-only.",
-                        f"Use {symbol} as the market context and help me build a review-only strategy.",
-                    ),
-                    "strategy",
-                    priority=2,
-                ),
-            ]
+    actions.extend(
+        _registry_action_suggestions(
+            language=language,
+            context_text=combined_context,
+            artifact_kinds=artifact_kinds,
+            web_search=web_search,
+            action_plan=action_plan,
+            start_priority=-10,
         )
-    elif response_intent == "docs_research":
-        actions.append(
-            _suggestion_action(
-                "summarize-docs",
-                _copy(language, "Tóm tắt điểm cần dùng", "Summarize what matters"),
-                _copy(
-                    language,
-                    "Tóm tắt các điểm quan trọng nhất và cách áp dụng vào workflow strategy hiện tại.",
-                    "Summarize the most important points and how they apply to the current strategy workflow.",
-                ),
-                "review",
-                priority=1,
-            )
-        )
-    elif artifact_available:
-        actions.extend(
-            [
-                _artifact_action(
-                    "view-artifact",
-                    _copy(language, "Mở artifact", "View artifact"),
-                    priority=1,
-                ),
-                _suggestion_action(
-                    "review-code",
-                    _copy(language, "Review code", "Review code"),
-                    _copy(
-                        language,
-                        "Review artifact hiện tại và chỉ ra giả định, rủi ro, và điểm cần tự validation.",
-                        "Review the current artifact and list assumptions, risks, and manual validation points.",
-                    ),
-                    "review",
-                    priority=2,
-                ),
-            ]
-        )
-    elif response_intent in {"strategy_building", "artifact_generation"}:
-        if missing_fields:
-            for field in missing_fields[:2]:
-                actions.append(_missing_field_action(field, language, priority=len(actions) + 1))
-            actions.append(
-                _suggestion_action(
-                    "review-assumptions",
-                    _copy(language, "Review giả định", "Review assumptions"),
-                    _copy(
-                        language,
-                        "Liệt kê các giả định còn thiếu hoặc chưa rõ trong strategy context hiện tại.",
-                        "List missing or unclear assumptions in the current strategy context.",
-                    ),
-                    "review",
-                    priority=3,
-                )
-            )
-        else:
-            actions.extend(
-                [
-                    _suggestion_action(
-                        "generate-pine-v6",
-                        _copy(language, "Tạo Pine v6", "Generate Pine v6"),
-                        _copy(
-                            language,
-                            "Tạo artifact Pine v6 review-only từ strategy context hiện tại.",
-                            "Generate a review-only Pine v6 artifact from the current strategy context.",
-                        ),
-                        "code",
-                        priority=1,
-                    ),
-                    _suggestion_action(
-                        "review-risk",
-                        _copy(language, "Review risk", "Review risk"),
-                        _copy(
-                            language,
-                            "Review risk rules và đề xuất phiên bản an toàn hơn nếu cần.",
-                            "Review the risk rules and suggest a safer version if needed.",
-                        ),
-                        "risk",
-                        priority=2,
-                    ),
-                    _suggestion_action(
-                        "conservative-version",
-                        _copy(language, "Tạo bản conservative", "Create safer version"),
-                        _copy(
-                            language,
-                            "Tạo phiên bản conservative hơn với filter và risk controls chặt hơn.",
-                            "Create a more conservative version with stricter filters and risk controls.",
-                        ),
-                        "strategy",
-                        priority=3,
-                    ),
-                ]
-            )
-    elif response_intent == "capability_help":
-        actions.append(
-            _suggestion_action(
-                "show-strategy-format",
-                _copy(language, "Cho mình mẫu spec", "Show a spec example"),
-                _copy(
-                    language,
-                    "Cho mình một mẫu strategy spec ngắn để bắt đầu.",
-                    "Show me a short strategy spec example to get started.",
-                ),
-                "strategy",
-                priority=1,
-            )
-        )
+    )
+    context_payload: dict[str, Any] = {
+        "artifact_available": artifact_available,
+        "artifact_kinds": sorted(artifact_kinds),
+        "intent": response_intent,
+        "missing_fields": missing_fields,
+        "readiness": readiness,
+    }
+    if semantic_action is not None and semantic_action.source != "none":
+        context_payload.update(semantic_action.context_payload())
+    if action_plan is not None and action_plan.source != "none":
+        context_payload.update(action_plan.payload())
 
     return {
-        "actions": sorted(actions, key=lambda item: item["priority"])[:3],
+        "actions": _dedupe_suggestions(sorted(actions, key=lambda item: item["priority"]))[:3],
         "composer_blocks": composer_blocks,
-        "context": {
-            "artifact_available": artifact_available,
-            "intent": response_intent,
-            "missing_fields": missing_fields,
-            "readiness": readiness,
-        },
+        "context": context_payload,
         "safe": True,
         "version": 1,
     }
+
+
+def _registry_action_suggestions(
+    *,
+    language: str,
+    context_text: str,
+    artifact_kinds: set[str],
+    web_search: str,
+    action_plan: ActionPlanDecision | None,
+    start_priority: int,
+) -> list[dict[str, Any]]:
+    if action_plan is None or not action_plan.is_active():
+        return []
+    planned_tool_ids: list[str] = []
+    if action_plan.tool_id:
+        planned_tool_ids.append(action_plan.tool_id)
+    for tool_id in action_plan.suggested_actions:
+        if tool_id not in planned_tool_ids:
+            planned_tool_ids.append(tool_id)
+    if not planned_tool_ids:
+        return []
+
+    registry_entries = {
+        str(entry.get("tool_id")): entry
+        for entry in action_registry_payload(artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search)
+        if isinstance(entry.get("tool_id"), str)
+    }
+    actions: list[dict[str, Any]] = []
+    priority = start_priority
+    for tool_id in planned_tool_ids:
+        entry = registry_entries.get(tool_id)
+        if entry is None:
+            continue
+        actions.append(
+            _suggestion_action(
+                str(entry["id"]),
+                str(entry["label"]),
+                str(entry["prompt"]),
+                str(entry["category"]),
+                priority=priority,
+                enabled=entry.get("available") is True,
+                disabled_reason=_safe_string(entry.get("disabled_reason")),
+                reason=action_plan.reason,
+                risk_level=_safe_string(entry.get("risk_level")),
+                tool_id=tool_id,
+                required_inputs=[str(item) for item in entry.get("required_inputs", []) if isinstance(item, str)],
+                artifact_kind=_safe_string(entry.get("artifact_kind")),
+                next_state=_safe_string(entry.get("next_state")),
+                presentation=entry.get("presentation") if isinstance(entry.get("presentation"), dict) else None,
+            )
+        )
+        priority += 1
+    return actions
+
+
+def _dedupe_suggestions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for action in actions:
+        action_id = str(action.get("id") or "")
+        if action_id in seen:
+            continue
+        seen.add(action_id)
+        deduped.append(action)
+    return deduped
+
+
+def _artifact_kind_matches(kind: str, terms: tuple[str, ...]) -> bool:
+    normalized = kind.lower()
+    return any(term in normalized for term in terms)
+
+
+def _has_strategy_artifact_kind(artifact_kinds: set[str]) -> bool:
+    return any(_artifact_kind_matches(kind, ("pine", "strategy_spec", "strategy", "code", "source_bundle")) for kind in artifact_kinds)
+
+
+def _is_bot_boundary_request(normalized: str) -> bool:
+    terms = ("bot", "live", "paper", "order", "intent", "signal", "vào lệnh", "đặt lệnh", "chạy bot", "trade setup", "nếu trade")
+    return any(term in normalized for term in terms)
 
 
 def _composer_block_suggestions(language: str, missing_fields: list[str]) -> list[dict[str, Any]]:
@@ -1249,6 +2455,13 @@ def _suggestion_action(
     priority: int,
     enabled: bool = True,
     disabled_reason: str | None = None,
+    reason: str | None = None,
+    risk_level: str | None = None,
+    tool_id: str | None = None,
+    required_inputs: list[str] | None = None,
+    artifact_kind: str | None = None,
+    next_state: str | None = None,
+    presentation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = {
         "action": "send_prompt",
@@ -1262,19 +2475,21 @@ def _suggestion_action(
     }
     if disabled_reason:
         payload["disabled_reason"] = disabled_reason
+    if reason:
+        payload["reason"] = reason
+    if risk_level:
+        payload["risk_level"] = risk_level
+    if tool_id:
+        payload["tool_id"] = tool_id
+    if required_inputs:
+        payload["required_inputs"] = required_inputs
+    if artifact_kind:
+        payload["artifact_kind"] = artifact_kind
+    if next_state:
+        payload["next_state"] = next_state
+    if presentation:
+        payload["presentation"] = presentation
     return payload
-
-
-def _artifact_action(suggestion_id: str, label: str, *, priority: int) -> dict[str, Any]:
-    return {
-        "action": "open_artifact",
-        "category": "code",
-        "enabled": True,
-        "id": suggestion_id,
-        "kind": "artifact_action",
-        "label": label,
-        "priority": priority,
-    }
 
 
 def _missing_field_action(field: str, language: str, *, priority: int) -> dict[str, Any]:
@@ -1303,21 +2518,36 @@ def _strategy_missing_fields(context: str) -> list[str]:
     return [field for field, terms in checks.items() if not any(term in context for term in terms)]
 
 
-def _conversation_has_user_artifact(
+def _conversation_user_artifact_kinds(
     repository: ConversationRepository,
     auth: AuthContext,
     conversation_id: str,
     *,
     current_run_id: str,
-) -> bool:
+) -> set[str]:
+    kinds: set[str] = set()
     runs = repository.list_runs(auth, conversation_id) or []
     for run in runs[:5]:
         if run.id == current_run_id:
             continue
         artifacts = repository.list_artifacts(auth, run.id) or []
-        if any(_artifact_is_user_visible(artifact) for artifact in artifacts):
-            return True
-    return False
+        for artifact in artifacts:
+            if _artifact_is_user_visible(artifact):
+                kinds.add(str(getattr(artifact, "kind", "")).lower())
+    return kinds
+
+
+def _current_run_user_artifact_kinds(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    run_id: str,
+) -> set[str]:
+    kinds: set[str] = set()
+    artifacts = repository.list_artifacts(auth, run_id) or []
+    for artifact in artifacts:
+        if _artifact_is_user_visible(artifact):
+            kinds.add(str(getattr(artifact, "kind", "")).lower())
+    return kinds
 
 
 def _artifact_is_user_visible(artifact: Any) -> bool:
@@ -1326,6 +2556,151 @@ def _artifact_is_user_visible(artifact: Any) -> bool:
         return visibility != "internal"
     kind = str(getattr(artifact, "kind", "")).lower()
     return not any(term in kind for term in ("trace", "observability", "internal"))
+
+
+def _post_tool_suggestions_payload(
+    *,
+    repository: ConversationRepository,
+    auth: AuthContext,
+    run: AssistantRunRecord,
+    tool_name: str,
+    tool_result: dict[str, Any],
+    response_intent: str | None,
+    message_content: str,
+    context_text: str,
+    language: str,
+    web_search: str,
+) -> dict[str, Any] | None:
+    if tool_name not in {"generate_pine"}:
+        return None
+    artifact_kinds = _conversation_user_artifact_kinds(
+        repository,
+        auth,
+        run.conversation_id,
+        current_run_id=run.id,
+    )
+    artifact_kinds.update(_current_run_user_artifact_kinds(repository, auth, run.id))
+    if not artifact_kinds:
+        return None
+    post_tool_context_text = f"{context_text}\n{_tool_result_context_text(tool_result)}"
+    action_plan = ActionPlanDecision(
+        "suggest_actions",
+        "local_preview_evidence",
+        1.0,
+        "post_tool_registry",
+        suggested_actions=("run_backtest_preview",),
+        reason="A Pine artifact was created and can be reviewed with local preview evidence.",
+    )
+    return _suggestions_payload(
+        response_intent=response_intent or "artifact_generation",
+        message_content=message_content,
+        context_text=post_tool_context_text,
+        language=language,
+        artifact_available=True,
+        artifact_kinds=artifact_kinds,
+        web_search=web_search,
+        action_plan=action_plan,
+    )
+
+
+def _tool_result_context_text(tool_result: dict[str, Any]) -> str:
+    spec = tool_result.get("strategy_spec") if isinstance(tool_result.get("strategy_spec"), dict) else None
+    if not spec:
+        return ""
+    parts: list[str] = []
+    for key in ("market", "symbol", "timeframe", "position_sizing", "risk"):
+        value = spec.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}: {value}")
+    for key in ("entry_rules", "exit_rules", "risk_rules"):
+        value = spec.get(key)
+        if isinstance(value, list):
+            joined = "; ".join(str(item) for item in value[:3] if str(item).strip())
+            if joined:
+                parts.append(f"{key}: {joined}")
+    return "\n".join(parts)
+
+
+def _latest_backtest_live_context(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+) -> str | None:
+    snapshot = repository.get_conversation_state_snapshot(auth, conversation_id, event_limit=100)
+    if snapshot is None:
+        return None
+    relevant_types = {
+        "backtest.preview.heartbeat",
+        "backtest.preview.approval_required",
+        "backtest.preview.queued",
+        "backtest.preview.failed",
+        "backtest.preview.rejected",
+        "chat.auto_chain.waiting_for_backtest",
+    }
+    latest = next(
+        (event for event in reversed(snapshot.conversation_run_events) if event.type in relevant_types),
+        None,
+    )
+    if latest is None:
+        return None
+    payload = latest.payload if isinstance(latest.payload, dict) else {}
+    if latest.type == "backtest.preview.heartbeat":
+        stage = _safe_string(payload.get("stage")) or "unknown"
+        status = _safe_string(payload.get("status")) or "running"
+        progress = payload.get("progress_pct")
+        eta = payload.get("eta_ms")
+        message = _safe_string(payload.get("message")) or "Backtest preview status updated."
+        details = [
+            "Latest local backtest preview status for this conversation.",
+            f"run_id: {latest.run_id}",
+            f"status: {status}",
+            f"stage: {stage}",
+            f"message: {message}",
+        ]
+        if isinstance(progress, int | float):
+            details.append(f"progress_pct: {round(float(progress), 1)}")
+        if isinstance(eta, int | float) and eta > 0:
+            details.append(f"eta_ms: {round(float(eta))}")
+        details.append(
+            "Boundary: local sandbox preview only, not TradingView proof, broker proof, live trading evidence, or a profitability claim."
+        )
+        return "\n".join(details)
+    if latest.type == "backtest.preview.rejected":
+        return (
+            "Latest local backtest preview status for this conversation.\n"
+            f"run_id: {latest.run_id}\n"
+            "status: rejected\n"
+            "message: The user skipped the backtest preview. Do not imply a preview is running."
+        )
+    if latest.type == "backtest.preview.failed":
+        message = _safe_string(payload.get("message")) or "Backtest preview failed."
+        return (
+            "Latest local backtest preview status for this conversation.\n"
+            f"run_id: {latest.run_id}\n"
+            "status: failed\n"
+            f"message: {message}\n"
+            "Boundary: local sandbox preview only, not TradingView proof, broker proof, live trading evidence, or a profitability claim."
+        )
+    if latest.type == "backtest.preview.approval_required":
+        return (
+            "Latest local backtest preview status for this conversation.\n"
+            f"run_id: {latest.run_id}\n"
+            "status: approval_required\n"
+            "message: A backtest plan is waiting for explicit user approval before queueing."
+        )
+    child_run_id = _safe_string(payload.get("child_run_id")) or latest.run_id
+    return (
+        "Latest local backtest preview status for this conversation.\n"
+        f"run_id: {child_run_id}\n"
+        "status: queued\n"
+        "message: The approved local preview job is queued or starting."
+    )
+
+
+def _insert_system_context(messages: list[dict[str, str]], content: str) -> list[dict[str, str]]:
+    if not messages:
+        return [{"role": "system", "content": content}]
+    return [messages[0], {"role": "system", "content": content}, *messages[1:]]
 
 
 def _copy(language: str, vi: str, en: str) -> str:
@@ -1423,7 +2798,24 @@ def _is_docs_research_request(normalized: str) -> bool:
 def _is_market_research_request(normalized: str) -> bool:
     research_terms = ("research", "news", "latest", "sources", "citation", "tin tức", "nguồn", "nghiên cứu")
     market_terms = ("market", "crypto", "forex", "btc", "eth", "price", "giá")
-    return any(term in normalized for term in research_terms) and any(term in normalized for term in market_terms)
+    if any(term in normalized for term in research_terms) and any(term in normalized for term in market_terms):
+        return True
+    market_context_terms = ("market condition", "market conditions", "market setup", "market context", "market hiện tại")
+    market_followup_terms = (
+        "what should",
+        "what do i do",
+        "what to do",
+        "should i",
+        "suitable",
+        "plan",
+        "condition",
+        "nên làm gì",
+        "làm gì",
+        "phù hợp",
+    )
+    return any(term in normalized for term in market_context_terms) or (
+        "market" in normalized and any(term in normalized for term in market_followup_terms)
+    )
 
 
 def _is_capability_help_request(normalized: str) -> bool:
@@ -1509,6 +2901,44 @@ def _intent_classifier_system_prompt() -> str:
     )
 
 
+def _chat_intent_decision_system_prompt() -> str:
+    intents = ", ".join(sorted(RESPONSE_INTENTS))
+    actions = ", ".join(sorted(CHAT_INTENT_ACTIONS))
+    stages = ", ".join(sorted(CHAT_INTENT_MODEL_STAGES))
+    return (
+        "You are Strategy Codebot's semantic chat intent gate. Return JSON only with keys: "
+        "response_intent, action, model_stage, confidence, tool_id, auto_chain, "
+        "current_context_required, missing_inputs, reasons, used_signals. "
+        f"response_intent must be one of: {intents}. "
+        f"action must be one of: {actions}. "
+        f"model_stage must be one of: {stages}. "
+        "Regex evidence is only a hint; decide from semantic intent, recent context, artifacts, and available actions. "
+        "Use start_auto_chain or auto_chain=true when the user wants local preview/backtest evidence, including paraphrases such as simulate, paper test, preview performance, chạy thử, thử hiệu quả, or chay thu. "
+        "Use pine_generation or artifact_generation with the Pine code generation stage for Pine/code/script requests. "
+        "Use current_context_required only for current external facts such as market data, docs, providers, models, pricing, releases, or versions; current preview evidence is internal context. "
+        "Never select broker, live trading, paper trading execution, profitability proof, or approval bypass behavior. "
+        "Do not include markdown or extra keys."
+    )
+
+
+def _action_planner_system_prompt() -> str:
+    return (
+        "You are Strategy Codebot's bounded action planner. Return JSON only with keys: "
+        "decision, intent_id, confidence, tool_id, arguments, suggested_actions, reason. "
+        "decision must be one of: answer, call_tool, suggest_actions, ask_clarification. "
+        "Choose call_tool only when the user's request clearly maps to one available action. "
+        "For explicit trade row requests such as show/list/fetch/give first N trades, choose call_tool "
+        "with tool_id query_backtest_trades and include limit when the user gives a count. "
+        "Omit bucket for first/latest/all trade requests; use bucket only when the user explicitly asks for sample, top winners, or top losers. "
+        "Trade-list tool results are rendered by the UI as a structured table, so do not enumerate trade rows in prose. "
+        "Do not answer that you will fetch data when an available read-only tool can fetch it now. "
+        "Use suggested_actions for helpful next steps when execution is not explicitly requested. "
+        "Do not use keyword matching blindly: interpret terms like current in context, e.g. current preview evidence "
+        "means the active backtest preview, not market news. "
+        "Never plan paper/live trading, broker execution, profitability claims, or bypass approval gates."
+    )
+
+
 def _parse_intent_classifier_json(text: str) -> dict[str, Any] | None:
     payload = _extract_json_object(text)
     if payload is None:
@@ -1523,20 +2953,282 @@ def _parse_intent_classifier_json(text: str) -> dict[str, Any] | None:
     return {"confidence": bounded_confidence, "intent": intent}
 
 
+def _parse_action_plan_json(text: str, *, available_tools: set[str]) -> ActionPlanDecision | None:
+    payload = _extract_json_object(text)
+    if payload is None:
+        return None
+    decision = _safe_string(payload.get("decision")) or "answer"
+    if decision not in {"answer", "call_tool", "suggest_actions", "ask_clarification"}:
+        return None
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, int | float):
+        return None
+    tool_id = _safe_string(payload.get("tool_id"))
+    if decision == "call_tool":
+        if tool_id not in available_tools:
+            intent_id = (_safe_string(payload.get("intent_id")) or _safe_string(payload.get("intent")) or "unavailable_action")[:80]
+            reason = _safe_string(payload.get("reason"))
+            return ActionPlanDecision(
+                "suggest_actions",
+                intent_id or "unavailable_action",
+                float(max(0.0, min(1.0, confidence))),
+                "llm",
+                tool_id=tool_id,
+                reason=(reason or f"Planner selected unavailable action: {tool_id}")[:240],
+            )
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+    else:
+        arguments = None
+        if tool_id not in available_tools:
+            tool_id = None
+    raw_suggestions = payload.get("suggested_actions")
+    suggested_actions: list[str] = []
+    if isinstance(raw_suggestions, list):
+        for item in raw_suggestions:
+            normalized = _normalize_semantic_action(item)
+            if normalized and normalized in SEMANTIC_ACTIONS and normalized not in suggested_actions:
+                suggested_actions.append(normalized)
+    if tool_id and not suggested_actions:
+        normalized_tool_action = _normalize_semantic_action(tool_id)
+        if normalized_tool_action and normalized_tool_action in SEMANTIC_ACTIONS:
+            suggested_actions.append(normalized_tool_action)
+    intent_id = (_safe_string(payload.get("intent_id")) or _safe_string(payload.get("intent")) or decision)[:80]
+    reason = _safe_string(payload.get("reason"))
+    return ActionPlanDecision(
+        decision,
+        intent_id,
+        float(max(0.0, min(1.0, confidence))),
+        "llm",
+        tool_id=tool_id,
+        arguments=dict(arguments) if isinstance(arguments, dict) else None,
+        suggested_actions=tuple(suggested_actions[:3]),
+        reason=reason[:240] if reason else None,
+    )
+
+
+def _parse_chat_intent_decision_json(
+    text: str,
+    *,
+    available_tools: set[str],
+    regex_evidence: dict[str, bool] | None = None,
+) -> ChatIntentDecision | None:
+    payload = _extract_json_object(text)
+    if payload is None:
+        return None
+    response_intent = _safe_string(payload.get("response_intent") or payload.get("intent")) or "general_chat"
+    if response_intent not in RESPONSE_INTENTS:
+        return None
+    action = _safe_string(payload.get("action")) or "answer"
+    if action not in CHAT_INTENT_ACTIONS:
+        return None
+    model_stage = _safe_string(payload.get("model_stage")) or _model_stage_for_intent(response_intent)
+    if model_stage not in CHAT_INTENT_MODEL_STAGES:
+        model_stage = _model_stage_for_intent(response_intent)
+    confidence = payload.get("confidence")
+    if not isinstance(confidence, int | float):
+        return None
+    bounded_confidence = float(max(0.0, min(1.0, confidence)))
+    tool_id = _safe_string(payload.get("tool_id"))
+    if action == "call_tool" and tool_id not in available_tools:
+        action = "suggest_actions"
+    if tool_id not in available_tools:
+        tool_id = None
+    if bounded_confidence < CHAT_INTENT_DECISION_MIN_CONFIDENCE:
+        return None
+    used_signals = _safe_string_tuple(payload.get("used_signals"))
+    if not used_signals and regex_evidence:
+        used_signals = tuple(key for key, value in regex_evidence.items() if value)
+    return ChatIntentDecision(
+        response_intent=response_intent,
+        action=action,
+        model_stage=model_stage,
+        confidence=bounded_confidence,
+        source="llm",
+        tool_id=tool_id,
+        auto_chain=bool(payload.get("auto_chain")),
+        current_context_required=bool(payload.get("current_context_required")),
+        missing_inputs=_safe_string_tuple(payload.get("missing_inputs")),
+        reasons=_safe_string_tuple(payload.get("reasons") or payload.get("reason")),
+        used_signals=used_signals,
+    )
+
+
+def _fallback_chat_intent_decision(
+    message_content: str,
+    *,
+    web_search: str,
+    regex_evidence: dict[str, bool],
+) -> ChatIntentDecision:
+    deterministic = _deterministic_response_intent(message_content, web_search=web_search)
+    response_intent = deterministic.intent if deterministic is not None else "general_chat"
+    confidence = deterministic.confidence if deterministic is not None else RESPONSE_INTENT_FALLBACK_CONFIDENCE
+    auto_chain = bool(regex_evidence.get("explicit_backtest") or regex_evidence.get("preview_intent"))
+    source = "fallback_regex" if auto_chain else (deterministic.source if deterministic is not None else "fallback")
+    action = "start_auto_chain" if auto_chain else "answer"
+    if regex_evidence.get("pine_or_code") and response_intent == "general_chat":
+        response_intent = "artifact_generation"
+        confidence = max(confidence, 0.75)
+    return ChatIntentDecision(
+        response_intent=response_intent,
+        action=action,
+        model_stage=_model_stage_for_intent(response_intent),
+        confidence=confidence,
+        source=source,
+        auto_chain=auto_chain,
+        current_context_required=bool(regex_evidence.get("current_info")),
+        used_signals=tuple(key for key, value in regex_evidence.items() if value),
+    )
+
+
+def _safe_string_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return (stripped[:160],) if stripped else ()
+    if not isinstance(value, list):
+        return ()
+    items: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            items.append(item.strip()[:160])
+    return tuple(items[:6])
+
+
+def _chat_regex_evidence(message_content: str) -> dict[str, bool]:
+    normalized = " ".join((message_content or "").lower().split())
+    return {
+        "explicit_backtest": _explicit_backtest_signal(normalized),
+        "preview_intent": _preview_intent_signal(normalized),
+        "pine_or_code": _pine_or_code_signal(normalized),
+        "current_info": _should_enable_web_search_auto(normalized),
+        "artifact_or_strategy": _is_artifact_generation_request(normalized) or _is_strategy_building_request(normalized),
+        "risky_url_action": _risky_url_action_signal(normalized),
+    }
+
+
+def _explicit_backtest_signal(normalized: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(backtest|run\s+(?:a\s+)?preview|test(?:\s+(?:the\s+)?strategy)?|compare(?:\s+variants?)?)\b"
+            r"|chạy\s+backtest|kiểm\s*thử|test\s+(?:chiến\s*lược|strategy)|so\s+sánh",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _preview_intent_signal(normalized: str) -> bool:
+    terms = (
+        "simulate",
+        "paper test",
+        "preview performance",
+        "preview evidence",
+        "run thử",
+        "chạy thử",
+        "thử hiệu quả",
+        "xem chiến lược này ổn không",
+        "chay thu",
+        "thu hieu qua",
+    )
+    return any(term in normalized for term in terms)
+
+
+def _pine_or_code_signal(normalized: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(pine|pinescript|strategy\.entry|strategy\.exit|script|code|indicator|mql5|expert advisor)\b"
+            r"|viết\s+code|sinh\s+code|tạo\s+code",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _risky_url_action_signal(normalized: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(run|execute|call|use|fetch|open|read|send|submit|request|connect|download|upload|curl|wget|shell|filesystem|network\s+request)\b",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _model_stage_for_intent(response_intent: str | None) -> str:
+    if response_intent in {"artifact_generation", "backtest_preview", "pine_generation", "strategy_building"}:
+        return MODEL_STAGE_PINE_CODE_GENERATION
+    if response_intent in {"market_research", "docs_research"}:
+        return MODEL_STAGE_BALANCED_REVIEW
+    return DEFAULT_MODEL_STAGE
+
+
+def _normalize_semantic_action(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "build_robustness": "build_robustness_report",
+        "proposed_intent": "create_proposed_intent",
+        "repair_validation": "repair",
+        "risk_gate": "run_risk_gate",
+        "variant_lab": "run_backtest_variant_lab",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _has_blocked_semantic_action_claim(text: str) -> bool:
+    normalized = text.lower()
+    blocked_terms = (
+        "guaranteed profit",
+        "guaranteed returns",
+        "live ready",
+        "live-ready",
+        "no loss",
+        "profit guaranteed",
+        "risk free",
+        "risk-free",
+        "safe to trade live",
+        "broker execution",
+        "paper trade now",
+        "trade now",
+        "chắc chắn lời",
+        "không lỗ",
+        "sẵn sàng live",
+    )
+    return any(term in normalized for term in blocked_terms)
+
+
+def _direct_action_plan_tool_args(
+    action_plan: ActionPlanDecision,
+    *,
+    artifact_kinds: set[str],
+    context_text: str,
+    web_search: str,
+) -> tuple[str, dict[str, Any]] | None:
+    if not action_plan.is_active() or action_plan.decision != "call_tool" or not action_plan.tool_id:
+        return None
+    if action_plan.tool_id not in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report"}:
+        return None
+    available_tools = available_registry_tool_ids(
+        artifact_kinds=artifact_kinds,
+        context_text=context_text,
+        web_search=web_search,
+    )
+    if action_plan.tool_id not in available_tools:
+        return None
+    arguments = dict(action_plan.arguments or {})
+    arguments.setdefault("run_id", "latest_completed_backtest")
+    if action_plan.tool_id == "query_backtest_trades":
+        bucket = arguments.get("bucket")
+        if bucket is not None and bucket not in {"sample", "top_loser", "top_winner"}:
+            arguments.pop("bucket", None)
+        arguments["limit"] = _requested_tool_output_limit(arguments.get("limit"), default=20, maximum=50)
+    return action_plan.tool_id, arguments
+
+
 def _extract_json_object(text: str) -> dict[str, Any] | None:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```(?:json)?\s*", "", stripped)
-        stripped = re.sub(r"\s*```$", "", stripped)
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    try:
-        decoded = json.loads(stripped[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return decoded if isinstance(decoded, dict) else None
+    return extract_json_object(text)
 
 
 def _normalize_web_sources(value: Any) -> list[dict[str, str]]:
@@ -1642,6 +3334,10 @@ def _safe_blocked_message(language: str = "en") -> str:
 
 def _failure_assistant_message(payload: dict[str, Any], language: str = "en") -> str:
     is_vi = _normalize_language(language) == "vi"
+    if payload.get("dimension") == "workflow" or payload.get("code") == "pine_validation_failed":
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
     if payload.get("code") == "provider_timeout" or payload.get("error") == "ProviderTimeoutError":
         return (
             "AI provider phản hồi quá lâu. Bạn có thể thử lại hoặc chuyển sang deterministic mode trong lúc provider ổn định lại."
@@ -1670,7 +3366,84 @@ def _failure_assistant_message(payload: dict[str, Any], language: str = "en") ->
     )
 
 
-def _tool_only_success_message(tool_ids: list[str], language: str = "en") -> str:
+def _tool_success_result(tool_name: str, arguments: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {"tool_id": tool_name}
+    if tool_name == "get_backtest_summary":
+        result["output"] = compact_tool_output(output)
+    if tool_name == "query_backtest_trades":
+        trades = output.get("trades")
+        limit = _requested_tool_output_limit(arguments.get("limit"), default=20, maximum=50)
+        result["output"] = {
+            "status": output.get("status"),
+            "run_id": output.get("run_id"),
+            "requested_run_id": output.get("requested_run_id"),
+            "fallback_used": output.get("fallback_used"),
+            "trades": trades[:limit] if isinstance(trades, list) else [],
+        }
+    if tool_name == "build_robustness_report":
+        result["output"] = compact_tool_output(output)
+    if tool_name == "generate_pine":
+        strategy_spec = arguments.get("strategy_spec")
+        if isinstance(strategy_spec, dict):
+            result["strategy_spec"] = strategy_spec
+        pine_code = output.get("pine_code")
+        if isinstance(pine_code, str) and pine_code.strip():
+            result["pine_code"] = pine_code
+        artifact_id = output.get("artifact_id")
+        if isinstance(artifact_id, str) and artifact_id:
+            result["artifact_id"] = artifact_id
+        result["artifact_name"] = "strategy.pine"
+    if tool_name == "create_backtest_plan":
+        strategy_spec = arguments.get("strategy_spec")
+        if isinstance(strategy_spec, dict):
+            result["strategy_spec"] = strategy_spec
+        for key in ("pine_code",):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                result[key] = value
+        backtest_config = output.get("backtest_config")
+        if isinstance(backtest_config, dict):
+            full_backtest_config = arguments.get("backtest_config")
+            internal_backtest_config = dict(full_backtest_config) if isinstance(full_backtest_config, dict) else dict(backtest_config)
+            internal_backtest_config.setdefault("engine", "pineforge")
+            internal_backtest_config.setdefault("data_source", "public-readonly-cache")
+            result["backtest_config"] = internal_backtest_config
+        validation = output.get("validation") or output.get("pineforge_validation")
+        if isinstance(validation, dict):
+            result["validation"] = validation
+    if tool_name == "run_backtest_preview":
+        for key in ("run_id", "job_id", "status", "mode", "evidence_label"):
+            value = output.get(key)
+            if isinstance(value, str) and value.strip():
+                result[key] = value
+        backtest_config = output.get("backtest_config")
+        if isinstance(backtest_config, dict):
+            result["backtest_config"] = backtest_config
+    return result
+
+
+def _tool_log_summary(output: dict[str, Any]) -> tuple[str | None, int | None, str | None]:
+    output_status = output.get("status") if isinstance(output.get("status"), str) else None
+    artifact_kind = output.get("artifact_kind") if isinstance(output.get("artifact_kind"), str) else None
+    rows = output.get("rows") if isinstance(output.get("rows"), list) else None
+    trades = output.get("trades") if isinstance(output.get("trades"), list) else None
+    artifacts = output.get("artifacts") if isinstance(output.get("artifacts"), list) else None
+    row_count = None
+    if rows is not None:
+        row_count = len(rows)
+    elif trades is not None:
+        row_count = len(trades)
+    elif artifacts is not None:
+        row_count = len(artifacts)
+    return output_status, row_count, artifact_kind
+
+
+def _tool_only_success_message(
+    tool_ids: list[str],
+    language: str = "en",
+    *,
+    tool_results: list[dict[str, Any]] | None = None,
+) -> str:
     is_vi = _normalize_language(language) == "vi"
     if tool_ids and all(tool_id == "knowledge_check" for tool_id in tool_ids):
         if is_vi:
@@ -1682,7 +3455,17 @@ def _tool_only_success_message(tool_ids: list[str], language: str = "en") -> str
             "I checked the relevant knowledge context, but I do not have a strategy spec or Pine artifact to generate from yet. "
             "Share the strategy rules or turn the idea into a strategy spec first, then I can generate a review-only Pine v6 artifact."
         )
+    if "run_backtest_preview" in tool_ids:
+        if is_vi:
+            return "Đã queue local sandbox preview run. Report sẽ là evidence artifact review-only khi worker hoàn tất."
+        return "Queued a local sandbox preview run. The worker will persist review-only evidence artifacts when it completes."
     if "generate_pine" in tool_ids:
+        pine_result = next(
+            (result for result in reversed(tool_results or []) if result.get("tool_id") == "generate_pine"),
+            None,
+        )
+        if pine_result is not None:
+            return _generate_pine_fallback_summary(pine_result, language)
         if is_vi:
             return (
                 "Đã tạo code Pine v6 review-only từ strategy spec đã cung cấp. "
@@ -1702,33 +3485,343 @@ def _tool_only_success_message(tool_ids: list[str], language: str = "en") -> str
         return "Completed static validation for the provided Pine artifact. Review the validation result before continuing."
     if "run_backtest_variant_lab" in tool_ids:
         if is_vi:
-            return "Đã queue variant lab cho Backtest Kit local preview. Hãy theo dõi từng child run và so sánh report khi tất cả hoàn tất."
-        return "Queued a Backtest Kit local preview variant lab. Track each child run and compare reports after all complete."
-    if "run_backtest_preview" in tool_ids:
+            return "Đã queue variant lab cho local preview. Hãy theo dõi từng child run và so sánh report khi tất cả hoàn tất."
+        return "Queued a local preview variant lab. Track each child run and compare reports after all complete."
+    if "get_backtest_summary" in tool_ids:
+        summary_result = next(
+            (result for result in reversed(tool_results or []) if result.get("tool_id") == "get_backtest_summary"),
+            None,
+        )
+        if summary_result is not None:
+            if not _has_available_backtest_summary(summary_result):
+                return _backtest_summary_unavailable_message(language)
+            return _backtest_summary_fallback(summary_result, language)
         if is_vi:
-            return "Đã queue Backtest Kit local preview run. Report sẽ là evidence artifact review-only khi worker hoàn tất."
-        return "Queued a Backtest Kit local preview run. The worker will persist review-only evidence artifacts when it completes."
-    if "create_pinets_preview_plan" in tool_ids:
+            return "Đã tải summary backtest từ DB index. Hãy review metrics và caveat local preview trước khi tiếp tục."
+        return "Loaded the DB-indexed backtest summary. Review the metrics and local preview caveat before continuing."
+    if "query_backtest_trades" in tool_ids:
+        trades_result = next(
+            (result for result in reversed(tool_results or []) if result.get("tool_id") == "query_backtest_trades"),
+            None,
+        )
+        if trades_result is not None:
+            return _backtest_trades_fallback(trades_result, language)
         if is_vi:
-            return "Đã tạo PineTS local preview plan. Đây không phải TradingView validation."
-        return "Created a PineTS local preview plan. This is not TradingView validation."
-    if "create_signals_market_context_plan" in tool_ids:
+            return "Đã tải indexed trades từ backtest report. Hãy review trade rows và local preview caveat trước khi tiếp tục."
+        return "Loaded indexed trades from the backtest report. Review the trade rows and local preview caveat before continuing."
+    if "build_robustness_report" in tool_ids:
+        robustness_result = next(
+            (result for result in reversed(tool_results or []) if result.get("tool_id") == "build_robustness_report"),
+            None,
+        )
+        if robustness_result is not None:
+            return _robustness_report_fallback(robustness_result, language)
         if is_vi:
-            return "Đã tạo Backtest Kit signals market-context plan cho LLM context."
-        return "Created a Backtest Kit signals market-context plan for LLM context."
-    if "create_graph_pipeline_plan" in tool_ids:
-        if is_vi:
-            return "Đã tạo Backtest Kit graph pipeline plan cho multi-timeframe/variant composition."
-        return "Created a Backtest Kit graph pipeline plan for multi-timeframe and variant composition."
-    if "create_sidekick_export_plan" in tool_ids:
-        if is_vi:
-            return "Đã tạo Sidekick export/scaffold plan. Sidekick không chạy trong API runtime."
-        return "Created a Sidekick export/scaffold plan. Sidekick does not run in the API runtime."
+            return "Đã tạo robustness report review-only cho backtest preview hiện tại."
+        return "Built a review-only robustness report for the current backtest preview."
     if "create_backtest_plan" in tool_ids:
         if is_vi:
-            return "Đã tạo backtest plan review-only cho Backtest Kit local preview. Hãy review config trước khi queue run."
-        return "Created a review-only Backtest Kit local preview plan. Review the config before queueing a run."
+            return "Đã tạo backtest plan review-only cho local preview. Hãy review config trước khi queue run."
+        return "Created a review-only local preview plan. Review the config before queueing a run."
     return "Tool run đã hoàn tất. Hãy review kết quả phía trên trước khi tiếp tục." if is_vi else "The tool run completed successfully. Review the result above before continuing."
+
+
+def _maybe_backtest_summary_response(
+    final_text: str,
+    tool_ids: list[str],
+    tool_results: list[dict[str, Any]] | None,
+    language: str = "en",
+) -> str:
+    if "get_backtest_summary" not in tool_ids:
+        return final_text
+    summary_result = next(
+        (result for result in reversed(tool_results or []) if result.get("tool_id") == "get_backtest_summary"),
+        None,
+    )
+    if summary_result is None:
+        return final_text
+    if not _has_available_backtest_summary(summary_result):
+        if final_text.strip():
+            return final_text
+        return _backtest_summary_unavailable_message(language)
+    lower_text = final_text.lower()
+    looks_missing = any(
+        marker in lower_text
+        for marker in (
+            "didn't return specific",
+            "did not return specific",
+            "không trả về",
+            "không thấy kết quả",
+            "n/a",
+        )
+    )
+    has_summary_metrics = any(marker in lower_text for marker in ("pnl", "drawdown", "trade", "win rate", "trades"))
+    if looks_missing or not has_summary_metrics:
+        return _backtest_summary_fallback(summary_result, language)
+    return final_text
+
+
+def _maybe_backtest_trades_response(
+    final_text: str,
+    tool_ids: list[str],
+    tool_results: list[dict[str, Any]] | None,
+    language: str = "en",
+) -> str:
+    if "query_backtest_trades" not in tool_ids:
+        return final_text
+    trades_result = next(
+        (result for result in reversed(tool_results or []) if result.get("tool_id") == "query_backtest_trades"),
+        None,
+    )
+    if trades_result is None:
+        return final_text
+    output = trades_result.get("output") if isinstance(trades_result.get("output"), dict) else {}
+    trades = output.get("trades") if isinstance(output.get("trades"), list) else []
+    if not trades:
+        return final_text or _backtest_trades_fallback(trades_result, language)
+    lower_text = final_text.lower()
+    looks_deferred = any(
+        marker in lower_text
+        for marker in (
+            "let me",
+            "i'll fetch",
+            "i will fetch",
+            "need to actually retrieve",
+            "right away",
+            "để mình",
+            "mình sẽ tải",
+        )
+    )
+    has_trade_rows = "#1" in final_text or "trade_rank" in lower_text or "loaded " in lower_text and "trades" in lower_text
+    if looks_deferred or not has_trade_rows:
+        return _backtest_trades_fallback(trades_result, language)
+    return final_text
+
+
+def _maybe_auto_chain_final_response(
+    final_text: str,
+    tool_ids: list[str],
+    tool_results: list[dict[str, Any]] | None,
+    language: str = "en",
+    *,
+    auto_chain_started: bool,
+) -> str:
+    if not auto_chain_started:
+        return final_text
+    if "create_backtest_plan" in tool_ids and "run_backtest_preview" not in tool_ids:
+        lower_text = final_text.lower()
+        if "approval" in lower_text or "approve" in lower_text or "phê duyệt" in lower_text:
+            return final_text
+        if language == "vi":
+            approval_text = (
+                "Mình đã tạo backtest plan và đang chờ bạn phê duyệt trước khi queue local preview. "
+                "Preview này chỉ là kiểm thử local sandbox, không phải TradingView proof, broker proof, "
+                "live trading evidence, hoặc profitability claim."
+            )
+        else:
+            approval_text = (
+                "I created the backtest plan and am waiting for your approval before queueing the local preview. "
+                "This preview is local sandbox evidence only, not TradingView proof, broker proof, live trading evidence, "
+                "or a profitability claim."
+            )
+        return f"{final_text.rstrip()}\n\n{approval_text}"
+    if "run_backtest_preview" not in tool_ids:
+        return final_text
+    lower_text = final_text.lower()
+    if "queued" in lower_text or "đã queue" in lower_text or "backtest queued" in lower_text:
+        return final_text
+    queued_text = _tool_only_success_message(tool_ids, language, tool_results=tool_results)
+    return f"{final_text.rstrip()}\n\n{queued_text}"
+
+
+def _backtest_summary_fallback(tool_result: dict[str, Any], language: str = "en") -> str:
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else tool_result
+    summary = output.get("summary") if isinstance(output.get("summary"), dict) else {}
+    return format_backtest_summary_text(summary, language=language)
+
+
+def _has_available_backtest_summary(tool_result: dict[str, Any]) -> bool:
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else tool_result
+    return output.get("status") in (None, "ok") and isinstance(output.get("summary"), dict)
+
+
+def _backtest_summary_unavailable_message(language: str = "en") -> str:
+    if _normalize_language(language) == "vi":
+        return "Summary backtest chưa sẵn sàng cho run này. Hãy thử lại sau khi backtest hoàn tất."
+    return "The backtest summary is not available for this run yet. Try again after the backtest completes."
+
+
+def _backtest_trades_fallback(tool_result: dict[str, Any], language: str = "en") -> str:
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else tool_result
+    trades = output.get("trades") if isinstance(output.get("trades"), list) else []
+    is_vi = _normalize_language(language) == "vi"
+    if output.get("status") not in (None, "ok") or not trades:
+        return (
+            "Chưa có indexed trades cho backtest run này. Hãy thử lại sau khi report hoàn tất."
+            if is_vi
+            else "Indexed trades are not available for this backtest run yet. Try again after the report completes."
+        )
+    run_id = output.get("run_id")
+    header = (
+        f"Đã tải {len(trades)} indexed trades từ backtest run `{run_id}`." if is_vi and isinstance(run_id, str)
+        else f"Loaded {len(trades)} indexed trades from backtest run `{run_id}`." if isinstance(run_id, str)
+        else f"Đã tải {len(trades)} indexed trades từ backtest report." if is_vi
+        else f"Loaded {len(trades)} indexed trades from the backtest report."
+    )
+    if output.get("fallback_used") is True:
+        header += (
+            " Mình dùng latest completed backtest report trong conversation vì requested run không khớp."
+            if is_vi
+            else " I used the latest completed backtest report in this conversation because the requested run did not match."
+        )
+    return f"{header} {'Xem bảng bên dưới.' if is_vi else 'See the table below.'}"
+
+
+def _robustness_report_fallback(tool_result: dict[str, Any], language: str = "en") -> str:
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else tool_result
+    report = output.get("robustness_report") if isinstance(output.get("robustness_report"), dict) else {}
+    is_vi = _normalize_language(language) == "vi"
+    if output.get("status") not in (None, "ok") or not report:
+        return (
+            "Chưa thể tạo robustness report vì backtest report chưa sẵn sàng."
+            if is_vi
+            else "The robustness report is not available because the backtest report is not ready."
+        )
+    recommendation = report.get("recommendation")
+    checks = report.get("checks") if isinstance(report.get("checks"), list) else []
+    fail_count = sum(1 for check in checks if isinstance(check, dict) and check.get("status") == "fail")
+    warn_count = sum(1 for check in checks if isinstance(check, dict) and check.get("status") == "warn")
+    artifact_id = output.get("artifact_id")
+    run_id = output.get("run_id")
+    if is_vi:
+        lines = [
+            f"Đã tạo robustness report review-only cho backtest run `{run_id}`.",
+            f"Recommendation: `{recommendation}` với {fail_count} fail và {warn_count} warning.",
+        ]
+    else:
+        lines = [
+            f"Built a review-only robustness report for backtest run `{run_id}`.",
+            f"Recommendation: `{recommendation}` with {fail_count} failed checks and {warn_count} warnings.",
+        ]
+    if isinstance(artifact_id, str) and artifact_id:
+        lines.append(f"Artifact: `{artifact_id}`.")
+    lines.append("Local sandbox preview evidence only; not TradingView proof, broker proof, live trading evidence, or a profitability claim.")
+    return "\n".join(lines)
+
+
+def _format_backtest_trade_row(row: dict[str, Any]) -> str:
+    trade = row.get("trade") if isinstance(row.get("trade"), dict) else row
+    rank = row.get("trade_rank") or trade.get("trade_rank") or trade.get("number")
+    bucket = row.get("bucket")
+    side = trade.get("side") or trade.get("direction")
+    opened_at = row.get("opened_at") or trade.get("opened_at") or trade.get("entry_time") or trade.get("entry_timestamp")
+    closed_at = row.get("closed_at") or trade.get("closed_at") or trade.get("exit_time") or trade.get("exit_timestamp")
+    pnl_cost = row.get("pnl_cost") if row.get("pnl_cost") is not None else trade.get("pnl_cost")
+    pnl_pct = row.get("pnl_percentage") if row.get("pnl_percentage") is not None else trade.get("pnl_percentage")
+    parts: list[str] = []
+    if rank is not None:
+        parts.append(f"#{rank}")
+    if isinstance(bucket, str) and bucket:
+        parts.append(bucket.replace("_", " "))
+    if isinstance(side, str) and side:
+        parts.append(side)
+    pnl_parts = []
+    if isinstance(pnl_cost, int | float):
+        pnl_parts.append(f"{float(pnl_cost):+.2f}")
+    if isinstance(pnl_pct, int | float):
+        pnl_parts.append(f"{float(pnl_pct):+.2f}%")
+    if pnl_parts:
+        parts.append(f"P&L {' / '.join(pnl_parts)}")
+    if isinstance(opened_at, str) and opened_at:
+        if isinstance(closed_at, str) and closed_at:
+            parts.append(f"{opened_at} -> {closed_at}")
+        else:
+            parts.append(opened_at)
+    return ", ".join(parts) if parts else "indexed trade row"
+
+
+def _requested_tool_output_limit(value: Any, *, default: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(parsed, maximum))
+
+
+def _auto_chain_failure_message(tool_id: str, reason: str, language: str = "en") -> str:
+    is_vi = _normalize_language(language) == "vi"
+    safe_reason = _user_facing_preview_failure_text(reason)
+    if is_vi:
+        return (
+            f"Mình đã dừng auto-chain backtest ở bước `{tool_id}`: {safe_reason}. "
+            "Pine artifact/plan hiện có vẫn là review-only; hãy bổ sung symbol, timeframe, date range hoặc sửa validation rồi chạy lại preview."
+        )
+    return (
+        f"I stopped the backtest auto-chain at `{tool_id}`: {safe_reason}. "
+        "The current Pine artifact/plan remains review-only; add the missing symbol, timeframe, date range, or fix validation before running the preview again."
+    )
+
+
+def _user_facing_preview_failure_text(value: str) -> str:
+    text = re.sub(r"pineforge[-_\s]*(?:runner|engine)?", "local preview", value, flags=re.IGNORECASE)
+    text = re.sub(r"\bpineforge\b", "local preview", text, flags=re.IGNORECASE)
+    text = re.sub(r"\brunner\b", "preview runtime", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bengine\b", "preview runtime", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bcompile(?:d|r)?\b", "compatibility", text, flags=re.IGNORECASE)
+    text = re.sub(r"\btranspile(?:d|r)?\b", "compatibility", text, flags=re.IGNORECASE)
+    return text
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _generate_pine_fallback_summary(tool_result: dict[str, Any], language: str = "en") -> str:
+    is_vi = _normalize_language(language) == "vi"
+    spec = tool_result.get("strategy_spec") if isinstance(tool_result.get("strategy_spec"), dict) else {}
+    artifact_name = _safe_string(tool_result.get("artifact_name")) or "strategy.pine"
+    market = _safe_string(spec.get("market"))
+    symbol = _safe_string(spec.get("symbol"))
+    timeframe = _safe_string(spec.get("timeframe"))
+    premise = _strategy_premise_from_spec(spec)
+    context_parts = [part for part in (market, symbol, timeframe) if part]
+    context_text = " / ".join(context_parts) if context_parts else None
+    if is_vi:
+        lines = [f"Đã tạo artifact Pine v6 review-only `{artifact_name}`."]
+        if context_text:
+            lines.append(f"Giả định chính: {context_text}.")
+        if premise:
+            lines.append(f"Logic chính: {premise}.")
+        lines.append("Đây chưa phải TradingView/runtime proof, backtest proof, hay broker/live deployment approval.")
+        lines.append("Bước tiếp theo nên là review risk, static validation, rồi Backtest Preview nếu bạn muốn local preview evidence.")
+        return "\n".join(lines)
+    lines = [f"Generated the review-only Pine v6 artifact `{artifact_name}`."]
+    if context_text:
+        lines.append(f"Main assumptions: {context_text}.")
+    if premise:
+        lines.append(f"Core logic: {premise}.")
+    lines.append("This is not TradingView/runtime proof, backtest proof, or broker/live deployment approval.")
+    lines.append("Next step: review risk, run static validation, then use Backtest Preview for local preview evidence.")
+    return "\n".join(lines)
+
+
+def _strategy_premise_from_spec(spec: dict[str, Any]) -> str | None:
+    for key in ("strategy_name", "name", "premise", "description", "setup"):
+        value = _safe_string(spec.get(key))
+        if value:
+            return value[:180]
+    entry_rules = spec.get("entry_rules")
+    if isinstance(entry_rules, list):
+        for item in entry_rules:
+            value = _safe_string(item)
+            if value:
+                return value[:180]
+    return None
 
 
 def _market_snapshot_source_required_message(language: str = "en") -> str:
@@ -1754,10 +3847,6 @@ def _tool_activity_label(tool_name: str, language: str = "en") -> str:
             "create_backtest_plan": "Tạo backtest plan",
             "run_backtest_preview": "Queue backtest preview",
             "run_backtest_variant_lab": "Queue variant lab",
-            "create_pinets_preview_plan": "Tạo PineTS preview plan",
-            "create_signals_market_context_plan": "Tạo market context plan",
-            "create_graph_pipeline_plan": "Tạo graph pipeline plan",
-            "create_sidekick_export_plan": "Tạo Sidekick export plan",
         }
         if _normalize_language(language) == "vi"
         else {
@@ -1770,10 +3859,6 @@ def _tool_activity_label(tool_name: str, language: str = "en") -> str:
             "create_backtest_plan": "Create backtest plan",
             "run_backtest_preview": "Queue backtest preview",
             "run_backtest_variant_lab": "Queue variant lab",
-            "create_pinets_preview_plan": "Create PineTS preview plan",
-            "create_signals_market_context_plan": "Create market context plan",
-            "create_graph_pipeline_plan": "Create graph pipeline plan",
-            "create_sidekick_export_plan": "Create Sidekick export plan",
         }
     )
     return labels.get(tool_name, _tool_label(tool_name))
@@ -1802,7 +3887,7 @@ def _tool_user_summary(tool_name: str, output: dict[str, Any], language: str = "
     if tool_name == "create_mql5_design":
         return "Đã chuẩn bị MQL5 design note từ strategy spec đã cung cấp." if is_vi else "Prepared an MQL5 design note from the provided strategy spec."
     if tool_name == "create_backtest_plan":
-        return "Đã tạo backtest plan review-only cho Backtest Kit local preview." if is_vi else "Created a review-only Backtest Kit local preview plan."
+        return "Đã tạo backtest plan review-only cho local preview." if is_vi else "Created a review-only local preview plan."
     if tool_name == "run_backtest_preview":
         run_id = output.get("run_id")
         if is_vi:
@@ -1814,14 +3899,6 @@ def _tool_user_summary(tool_name: str, output: dict[str, Any], language: str = "
         if is_vi:
             return f"Đã queue {count} backtest variants để so sánh." if count else "Đã queue backtest variant lab."
         return f"Queued {count} comparable backtest variants." if count else "Queued a backtest variant lab."
-    if tool_name == "create_pinets_preview_plan":
-        return "Đã tạo PineTS local preview plan; đây không phải TradingView validation." if is_vi else "Created a PineTS local preview plan; this is not TradingView validation."
-    if tool_name == "create_signals_market_context_plan":
-        return "Đã tạo market-context plan dùng @backtest-kit/signals, model routing vẫn thuộc strategy-codebot." if is_vi else "Created a market-context plan using @backtest-kit/signals; model routing remains in strategy-codebot."
-    if tool_name == "create_graph_pipeline_plan":
-        return "Đã tạo graph pipeline plan cho multi-timeframe/variant composition." if is_vi else "Created a graph pipeline plan for multi-timeframe and variant composition."
-    if tool_name == "create_sidekick_export_plan":
-        return "Đã tạo Sidekick export plan; Sidekick không chạy trong API runtime." if is_vi else "Created a Sidekick export plan; Sidekick does not run in the API runtime."
     return "Tool output đã sẵn sàng." if is_vi else "Tool output is ready."
 
 
@@ -1894,6 +3971,22 @@ def _title_prompt(user_message: str) -> str:
     return f"User message:\n{redact_text(user_message)}"
 
 
+def _sanitize_user_facing_model_text(value: str) -> str:
+    return (
+        value.replace("PineForge local Pine preview evidence only", "Local sandbox preview evidence only")
+        .replace("PineForge local Pine preview evidence", "Local sandbox preview evidence")
+        .replace("PineForge (Local Preview)", "local preview")
+        .replace("PineForge Preview", "Backtest Preview")
+        .replace("PineForge local Pine preview", "local sandbox preview")
+        .replace("PineForge output", "Local sandbox preview output")
+        .replace("PineForge compile/backtest", "local preview")
+        .replace("PineForge backtest", "backtest preview")
+        .replace("PineForge", "local sandbox preview")
+        .replace("pineforge-engine", "local preview")
+        .replace("pineforge-runner", "local preview")
+    )
+
+
 def _system_prompt(language: str = "en", *, web_search: str = "auto") -> str:
     language_instruction = (
         "Respond in Vietnamese for user-facing chat text. Keep code, Pine syntax, JSON schema keys, tool ids, artifact filenames, and policy/event codes unchanged."
@@ -1917,6 +4010,8 @@ def _system_prompt(language: str = "en", *, web_search: str = "auto") -> str:
 - Do not request shell, arbitrary network, arbitrary file, broker, exchange, or live trading actions.
 - Do not claim profitability, compile success, runtime success, or backtest success without evidence.
 - Keep every generated artifact and recommendation review-only.
+- Do not reveal internal implementation names, package names, service names, provider routes, runner names, or engine/vendor names.
+- If users ask what backtest engine, runner, provider, or package is used, answer only with the product term "local sandbox preview" or "Backtest Preview"; do not name internal dependencies.
 </safety_boundaries>
 
 <response_style>
@@ -1933,7 +4028,8 @@ def _system_prompt(language: str = "en", *, web_search: str = "auto") -> str:
 - For capability questions, include what you can help with and the review-only boundary.
 - For strategy requests, summarize the idea, clarify assumptions if needed, then propose next steps.
 - For generated code or reports, keep the chat answer brief and point users to the reviewable artifact when available.
-- For Backtest Kit requests, use create_backtest_plan before queueing when config assumptions are not explicit. Use create_pinets_preview_plan for Pine local preview, create_signals_market_context_plan for LLM-ready market context, create_graph_pipeline_plan for multi-timeframe/variant composition, and create_sidekick_export_plan only for export/scaffold guidance. Treat run_backtest_preview and run_backtest_variant_lab outputs as queued local preview jobs only; never claim backtest success until report artifacts exist.
+- After generate_pine succeeds, always produce a short final summary covering the strategy premise, symbol/timeframe assumptions, artifact name, key risk/review caveat, and the next validation or preview action. Do not stop after the tool call unless the runtime stops you.
+- For Backtest Preview requests, require PineScript v6 strategy source, use create_backtest_plan before queueing when config assumptions are not explicit, and treat run_backtest_preview and run_backtest_variant_lab outputs as queued local preview jobs only; never claim backtest success until report artifacts exist.
 </domain_shape>"""
 
 
@@ -1960,9 +4056,14 @@ def _provider_tools_for_web_search(
     message_content: str,
     *,
     response_intent: str | None = None,
+    current_context_required: bool = False,
 ) -> list[dict[str, Any]]:
     mode = _normalize_web_search(web_search)
-    intent_needs_web_search = response_intent in {"docs_research", "market_research", "market_snapshot"}
+    intent_needs_web_search = current_context_required or response_intent in {
+        "docs_research",
+        "market_research",
+        "market_snapshot",
+    }
     if intent_needs_web_search and mode != "off":
         return [{"type": "web_search"}]
 

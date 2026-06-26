@@ -31,6 +31,7 @@ CURRENT_STAGE_PROMPT_TEMPLATES = {
         "Include a concrete market premise/regime, failure mode, invalidation, timeframe/session or liquidity assumptions, and ask-before-coding gaps. "
         "For strategy outputs, include concrete position sizing, stop-loss, and take-profit assumptions "
         "unless the prompt explicitly requests indicator-only output or excludes fixed risk exits. "
+        "State risk concentration assumptions: per-trade risk, exposure or portfolio heat, correlated-position cap, and leverage boundary. "
         "If the prompt asks for price-action-only or no-indicator logic, do not add ATR, moving averages, RSI, MACD, stochastic, or other indicators; use explicit OHLC swing, wick, close, sweep, reclaim, BOS/retest, and structure rules. "
         "For sweep/reclaim logic, describe failed-reclaim handling and avoid chasing every break. "
         "{conservative_sizing_guidance}"
@@ -40,6 +41,7 @@ CURRENT_STAGE_PROMPT_TEMPLATES = {
         "Encode the trading thesis, regime, invalidation, session/liquidity assumptions, and false-break handling into rules or constraints. "
         "Populate stop_loss and take_profit for strategy outputs when risk exits are expected. "
         "Set position_sizing to fixed units, 1-2% account equity risk, or another explicitly bounded small-risk model; never use all-in or full-capital sizing. "
+        "Add risk_rules for single-strategy exposure, portfolio-heat or correlated-position caps, and no leverage unless explicitly bounded. "
         "For price-action-only or no-indicator prompts, encode indicator bans in constraints and use only OHLC-derived swing/structure rules. "
         "{conservative_sizing_guidance}"
     ),
@@ -70,6 +72,7 @@ OPTIMIZED_STAGE_PROMPT_TEMPLATES = {
     STAGE_STRATEGY_REASONING: (
         "Create a concise strategy brief, not Pine code. State the market thesis first: regime, timeframe/session, liquidity condition, and when the setup should be avoided. "
         "Then specify entry trigger, invalidation, failed-break/fakeout handling, stop/target premise, bounded sizing, and ask-before-coding gaps. "
+        "Include risk concentration assumptions: per-trade risk, exposure/portfolio heat, correlation, and leverage boundary. "
         "For price-action-only prompts, use OHLC structure terms only: sweep, reclaim, wick, close, BOS/retest, prior swing, support/resistance. "
         "Do not introduce ATR, MA, RSI, MACD, stochastic, oscillators, or other indicators when the prompt forbids indicators. "
         "{conservative_sizing_guidance}"
@@ -77,6 +80,7 @@ OPTIMIZED_STAGE_PROMPT_TEMPLATES = {
     STAGE_STRATEGY_CODING: (
         "Convert the brief into strategy_spec only. Encode premise/regime, avoid conditions, entry trigger, invalidation, stop, target, session/timeframe, false-break handling, and indicator bans as explicit fields or constraints. "
         "Use fixed units, 1-2% account equity risk, or another bounded small-risk sizing model; never full balance, all-in, or 100% equity. "
+        "Risk rules must state exposure or portfolio heat assumptions, correlated-position cap, and leverage boundary. "
         "If information is missing, encode conservative assumptions rather than inventing extra indicators. "
         "{conservative_sizing_guidance}"
     ),

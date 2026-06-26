@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,13 +14,31 @@ from strategy_codebot.server.database import create_sqlite_repository
 from strategy_codebot.server.llm_clients import LLMClientEvent
 from strategy_codebot.server.llm_clients import LLM_EVENT_SOURCES
 from strategy_codebot.server.llm_clients import ProviderTimeoutError
+from strategy_codebot.server.llm_clients import chat_completion_events
 from strategy_codebot.server.llm_clients import response_events
 from strategy_codebot.server.llm_clients import stream_response_events
 from strategy_codebot.server.llm_orchestrator import LLMOrchestrator
+from strategy_codebot.server.llm_orchestrator import ActionPlanner
+from strategy_codebot.server.llm_orchestrator import ActionPlanDecision
+from strategy_codebot.server.llm_orchestrator import ChatIntentDecisionPlanner
 from strategy_codebot.server.llm_orchestrator import ResponseIntentClassifier
+from strategy_codebot.server.llm_orchestrator import _classify_domain_scope
+from strategy_codebot.server.llm_orchestrator import _classifier_timeout_seconds
 from strategy_codebot.server.llm_orchestrator import _classify_response_intent
+from strategy_codebot.server.llm_orchestrator import _model_stage_for_chat
+from strategy_codebot.server.llm_orchestrator import _parse_action_plan_json
+from strategy_codebot.server.llm_orchestrator import _parse_chat_intent_decision_json
+from strategy_codebot.server.llm_orchestrator import _sanitize_user_facing_model_text
 from strategy_codebot.server.llm_orchestrator import _should_enable_web_search_auto
+from strategy_codebot.server.llm_orchestrator import _action_planner_system_prompt
+from strategy_codebot.server.llm_orchestrator import _chat_intent_decision_system_prompt
+from strategy_codebot.server.llm_orchestrator import _direct_action_plan_tool_args
+from strategy_codebot.server.llm_orchestrator import _suggestions_payload
 from strategy_codebot.server.llm_orchestrator import _system_prompt
+from strategy_codebot.server.llm_orchestrator import _maybe_backtest_summary_response
+from strategy_codebot.server.llm_orchestrator import _maybe_backtest_trades_response
+from strategy_codebot.server.llm_orchestrator import _tool_only_success_message
+from strategy_codebot.server.llm_orchestrator import _tool_success_result
 from strategy_codebot.server.market_data import MarketDataGateway
 from strategy_codebot.server.schemas import MessageCreate
 from strategy_codebot.server.llm_tools import compact_tool_output, tool_catalog_consistency_errors
@@ -30,6 +49,18 @@ from server_helpers import valid_spec
 AUTH_A = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-a"}
 AUTH_B = {"X-User-Id": "user-b", "X-Workspace-Id": "workspace-a"}
 AUTH_OTHER_WORKSPACE = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-b"}
+
+
+def test_classifier_timeout_defaults_to_route_aware_budget(monkeypatch) -> None:
+    monkeypatch.delenv("STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS", raising=False)
+
+    assert _classifier_timeout_seconds() == 25.0
+
+
+def test_classifier_timeout_env_override_still_wins(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS", "3.5")
+
+    assert _classifier_timeout_seconds() == 3.5
 
 
 @dataclass
@@ -60,6 +91,17 @@ class RecordingLLMClient(FakeLLMClient):
 
 
 @dataclass
+class SlowLLMClient(FakeLLMClient):
+    delay_seconds: float = 0.2
+    calls: int = 0
+
+    def stream(self, *, messages: list[dict[str, str]], tools: list[dict]) -> Iterable[LLMClientEvent]:
+        self.calls += 1
+        time.sleep(self.delay_seconds)
+        return list(self.events)
+
+
+@dataclass
 class SequencedRecordingLLMClient:
     event_batches: list[list[LLMClientEvent]]
     model: str = "fake-responses-model"
@@ -86,7 +128,9 @@ class SummaryFailingAfterAnswerClient:
 
     def stream(self, *, messages: list[dict[str, str]], tools: list[dict]) -> Iterable[LLMClientEvent]:
         self.calls_messages.append(messages)
-        if len(self.calls_messages) == 1:
+        if len(self.calls_messages) in {1, 2}:
+            return [LLMClientEvent(type="message.delta", text="not an action plan")]
+        if len(self.calls_messages) == 3:
             return [LLMClientEvent(type="message.delta", text="Answer before summary failure.")]
         raise RuntimeError("summary provider down")
 
@@ -103,6 +147,8 @@ class IntentFailingThenAnswerClient:
         self.calls_messages.append(messages)
         if len(self.calls_messages) == 1:
             raise RuntimeError("intent classifier provider down")
+        if len(self.calls_messages) == 2:
+            return [LLMClientEvent(type="message.delta", text="not an action plan")]
         return [LLMClientEvent(type="message.delta", text="Fallback answer.")]
 
 
@@ -117,7 +163,41 @@ def test_system_prompt_includes_markdown_style_and_safety_boundaries() -> None:
     assert "fenced code blocks" in prompt
     assert "Do not request shell" in prompt
     assert "Do not claim profitability" in prompt
+    assert "Do not reveal internal implementation names" in prompt
+    assert "local sandbox preview" in prompt
     assert "review-only" in prompt
+
+
+def test_user_facing_model_text_sanitizes_backtest_engine_name() -> None:
+    text = _sanitize_user_facing_model_text(
+        "Our backtest engine is PineForge. Engine: PineForge. Use PineForge Preview next."
+    )
+
+    assert "PineForge" not in text
+    assert "local sandbox preview" in text
+    assert "Backtest Preview" in text
+
+
+def test_model_stage_selects_pine_generation_for_backtest_prompts() -> None:
+    assert (
+        _model_stage_for_chat(
+            "Generate a PineScript strategy and backtest BTC/USDT for 1Y",
+            response_intent="strategy_building",
+            active_tools=[],
+        )
+        == "pine_code_generation"
+    )
+
+
+def test_model_stage_keeps_normal_strategy_chat_on_reasoning() -> None:
+    assert (
+        _model_stage_for_chat(
+            "Review my entry and risk assumptions",
+            response_intent="strategy_building",
+            active_tools=[],
+        )
+        == "strategy_reasoning"
+    )
 
 
 def test_system_prompt_includes_selected_language_instruction() -> None:
@@ -150,7 +230,17 @@ def test_agent_chat_web_search_mode_controls_provider_tool() -> None:
         any(tool.get("type") == "web_search" for tool in tools)
         for tools in llm.calls_tools
     ]
-    assert enabled_flags == [False, False, False, True, True, True]
+    assert len(enabled_flags) == 18
+    assert enabled_flags[0::3] == [False, False, False, False, False, False]
+    assert enabled_flags[1::3] == [False, False, False, False, False, False]
+    assert enabled_flags[2::3] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
     assert _should_enable_web_search_auto("generate from current strategy context") is False
 
 
@@ -168,6 +258,20 @@ def test_response_intent_classifier_uses_deterministic_fast_path_without_llm() -
     classification = ResponseIntentClassifier(llm).classify("what is the current ETH price?", web_search="auto")
 
     assert classification.intent == "market_snapshot"
+    assert classification.source == "deterministic"
+    assert classification.confidence >= 0.9
+    assert llm.calls == 0
+
+
+def test_response_intent_classifier_market_condition_followup_is_deterministic() -> None:
+    llm = RecordingLLMClient([LLMClientEvent(type="message.delta", text='{"intent":"general_chat","confidence":1}')])
+
+    classification = ResponseIntentClassifier(llm).classify(
+        "what should I do with this market condition?",
+        web_search="auto",
+    )
+
+    assert classification.intent == "market_research"
     assert classification.source == "deterministic"
     assert classification.confidence >= 0.9
     assert llm.calls == 0
@@ -197,6 +301,112 @@ def test_response_intent_classifier_falls_back_on_malformed_or_low_confidence() 
     assert malformed.source == "fallback"
     assert low_confidence.intent == "general_chat"
     assert low_confidence.source == "fallback"
+
+
+def test_response_intent_classifier_timeout_falls_back_quickly(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS", "0.01")
+    client = SlowLLMClient([LLMClientEvent(type="message.delta", text='{"intent":"market_snapshot","confidence":0.9}')])
+    started = time.perf_counter()
+
+    classification = ResponseIntentClassifier(client).classify("ETH đang bao nhiêu rồi?", web_search="auto")
+
+    assert time.perf_counter() - started < 0.15
+    assert classification.intent == "general_chat"
+    assert classification.source == "timeout_fallback"
+    assert client.calls == 1
+
+
+def test_chat_intent_decision_parser_accepts_llm_auto_chain() -> None:
+    decision = _parse_chat_intent_decision_json(
+        json.dumps(
+            {
+                "response_intent": "backtest_preview",
+                "action": "start_auto_chain",
+                "model_stage": "pine_code_generation",
+                "confidence": 0.91,
+                "tool_id": "run_backtest_preview",
+                "auto_chain": True,
+                "current_context_required": False,
+                "missing_inputs": [],
+                "reasons": ["The user asks to simulate strategy performance."],
+                "used_signals": ["preview_intent"],
+            }
+        ),
+        available_tools={"run_backtest_preview"},
+        regex_evidence={"preview_intent": True},
+    )
+
+    assert decision is not None
+    assert decision.response_intent == "backtest_preview"
+    assert decision.action == "start_auto_chain"
+    assert decision.model_stage == "pine_code_generation"
+    assert decision.tool_id == "run_backtest_preview"
+    assert decision.should_start_auto_chain() is True
+
+
+def test_chat_intent_decision_parser_downgrades_unavailable_tool() -> None:
+    decision = _parse_chat_intent_decision_json(
+        '{"response_intent":"general_chat","action":"call_tool","model_stage":"strategy_reasoning","confidence":0.9,"tool_id":"missing_tool"}',
+        available_tools={"query_backtest_trades"},
+    )
+
+    assert decision is not None
+    assert decision.action == "suggest_actions"
+    assert decision.tool_id is None
+
+
+def test_chat_intent_decision_parser_rejects_low_confidence() -> None:
+    decision = _parse_chat_intent_decision_json(
+        '{"response_intent":"backtest_preview","action":"start_auto_chain","model_stage":"pine_code_generation","confidence":0.2,"auto_chain":true}',
+        available_tools={"run_backtest_preview"},
+    )
+
+    assert decision is None
+
+
+def test_chat_intent_decision_planner_uses_llm_for_vietnamese_paraphrase() -> None:
+    llm = RecordingLLMClient(
+        [
+            LLMClientEvent(
+                type="message.delta",
+                text=json.dumps(
+                    {
+                        "response_intent": "backtest_preview",
+                        "action": "start_auto_chain",
+                        "model_stage": "pine_code_generation",
+                        "confidence": 0.88,
+                        "tool_id": "run_backtest_preview",
+                        "auto_chain": True,
+                        "current_context_required": False,
+                        "missing_inputs": [],
+                        "reasons": ["The user asks to test strategy effectiveness."],
+                        "used_signals": ["preview_intent"],
+                    }
+                ),
+            )
+        ]
+    )
+
+    decision = ChatIntentDecisionPlanner(llm).decide(
+        "thử hiệu quả chiến lược này giúp mình",
+        context_text="Pine strategy artifact exists for BTCUSDT 1h.",
+        artifact_kinds={"pine_file"},
+        web_search="auto",
+        language="vi",
+    )
+
+    assert decision.source == "llm"
+    assert decision.response_intent == "backtest_preview"
+    assert decision.should_start_auto_chain() is True
+    assert llm.calls == 1
+
+
+def test_chat_intent_decision_prompt_marks_regex_as_hint() -> None:
+    prompt = _chat_intent_decision_system_prompt()
+
+    assert "Regex evidence is only a hint" in prompt
+    assert "start_auto_chain" in prompt
+    assert "chay thu" in prompt
 
 
 def test_agent_chat_emits_source_backed_market_snapshot(tmp_path: Path) -> None:
@@ -289,6 +499,7 @@ def test_market_chat_allows_reference_urls_without_policy_block(tmp_path: Path) 
     assert stream.status_code == 200, stream.text
     frames = parse_sse(stream.text)
     assert "policy.blocked" not in [frame["event"] for frame in frames]
+    assert not any(frame["event"].startswith("chat.auto_chain.") for frame in frames)
     terminal = next(frame for frame in frames if frame["event"] == "run.completed")
     assert terminal["data"]["payload"]["status"] == "completed"
     assert any(frame["event"] == "chat.market_snapshot" for frame in frames)
@@ -380,8 +591,7 @@ def test_agent_chat_emits_context_aware_suggestions_for_market_prompt(tmp_path: 
     suggestions = next(frame for frame in frames if frame["event"] == "chat.suggestions.updated")
     payload = suggestions["data"]["payload"]
     assert payload["context"]["intent"] == "market_snapshot"
-    assert [action["category"] for action in payload["actions"]] == ["market", "strategy"]
-    assert "code" not in {action["category"] for action in payload["actions"]}
+    assert payload["actions"] == []
 
 
 def test_agent_chat_emits_missing_field_suggestions_for_strategy_prompt(tmp_path: Path) -> None:
@@ -402,7 +612,392 @@ def test_agent_chat_emits_missing_field_suggestions_for_strategy_prompt(tmp_path
     assert payload["context"]["intent"] == "strategy_building"
     assert "risk" in payload["context"]["missing_fields"]
     assert any(block["slot"] == "risk" for block in payload["composer_blocks"])
-    assert any(action["id"] == "add-risk" for action in payload["actions"])
+    assert payload["actions"] == []
+
+
+def test_registry_backed_suggestions_use_planner_actions() -> None:
+    decision = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "suggest_actions",
+                            "intent_id": "bot_boundary_review",
+                            "confidence": 0.9,
+                            "suggested_actions": ["create_proposed_intent", "run_risk_gate"],
+                            "reason": "The user asks about bot/order behavior.",
+                        }
+                    ),
+                )
+            ]
+        )
+    ).plan(
+        "Nếu trade setup này thì vào lệnh sao và chạy bot được không?",
+        response_intent="strategy_building",
+        context_text="Market BTCUSDT timeframe 1h entry sweep reclaim exit stop-loss risk 1%",
+        artifact_kinds={"pine_file"},
+        web_search="auto",
+    )
+
+    payload = _suggestions_payload(
+        response_intent="strategy_building",
+        message_content="Nếu trade setup này thì vào lệnh sao và chạy bot được không?",
+        context_text="Market BTCUSDT timeframe 1h entry sweep reclaim exit stop-loss risk 1%",
+        language="vi",
+        artifact_kinds={"pine_file"},
+        action_plan=decision,
+    )
+
+    action_ids = [action["id"] for action in payload["actions"]]
+    assert action_ids[:2] == ["create-proposed-intent", "run-risk-gate"]
+    assert payload["actions"][0]["tool_id"] == "create_proposed_intent"
+    assert payload["actions"][0]["prompt"]
+    assert payload["actions"][1]["enabled"] is False
+    assert payload["actions"][1]["risk_level"] == "blocked"
+    assert "stale_after" in payload["actions"][1]["required_inputs"]
+    assert payload["context"]["action_plan_source"] == "llm"
+
+
+def test_registry_backed_suggestions_cover_backtest_robustness_and_variant() -> None:
+    preview_decision = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "suggest_actions",
+                            "intent_id": "local_preview_evidence",
+                            "confidence": 0.88,
+                            "suggested_actions": ["run_backtest_preview"],
+                            "reason": "Strategy code exists and the user asks for evidence.",
+                        }
+                    ),
+                )
+            ]
+        )
+    ).plan(
+        "test kỹ hơn giúp mình",
+        response_intent="general_chat",
+        context_text="market BTCUSDT timeframe 1h entry reclaim exit stop-loss risk 1%",
+        artifact_kinds={"pine_file"},
+        web_search="auto",
+    )
+    preview_payload = _suggestions_payload(
+        response_intent="general_chat",
+        message_content="test kỹ hơn giúp mình",
+        context_text="market BTCUSDT timeframe 1h entry reclaim exit stop-loss risk 1%",
+        language="vi",
+        artifact_available=True,
+        artifact_kinds={"pine_file"},
+        action_plan=preview_decision,
+    )
+    assert preview_payload["actions"][0]["id"] == "run-backtest-preview"
+    assert preview_payload["actions"][0]["tool_id"] == "run_backtest_preview"
+
+    robustness_decision = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "suggest_actions",
+                            "intent_id": "strategy_optimization",
+                            "confidence": 0.88,
+                            "suggested_actions": ["build_robustness_report", "run_backtest_variant_lab"],
+                            "reason": "The user asks to optimize after backtest evidence.",
+                        }
+                    ),
+                )
+            ]
+        )
+    ).plan(
+        "optimize thêm đi",
+        response_intent="general_chat",
+        context_text="Backtest report is available for BTCUSDT.",
+        artifact_kinds={"backtest_report"},
+        web_search="auto",
+    )
+    robustness_payload = _suggestions_payload(
+        response_intent="general_chat",
+        message_content="optimize thêm đi",
+        context_text="Backtest report is available for BTCUSDT.",
+        language="vi",
+        artifact_available=True,
+        artifact_kinds={"backtest_report"},
+        action_plan=robustness_decision,
+    )
+    action_ids = {action["id"] for action in robustness_payload["actions"]}
+    assert "build-robustness-report" in action_ids
+    assert "run-variant-lab" in action_ids
+
+
+def test_registry_backed_suggestion_disabled_when_action_unavailable() -> None:
+    decision = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "suggest_actions",
+                            "intent_id": "validation_repair",
+                            "confidence": 0.9,
+                            "suggested_actions": ["repair"],
+                            "reason": "Repair was requested.",
+                        }
+                    ),
+                )
+            ]
+        )
+    ).plan(
+        "repair this",
+        response_intent="general_chat",
+        context_text="No validation issue is present.",
+        artifact_kinds={"pine_file"},
+        web_search="auto",
+    )
+
+    payload = _suggestions_payload(
+        response_intent="general_chat",
+        message_content="repair this",
+        context_text="No validation issue is present.",
+        language="en",
+        artifact_available=True,
+        artifact_kinds={"pine_file"},
+        action_plan=decision,
+    )
+
+    repair = payload["actions"][0]
+    assert repair["id"] == "repair-validation"
+    assert repair["enabled"] is False
+    assert repair["disabled_reason"] == "A static validation problem is required."
+
+
+def test_action_planner_robustness_prompt_does_not_route_to_market_research() -> None:
+    prompt = (
+        "Build a review-only robustness report for the current preview evidence. "
+        "Summarize sample size, fees, slippage, drawdown, OOS concerns, and suspicious metrics."
+    )
+    planner = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "call_tool",
+                            "intent_id": "robustness_review",
+                            "confidence": 0.92,
+                            "tool_id": "build_robustness_report",
+                            "arguments": {"run_id": "latest_completed_backtest"},
+                            "suggested_actions": ["build_robustness_report"],
+                            "reason": "The prompt asks for a robustness report from current preview evidence.",
+                        }
+                    ),
+                )
+            ]
+        )
+    )
+    decision = planner.plan(
+        prompt,
+        response_intent="general_chat",
+        context_text="Backtest report is available for BNB/USDT.",
+        artifact_kinds={"backtest_report"},
+        web_search="auto",
+    )
+
+    payload = _suggestions_payload(
+        response_intent="general_chat",
+        message_content=prompt,
+        context_text="Backtest report is available for BNB/USDT.",
+        language="en",
+        artifact_available=True,
+        artifact_kinds={"backtest_report"},
+        action_plan=decision,
+    )
+
+    action_ids = [action["id"] for action in payload["actions"]]
+    assert decision.suggested_actions == ("build_robustness_report",)
+    assert "build-robustness-report" in action_ids
+    assert "market-research" not in action_ids
+
+
+def test_action_planner_routes_current_preview_evidence_to_robustness_tool() -> None:
+    planner = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "call_tool",
+                            "intent_id": "robustness_review",
+                            "confidence": 0.91,
+                            "tool_id": "build_robustness_report",
+                            "arguments": {"run_id": "latest_completed_backtest"},
+                            "suggested_actions": ["build_robustness_report"],
+                            "reason": "The user asks for a robustness report from current preview evidence.",
+                        }
+                    ),
+                )
+            ]
+        )
+    )
+
+    decision = planner.plan(
+        "Build a review-only robustness report for the current preview evidence.",
+        response_intent="general_chat",
+        context_text="Backtest report is available for BNB/USDT.",
+        artifact_kinds={"backtest_report"},
+        web_search="auto",
+    )
+
+    assert decision.decision == "call_tool"
+    assert decision.tool_id == "build_robustness_report"
+    assert decision.arguments == {"run_id": "latest_completed_backtest"}
+
+
+def test_action_planner_trade_followup_uses_structured_arguments() -> None:
+    planner = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "call_tool",
+                            "intent_id": "trade_review",
+                            "confidence": 0.93,
+                            "tool_id": "query_backtest_trades",
+                            "arguments": {"run_id": "latest_completed_backtest", "bucket": "sample", "limit": 20},
+                            "reason": "The user asks for the first 20 trades.",
+                        }
+                    ),
+                )
+            ]
+        )
+    )
+
+    decision = planner.plan(
+        "i mean the first 20 trades",
+        response_intent="general_chat",
+        context_text="Loaded 5 indexed trades from backtest run `run_a54`.",
+        artifact_kinds={"backtest_dashboard", "backtest_report"},
+        web_search="auto",
+    )
+
+    assert decision.decision == "call_tool"
+    assert decision.tool_id == "query_backtest_trades"
+    assert decision.arguments == {"run_id": "latest_completed_backtest", "bucket": "sample", "limit": 20}
+
+
+def test_action_planner_prompt_requires_trade_queries_to_call_tool() -> None:
+    prompt = _action_planner_system_prompt()
+
+    assert "show/list/fetch/give first N trades" in prompt
+    assert "query_backtest_trades" in prompt
+    assert "Omit bucket for first/latest/all trade requests" in prompt
+    assert "structured table" in prompt
+    assert "Do not answer that you will fetch data" in prompt
+
+
+def test_direct_trade_action_plan_does_not_default_to_sample_bucket() -> None:
+    planned_tool = _direct_action_plan_tool_args(
+        ActionPlanDecision(
+            decision="call_tool",
+            intent_id="trade_review",
+            confidence=0.95,
+            source="planner",
+            tool_id="query_backtest_trades",
+            arguments={"run_id": "latest_completed_backtest", "limit": 50},
+        ),
+        artifact_kinds={"backtest_report", "backtest_dashboard"},
+        context_text="Backtest dashboard is available.",
+        web_search="auto",
+    )
+
+    assert planned_tool == (
+        "query_backtest_trades",
+        {"run_id": "latest_completed_backtest", "limit": 50},
+    )
+
+
+def test_action_planner_timeout_does_not_fall_back_to_semantic_keywords(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS", "0.01")
+    planner = ActionPlanner(
+        SlowLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "suggest_actions",
+                            "intent_id": "strategy_evidence_review",
+                            "confidence": 0.9,
+                            "suggested_actions": ["run_backtest_preview"],
+                            "reason": "Would be useful, but this response times out.",
+                        }
+                    ),
+                )
+            ]
+        )
+    )
+
+    decision = planner.plan(
+        "test kỹ hơn giúp mình",
+        response_intent="general_chat",
+        context_text="strategy artifact exists",
+        artifact_kinds={"pine_file"},
+        web_search="auto",
+    )
+
+    assert decision.decision == "answer"
+    assert decision.source == "timeout_fallback"
+    assert decision.suggested_actions == ()
+
+
+def test_action_planner_live_prompt_stays_review_only_boundary() -> None:
+    decision = ActionPlanner(
+        FakeLLMClient(
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "decision": "suggest_actions",
+                            "intent_id": "bot_boundary_review",
+                            "confidence": 0.9,
+                            "suggested_actions": ["create_proposed_intent", "run_risk_gate"],
+                            "reason": "The user asks about live/bot behavior, so only review artifacts are allowed.",
+                        }
+                    ),
+                )
+            ]
+        )
+    ).plan(
+        "Cho setup này trade live luôn được không?",
+        response_intent="strategy_building",
+        context_text="Market BTCUSDT timeframe 1h entry reclaim exit stop-loss risk 1%",
+        artifact_kinds={"pine_file"},
+        web_search="auto",
+    )
+    payload = _suggestions_payload(
+        response_intent="strategy_building",
+        message_content="Cho setup này trade live luôn được không?",
+        context_text="Market BTCUSDT timeframe 1h entry reclaim exit stop-loss risk 1%",
+        language="vi",
+        artifact_kinds={"pine_file"},
+        action_plan=decision,
+    )
+
+    action_ids = [action["id"] for action in payload["actions"]]
+    assert action_ids[:2] == ["create-proposed-intent", "run-risk-gate"]
+    assert all("trade now" not in action["label"].lower() for action in payload["actions"])
+    assert all(action.get("tool_id") not in {"paper_trade", "live_trade", "broker_execute"} for action in payload["actions"])
 
 
 def test_agent_chat_classifier_failure_does_not_fail_stream(tmp_path: Path) -> None:
@@ -431,7 +1026,62 @@ def test_agent_chat_classifier_failure_does_not_fail_stream(tmp_path: Path) -> N
     assert intent["data"]["payload"]["intent"] == "general_chat"
     assert intent["data"]["payload"]["source"] == "fallback"
     assert any(frame["event"] == "message.delta" for frame in frames)
-    assert len(llm.calls_messages) == 2
+    assert len(llm.calls_messages) == 3
+
+
+def test_domain_scope_guard_blocks_explicit_off_topic_without_provider_call() -> None:
+    auth = AuthContext("user-a", "workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth)
+    llm = RecordingLLMClient([LLMClientEvent(type="message.delta", text="should not be used")])
+    orchestrator = LLMOrchestrator(
+        repository=repository,
+        artifact_store=None,
+        client=llm,
+    )
+
+    frames = [
+        frame
+        for raw in orchestrator.stream_chat(
+            auth=auth,
+            conversation_id=conversation.id,
+            message_content="help me write an email to my landlord",
+            web_search="auto",
+        )
+        for frame in parse_sse(raw)
+    ]
+
+    event_types = [frame["event"] for frame in frames]
+    intent = next(frame for frame in frames if frame["event"] == "chat.response_intent")
+    assistant_delta = next(frame for frame in frames if frame["event"] == "message.delta")
+    assert intent["data"]["payload"]["source"] == "domain_scope_guard"
+    assert intent["data"]["payload"]["domain_scope"] == "off_topic"
+    assert "Strategy Codebot" in assistant_delta["data"]["payload"]["text"]
+    assert "provider.started" not in event_types
+    assert "tool.started" not in event_types
+    assert "policy.blocked" not in event_types
+    assert llm.calls == 0
+
+
+def test_domain_scope_guard_allows_trading_and_product_requests() -> None:
+    assert _classify_domain_scope("write a Pine strategy for BTC risk review").allowed is True
+    assert _classify_domain_scope("latest OpenRouter model pricing docs source?").allowed is True
+    assert _classify_domain_scope(
+        "Build a review-only robustness report for the current preview evidence. "
+        "Summarize sample size, fees, slippage, drawdown, OOS concerns, and suspicious metrics."
+    ).allowed is True
+    contextual = _classify_domain_scope(
+        "summarize the current preview evidence",
+        artifact_kinds={"backtest_report"},
+    )
+    assert contextual.allowed is True
+    assert contextual.reason == "artifact_context_signal"
+    assert _classify_domain_scope("what did I mention?").allowed is True
+    assert _classify_domain_scope("write a Python script for a todo app").allowed is False
+    assert _classify_domain_scope(
+        "write an email to my landlord",
+        artifact_kinds={"backtest_report"},
+    ).allowed is False
 
 
 def test_agent_chat_llm_intent_can_enable_auto_web_search_for_paraphrase(tmp_path: Path) -> None:
@@ -465,7 +1115,8 @@ def test_agent_chat_llm_intent_can_enable_auto_web_search_for_paraphrase(tmp_pat
     assert intent["data"]["payload"]["intent"] == "market_snapshot"
     assert intent["data"]["payload"]["source"] == "llm"
     assert llm.calls_tools[0] == []
-    assert llm.calls_tools[1] == [{"type": "web_search"}]
+    assert llm.calls_tools[1] == []
+    assert llm.calls_tools[2] == [{"type": "web_search"}]
 
 
 def test_response_stream_extracts_web_search_annotations() -> None:
@@ -734,6 +1385,35 @@ def test_responses_stream_adapter_emits_delta_before_usage() -> None:
     assert events[3] == LLMClientEvent(type="usage", model="fake-responses-model", input_tokens=3, output_tokens=2)
 
 
+def test_chat_completion_adapter_emits_tool_calls_for_gateway_clients() -> None:
+    response = SimpleNamespace(
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7),
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="queued",
+                    tool_calls=[
+                        SimpleNamespace(
+                            function=SimpleNamespace(
+                                name="run_backtest_preview",
+                                arguments=json.dumps({"strategy_spec": valid_spec()}),
+                            )
+                        )
+                    ],
+                )
+            )
+        ],
+    )
+
+    events = list(chat_completion_events(response, model="openai/gpt-5.5"))
+
+    assert events[0] == LLMClientEvent(type="usage", model="openai/gpt-5.5", input_tokens=11, output_tokens=7)
+    assert events[1] == LLMClientEvent(type="message.delta", text="queued", model="openai/gpt-5.5")
+    assert events[2].type == "tool.call"
+    assert events[2].tool_name == "run_backtest_preview"
+    assert events[2].arguments == {"strategy_spec": valid_spec()}
+
+
 def test_agent_chat_cross_tenant_conversation_returns_404(tmp_path: Path) -> None:
     client = TestClient(create_app(repository=create_sqlite_repository(), artifact_root=tmp_path, llm_client=FakeLLMClient([])))
     conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
@@ -850,7 +1530,7 @@ def test_agent_chat_sends_prior_conversation_context_to_model(tmp_path: Path) ->
     )
 
     assert frames
-    provider_messages = llm.calls_messages[0]
+    provider_messages = llm.calls_messages[-1]
     contents = [message["content"] for message in provider_messages]
     assert "My strategy uses EMA 20/50 crossover." in contents
     assert "I can help review that strategy." in contents
@@ -860,6 +1540,86 @@ def test_agent_chat_sends_prior_conversation_context_to_model(tmp_path: Path) ->
     assert events is not None
     context_event = next(event for event in events if event.type == "context.built")
     assert context_event.payload["history_message_count"] == 2
+
+
+def test_agent_chat_sends_latest_backtest_live_status_to_model(tmp_path: Path) -> None:
+    auth = AuthContext("user-a", "workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth, "Backtest status")
+    backtest_run = repository.create_run(auth, conversation.id, status="running", mode="backtest-preview")
+    assert backtest_run is not None
+    repository.append_run_event(
+        auth,
+        backtest_run.id,
+        "backtest.preview.heartbeat",
+        {
+            "stage": "fetching",
+            "status": "running",
+            "progress_pct": 42,
+            "eta_ms": 18000,
+            "message": "Fetching missing public OHLCV candles.",
+            "updated_at": "2026-06-23T00:00:00Z",
+        },
+    )
+    current = repository.create_message(auth, conversation.id, "What is the current backtest status?", role="user")
+    assert current is not None
+    llm = RecordingLLMClient([LLMClientEvent(type="message.delta", text="The backtest is still running.")])
+    orchestrator = LLMOrchestrator(repository=repository, artifact_store=None, client=llm)
+
+    frames = list(
+        orchestrator.stream_chat(
+            auth=auth,
+            conversation_id=conversation.id,
+            message_content=current.content,
+            current_message_id=current.id,
+        )
+    )
+
+    assert frames
+    assert any(
+        "Latest local backtest preview status" in message["content"] and "stage: fetching" in message["content"]
+        for call in llm.calls_messages
+        for message in call
+    )
+    run_id = parse_sse(frames[0])[0]["data"]["run_id"]
+    events = repository.list_run_events(auth, run_id)
+    assert events is not None
+    context_event = next(event for event in events if event.type == "context.built")
+    assert context_event.payload["backtest_live_status_included"] is True
+
+
+def test_agent_chat_sends_failed_backtest_live_status_to_model(tmp_path: Path) -> None:
+    auth = AuthContext("user-a", "workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth, "Backtest failed status")
+    backtest_run = repository.create_run(auth, conversation.id, status="failed", mode="backtest-preview")
+    assert backtest_run is not None
+    repository.append_run_event(
+        auth,
+        backtest_run.id,
+        "backtest.preview.failed",
+        {"message": "No candles were available."},
+    )
+    current = repository.create_message(auth, conversation.id, "What happened to the backtest?", role="user")
+    assert current is not None
+    llm = RecordingLLMClient([LLMClientEvent(type="message.delta", text="The backtest failed.")])
+    orchestrator = LLMOrchestrator(repository=repository, artifact_store=None, client=llm)
+
+    frames = list(
+        orchestrator.stream_chat(
+            auth=auth,
+            conversation_id=conversation.id,
+            message_content=current.content,
+            current_message_id=current.id,
+        )
+    )
+
+    assert frames
+    assert any(
+        "status: failed" in message["content"] and "No candles were available." in message["content"]
+        for call in llm.calls_messages
+        for message in call
+    )
 
 
 def test_agent_chat_streams_safe_reasoning_summary_before_model_delta(tmp_path: Path) -> None:
@@ -996,7 +1756,7 @@ def test_agent_chat_guard_uses_memory_summary_as_selected_context() -> None:
         )
     )
 
-    assert len(llm.calls_messages) == 1
+    assert len(llm.calls_messages) == 3
     frame_payloads = [frame["data"]["payload"] for raw in frames for frame in parse_sse(raw) if frame["event"] == "message.delta"]
     assert all(payload.get("source") != "missing_current_strategy_context" for payload in frame_payloads)
     assert any("Continuing from memory." in str(payload) for payload in frame_payloads)
@@ -1013,9 +1773,10 @@ def test_agent_chat_compacts_long_conversation_after_completion(monkeypatch, tmp
     assert current is not None
     llm = SequencedRecordingLLMClient(
         [
+            [LLMClientEvent(type="message.delta", text="not an action plan")],
+            [LLMClientEvent(type="message.delta", text="not an action plan")],
             [LLMClientEvent(type="message.delta", text="Risk noted.")],
             [LLMClientEvent(type="message.delta", text="Summary: EMA crossover strategy with 1% risk.")],
-            [LLMClientEvent(type="message.delta", text="Second answer.")],
         ]
     )
     orchestrator = LLMOrchestrator(repository=repository, artifact_store=None, client=llm)
@@ -1034,7 +1795,7 @@ def test_agent_chat_compacts_long_conversation_after_completion(monkeypatch, tmp
     assert memory is not None
     assert memory.summary == "Summary: EMA crossover strategy with 1% risk."
     assert memory.covered_message_id is not None
-    assert "Summarize conversation memory" in llm.calls_messages[1][0]["content"]
+    assert "Summarize conversation memory" in llm.calls_messages[3][0]["content"]
 
     next_message = repository.create_message(auth, conversation.id, "Continue with the same context.", role="user")
     assert next_message is not None
@@ -1047,7 +1808,7 @@ def test_agent_chat_compacts_long_conversation_after_completion(monkeypatch, tmp
         )
     )
 
-    assert len(llm.calls_messages) == 3
+    assert len(llm.calls_messages) == 7
 
 
 def test_agent_chat_summary_failure_does_not_fail_completed_response(monkeypatch) -> None:
@@ -1073,7 +1834,7 @@ def test_agent_chat_summary_failure_does_not_fail_completed_response(monkeypatch
 
     assert parse_sse(frames[-1])[0]["event"] == "run.completed"
     assert repository.get_conversation_memory(auth, conversation.id) is None
-    assert len(llm.calls_messages) == 2
+    assert len(llm.calls_messages) == 4
     run_id = parse_sse(frames[0])[0]["data"]["run_id"]
     events = repository.list_run_events(auth, run_id)
     assert events is not None
@@ -1105,17 +1866,466 @@ def test_allowed_tool_call_runs_after_gates(tmp_path: Path) -> None:
         if frame["event"] == "message.delta" and frame["data"]["payload"].get("source") == "tool_only_success_fallback"
     )
     assert fallback_delta["data"]["payload"]["compact"] is True
-    assert "Generated review-only Pine v6 code" in fallback_delta["data"]["payload"]["text"]
+    fallback_text = fallback_delta["data"]["payload"]["text"]
+    assert "`strategy.pine`" in fallback_text
+    assert "BTCUSDT" in fallback_text
+    assert "1h" in fallback_text
+    assert "Backtest Preview" in fallback_text
+    assert "PineForge" not in fallback_text
     messages = client.get(f"/v1/conversations/{conversation['id']}/messages", headers=AUTH_A).json()["items"]
     assert [message["role"] for message in messages] == ["user", "assistant"]
-    assert "Generated review-only Pine v6 code" in messages[1]["content"]
+    assert "`strategy.pine`" in messages[1]["content"]
     assert "policy.blocked" not in [frame["event"] for frame in frames]
+    suggestion_frames = [frame for frame in frames if frame["event"] == "chat.suggestions.updated"]
+    assert len(suggestion_frames) >= 2
+    post_tool_actions = suggestion_frames[-1]["data"]["payload"]["actions"]
+    post_tool_action_ids = [action["id"] for action in post_tool_actions]
+    assert "run-backtest-preview" in post_tool_action_ids
+    assert post_tool_action_ids[0] == "run-backtest-preview"
+    assert "generate-pine-v6" not in post_tool_action_ids
     state = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A).json()
     assert {artifact["kind"] for artifact in state["latest_run_artifacts"]} == {"pine_file"}
     assert state["latest_run_artifacts"][0]["display_name"] == "strategy.pine"
     assert state["strategy_profile"]["source"] == "strategy_spec"
     replay = client.get(f"/v1/runs/{completed['data']['run_id']}/events", headers=AUTH_A).text
     assert "artifact.created" in [frame["event"] for frame in parse_sse(replay)]
+
+
+def test_explicit_backtest_prompt_auto_chains_to_pending_approval(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    repository = create_sqlite_repository()
+    llm = FakeLLMClient(
+        [
+            LLMClientEvent(
+                type="tool.call",
+                tool_name="generate_pine",
+                arguments={"strategy_spec": valid_spec()},
+            )
+        ]
+    )
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={"content": "Backtest BTCUSDT 1h from 2024-01-01 to 2024-02-01 with capital 10000."},
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    completed_tools = [
+        frame["data"]["payload"]["tool_id"]
+        for frame in frames
+        if frame["event"] == "tool.completed"
+    ]
+    assert completed_tools[:2] == ["generate_pine", "create_backtest_plan"]
+    assert "run_backtest_preview" not in completed_tools
+    assert "chat.auto_chain.started" in [frame["event"] for frame in frames]
+    assert "backtest.preview.approval_required" in [frame["event"] for frame in frames]
+    assert "chat.auto_chain.waiting_for_backtest" not in [frame["event"] for frame in frames]
+    plan = next(
+        frame
+        for frame in frames
+        if frame["event"] == "tool.completed" and frame["data"]["payload"]["tool_id"] == "create_backtest_plan"
+    )
+    assert plan["data"]["payload"]["output"]["requires_user_approval"] is True
+    assert isinstance(plan["data"]["payload"]["output"]["approval_id"], str)
+    job = repository.claim_run_job(job_type="backtest-preview", worker_id="test-worker")
+    assert job is None
+
+
+def test_llm_intent_decision_starts_backtest_auto_chain(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    repository = create_sqlite_repository()
+    llm = SequencedRecordingLLMClient(
+        [
+            [LLMClientEvent(type="message.delta", text="Preview Test")],
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "response_intent": "backtest_preview",
+                            "action": "start_auto_chain",
+                            "model_stage": "pine_code_generation",
+                            "confidence": 0.9,
+                            "tool_id": "run_backtest_preview",
+                            "auto_chain": True,
+                            "current_context_required": False,
+                            "missing_inputs": [],
+                            "reasons": ["The user asks for local preview evidence."],
+                            "used_signals": ["semantic_preview_request"],
+                        }
+                    ),
+                )
+            ],
+            [LLMClientEvent(type="message.delta", text="not an action plan")],
+            [LLMClientEvent(type="tool.call", tool_name="generate_pine", arguments={"strategy_spec": valid_spec()})],
+        ]
+    )
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={"content": "Evaluate how this BTCUSDT 1h strategy would have behaved from 2024-01-01 to 2024-02-01."},
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    completed_tools = [
+        frame["data"]["payload"]["tool_id"]
+        for frame in frames
+        if frame["event"] == "tool.completed"
+    ]
+    started = next(frame for frame in frames if frame["event"] == "chat.auto_chain.started")
+    intent = next(frame for frame in frames if frame["event"] == "chat.response_intent")
+    assert completed_tools[:2] == ["generate_pine", "create_backtest_plan"]
+    assert started["data"]["payload"]["source"] == "llm"
+    assert intent["data"]["payload"]["source"] == "llm"
+    assert intent["data"]["payload"]["action"] == "start_auto_chain"
+
+
+def test_backtest_plan_validation_failure_persists_evidence_without_provider_error(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    spec = valid_spec()
+    pine_code = generate_pine(spec)
+
+    monkeypatch.setattr(
+        "strategy_codebot.server.llm_tools.validate_pineforge_pine",
+        lambda *_args, **_kwargs: {
+            "status": "fail",
+            "errors": [{"message": "strategy.exit requires stop or limit"}],
+        },
+    )
+    repository = create_sqlite_repository()
+    llm = FakeLLMClient(
+        [
+            LLMClientEvent(
+                type="tool.call",
+                tool_name="create_backtest_plan",
+                arguments={
+                    "prompt": "backtest for it again",
+                    "strategy_spec": spec,
+                    "pine_code": pine_code,
+                    "backtest_config": {"symbol": "BNBUSDT", "timeframe": "1h"},
+                },
+            )
+        ]
+    )
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={"content": "backtest for it again"},
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    event_types = [frame["event"] for frame in frames]
+    assert "backtest.preview.approval_required" not in event_types
+    assert "chat.auto_chain.waiting_for_backtest" not in event_types
+
+    failed_tool = next(
+        frame
+        for frame in frames
+        if frame["event"] == "tool.completed"
+        and frame["data"]["payload"]["tool_id"] == "create_backtest_plan"
+    )
+    failed_payload = failed_tool["data"]["payload"]
+    assert failed_payload["status"] == "failed"
+    assert failed_payload["code"] == "pine_validation_failed"
+    assert failed_payload["pine_code_artifact_id"]
+    assert failed_payload["validation_artifact_id"]
+
+    failed_run = next(frame for frame in frames if frame["event"] == "run.failed")
+    run_failed_payload = failed_run["data"]["payload"]
+    assert run_failed_payload["code"] == "pine_validation_failed"
+    assert run_failed_payload["message"] == "Backtest plan failed because local Pine validation failed."
+    assert run_failed_payload["retryable"] is False
+    assert run_failed_payload["pine_code_artifact_id"] == failed_payload["pine_code_artifact_id"]
+    assert run_failed_payload["validation_artifact_id"] == failed_payload["validation_artifact_id"]
+    assert "Provider execution failed" not in stream.text
+
+    state = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A).json()
+    artifact_kinds = {artifact["kind"] for artifact in state["latest_run_artifacts"]}
+    assert {"pine_file", "validation_report"} <= artifact_kinds
+    job = repository.claim_run_job(job_type="backtest-preview", worker_id="test-worker")
+    assert job is None
+    messages = client.get(f"/v1/conversations/{conversation['id']}/messages", headers=AUTH_A).json()["items"]
+    assert messages[-1]["content"] == "Backtest plan failed because local Pine validation failed."
+
+
+def test_backtest_summary_tool_only_fallback_surfaces_metrics() -> None:
+    text = _tool_only_success_message(
+        ["get_backtest_summary"],
+        "en",
+        tool_results=[
+            {
+                "tool_id": "get_backtest_summary",
+                "output": {
+                    "summary": {
+                        "symbol": "ETH/USDT",
+                        "signal_timeframe": "1h",
+                        "candle_timeframe": "1m",
+                        "evidence_label": "PineForge local Pine preview evidence",
+                        "metrics": {
+                            "pnl": {"absolute": -894.3091, "percentage": -8.9431},
+                            "max_drawdown": None,
+                            "trade_count": 87,
+                            "win_rate": 0,
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+    assert "ETH/USDT" in text
+    assert "-894.3091" in text
+    assert "-8.9431%" in text
+    assert "87 trades" in text
+    assert "1h" in text
+    assert "1m" in text
+    assert "not TradingView official validation" in text
+    assert "PineForge" not in text
+
+
+def test_backtest_summary_overrides_non_metric_model_text() -> None:
+    text = _maybe_backtest_summary_response(
+        "It looks like the previous `get_backtest_summary` call didn't return specific results.",
+        ["get_backtest_summary"],
+        [
+            {
+                "tool_id": "get_backtest_summary",
+                "output": {
+                    "summary": {
+                        "symbol": "ETH/USDT",
+                        "signal_timeframe": "1h",
+                        "candle_timeframe": "1m",
+                        "evidence_label": "PineForge local Pine preview evidence",
+                        "metrics": {
+                            "pnl": {"absolute": -894.3091, "percentage": -8.9431},
+                            "max_drawdown": None,
+                            "trade_count": 87,
+                            "win_rate": 0,
+                        },
+                    },
+                },
+            }
+        ],
+    )
+
+    assert "ETH/USDT" in text
+    assert "-894.3091" in text
+    assert "-8.9431%" in text
+    assert "87 trades" in text
+    assert "didn't return specific" not in text
+    assert "PineForge" not in text
+
+
+def test_backtest_summary_not_found_does_not_render_fake_na_metrics() -> None:
+    text = _maybe_backtest_summary_response(
+        "",
+        ["get_backtest_summary"],
+        [{"tool_id": "get_backtest_summary", "output": {"status": "not_found", "run_id": "run_missing"}}],
+    )
+
+    assert "not available" in text
+    assert "PnL N/A" not in text
+
+
+def test_backtest_summary_tool_only_not_found_does_not_render_fake_na_metrics() -> None:
+    text = _tool_only_success_message(
+        ["get_backtest_summary"],
+        "en",
+        tool_results=[{"tool_id": "get_backtest_summary", "output": {"status": "not_found", "run_id": "run_missing"}}],
+    )
+
+    assert "not available" in text
+    assert "PnL N/A" not in text
+
+
+def test_backtest_trades_tool_only_response_renders_indexed_rows() -> None:
+    text = _tool_only_success_message(
+        ["query_backtest_trades"],
+        "en",
+        tool_results=[
+            {
+                "tool_id": "query_backtest_trades",
+                "output": {
+                    "status": "ok",
+                    "run_id": "run_backtest",
+                    "requested_run_id": "run_missing",
+                    "fallback_used": True,
+                    "trades": [
+                        {
+                            "bucket": "top_loser",
+                            "trade_rank": 42,
+                            "opened_at": "2024-03-15T19:00:00+00:00",
+                            "closed_at": "2024-03-15T20:00:00+00:00",
+                            "pnl_cost": -17.0297,
+                            "pnl_percentage": -0.17,
+                            "trade": {"side": "long"},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert "Loaded 1 indexed trades" in text
+    assert "run_backtest" in text
+    assert "latest completed backtest report" in text
+    assert "See the table below" in text
+    assert "top loser" not in text
+    assert "-17.03" not in text
+    assert "The tool run completed successfully" not in text
+
+
+def test_backtest_trades_tool_only_response_renders_requested_twenty_rows() -> None:
+    text = _tool_only_success_message(
+        ["query_backtest_trades"],
+        "en",
+        tool_results=[
+            {
+                "tool_id": "query_backtest_trades",
+                "output": {
+                    "status": "ok",
+                    "run_id": "run_backtest",
+                    "fallback_used": False,
+                    "trades": [
+                        {
+                            "bucket": "sample",
+                            "trade_rank": index,
+                            "opened_at": f"2024-01-{index:02d}T00:00:00+00:00",
+                            "closed_at": f"2024-01-{index:02d}T01:00:00+00:00",
+                            "pnl_cost": float(index),
+                            "trade": {"side": "long"},
+                        }
+                        for index in range(1, 21)
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert "Loaded 20 indexed trades" in text
+    assert "See the table below" in text
+    assert "#1" not in text
+    assert "#20" not in text
+
+
+def test_backtest_trades_response_overrides_deferred_model_text() -> None:
+    text = _maybe_backtest_trades_response(
+        "I apologize for the confusion. I need to actually retrieve the trade data first. Let me do that now.",
+        ["query_backtest_trades"],
+        [
+            {
+                "tool_id": "query_backtest_trades",
+                "output": {
+                    "status": "ok",
+                    "run_id": "run_backtest",
+                    "fallback_used": False,
+                    "trades": [
+                        {
+                            "bucket": "sample",
+                            "trade_rank": 1,
+                            "opened_at": "2024-01-01T00:00:00+00:00",
+                            "closed_at": "2024-01-01T01:00:00+00:00",
+                            "pnl_cost": -12.5,
+                            "pnl_percentage": -0.12,
+                            "trade": {"side": "long"},
+                        }
+                    ],
+                },
+            }
+        ],
+    )
+
+    assert "Loaded 1 indexed trades" in text
+    assert "See the table below" in text
+    assert "#1" not in text
+    assert "-12.50" not in text
+    assert "Let me do that now" not in text
+
+
+def test_backtest_summary_tool_result_keeps_bounded_output() -> None:
+    result = _tool_success_result(
+        "get_backtest_summary",
+        {"run_id": "run_123"},
+        {
+            "status": "ok",
+            "summary": {
+                "symbol": "ETH/USDT",
+                "metrics": {"trade_count": 87},
+            },
+        },
+    )
+
+    assert result["tool_id"] == "get_backtest_summary"
+    assert result["output"]["summary"]["symbol"] == "ETH/USDT"
+    assert result["output"]["summary"]["metrics"]["trade_count"] == 87
+
+
+def test_backtest_trades_tool_result_keeps_bounded_rows() -> None:
+    result = _tool_success_result(
+        "query_backtest_trades",
+        {"run_id": "run_123", "limit": 20},
+        {
+            "status": "ok",
+            "run_id": "run_123",
+            "requested_run_id": "run_123",
+            "fallback_used": False,
+            "trades": [{"trade_rank": index, "trade": {"side": "long"}} for index in range(25)],
+        },
+    )
+
+    assert result["tool_id"] == "query_backtest_trades"
+    assert result["output"]["run_id"] == "run_123"
+    assert len(result["output"]["trades"]) == 20
+
+
+def test_compact_tool_output_preserves_bounded_trade_rows() -> None:
+    output = compact_tool_output(
+        {
+            "status": "ok",
+            "run_id": "run_123",
+            "requested_run_id": "run_123",
+            "fallback_used": False,
+            "trades": [{"trade_rank": index, "trade": {"side": "long"}} for index in range(75)],
+        }
+    )
+
+    assert output["run_id"] == "run_123"
+    assert len(output["trades"]) == 50
+    assert output["truncated"] is True
+
+
+def test_action_planner_persists_unavailable_tool_decision() -> None:
+    decision = _parse_action_plan_json(
+        json.dumps(
+            {
+                "confidence": 0.94,
+                "decision": "call_tool",
+                "intent_id": "robustness",
+                "reason": "Needs robustness report.",
+                "tool_id": "build_robustness_report",
+                "arguments": {"run_id": "latest_completed_backtest"},
+            }
+        ),
+        available_tools={"market_research"},
+    )
+
+    assert decision is not None
+    assert decision.decision == "suggest_actions"
+    assert decision.source == "llm"
+    assert decision.tool_id == "build_robustness_report"
+    assert decision.reason == "Needs robustness report."
 
 
 def test_user_facing_chat_tools_persist_artifacts(tmp_path: Path) -> None:

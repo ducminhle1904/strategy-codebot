@@ -53,6 +53,11 @@ INTERNAL_DOCS = {
         "platform": "general",
         "stages": ["strategy_reasoning", "strategy_coding", "balanced_review", "repair"],
     },
+    "trading_skill_integration": {
+        "path": "docs/trading/strategy-playbooks/trading-skill-integration.md",
+        "platform": "general",
+        "stages": ["strategy_reasoning", "strategy_coding", "balanced_review", "repair"],
+    },
 }
 
 
@@ -83,19 +88,36 @@ def _build_static_knowledge_context(prompt: str, *, source_registry_path: Path |
     wants_pine = not wants_mql5 or any(token in prompt_text for token in ("pine", "tradingview", "indicator", "strategy"))
     wants_crypto = any(token in prompt_text for token in ("crypto", "bitcoin", "btc", "ethereum", "eth", "altcoin", "perpetual", "funding", "exchange"))
     wants_forex = any(token in prompt_text for token in ("forex", "fx", "eurusd", "gbpusd", "usdjpy", "session", "london", "new york", "rollover", "spread"))
+    wants_review_skill = any(
+        token in prompt_text
+        for token in (
+            "review",
+            "overfit",
+            "backtest",
+            "optimize",
+            "curve",
+            "robust",
+            "sample size",
+            "position sizing",
+            "risk gate",
+            "invalidation",
+            "price action",
+            "lesson",
+            "postmortem",
+        )
+    )
     selected_keys = ["risk_policy"]
     if wants_pine:
         selected_keys.insert(0, "pine_v6_rules")
+    if wants_review_skill:
+        selected_keys.append("trading_skill_integration")
     if wants_crypto:
         selected_keys.append("crypto_playbook")
     if wants_forex:
         selected_keys.append("forex_playbook")
     if wants_crypto or wants_forex or any(token in prompt_text for token in ("trend", "mean reversion", "breakout", "volatility", "position sizing")):
         selected_keys.append("strategy_patterns")
-    if any(token in prompt_text for token in ("review", "overfit", "backtest", "optimize", "curve")):
-        selected_keys.append("anti_overfit_checklist")
-    else:
-        selected_keys.append("anti_overfit_checklist")
+    selected_keys.append("anti_overfit_checklist")
     if wants_mql5:
         selected_keys.append("mql5_rules")
 

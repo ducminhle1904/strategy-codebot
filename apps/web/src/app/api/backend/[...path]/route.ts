@@ -1,4 +1,5 @@
 import { buildBackendHeaders, DEFAULT_API_BASE_URL } from "@/lib/backend-client";
+import { agentLog } from "@/lib/agent-log";
 import { resolveBackendTenant } from "@/lib/server-auth";
 
 export const runtime = "nodejs";
@@ -15,6 +16,7 @@ const FORWARDED_HEADERS = [
   "idempotency-key",
   "last-event-id",
   "x-request-id",
+  "x-trace-id",
 ];
 const MAX_PROXY_BODY_BYTES = 1024 * 1024;
 
@@ -122,7 +124,10 @@ function debugLog(event: string, payload: Record<string, unknown>) {
   if (process.env.STRATEGY_CODEBOT_WEB_DEBUG !== "1") {
     return;
   }
-  console.info(`[strategy-web-api-proxy] ${event}`, JSON.stringify(payload));
+  agentLog("info", `backend_proxy.${event}`, {
+    component: "backend_proxy",
+    ...payload,
+  });
 }
 
 function redactUrl(url: URL) {

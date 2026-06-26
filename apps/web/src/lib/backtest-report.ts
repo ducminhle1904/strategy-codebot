@@ -1,4 +1,5 @@
 export type BacktestReportMetric = {
+  key: string;
   label: string;
   value: string;
 };
@@ -7,7 +8,12 @@ export type BacktestReportCardModel = {
   kind: "report";
   metrics: BacktestReportMetric[];
   warnings: string[];
+  qualityStatus: string | null;
+  qualityFlags: string[];
   assumptions: BacktestReportMetric[];
+  robustness: BacktestReportMetric[];
+  promotionDecision: string | null;
+  promotionReasons: string[];
   dataSource: string | null;
   reproducibilityHash: string | null;
 };
@@ -26,7 +32,34 @@ export type BacktestVariantCardModel = {
   }>;
 };
 
-export type BacktestArtifactCardModel = BacktestReportCardModel | BacktestVariantCardModel;
+export type BacktestRobustnessCardModel = {
+  kind: "robustness_report";
+  recommendation: string | null;
+  boundary: string | null;
+  metrics: BacktestReportMetric[];
+  checkCounts: {
+    fail: number;
+    pass: number;
+    warn: number;
+  };
+  checks: Array<{
+    id: string;
+    message: string;
+    observed: string;
+    status: "fail" | "pass" | "warn";
+  }>;
+  tradeSampleCount: number;
+  topLoserCount: number;
+  topWinnerCount: number;
+  warnings: string[];
+};
+
+type RobustnessCheckStatus = BacktestRobustnessCardModel["checks"][number]["status"];
+
+export type BacktestArtifactCardModel =
+  | BacktestReportCardModel
+  | BacktestVariantCardModel
+  | BacktestRobustnessCardModel;
 
 export function parseBacktestArtifactPreview(kind: string, value: unknown): BacktestArtifactCardModel | null {
   if (kind === "backtest_report") {
@@ -35,7 +68,18 @@ export function parseBacktestArtifactPreview(kind: string, value: unknown): Back
   if (kind === "backtest_variant_comparison") {
     return parseBacktestVariantComparison(value);
   }
+  if (kind === "robustness_report") {
+    return parseBacktestRobustnessReport(value);
+  }
   return null;
+}
+
+function metric(key: string, label: string, value: string): BacktestReportMetric {
+  return { key, label, value };
+}
+
+function visibleMetrics(metrics: BacktestReportMetric[]) {
+  return metrics.filter((item) => item.value !== "N/A" && item.value !== "N/A -> N/A");
 }
 
 export function parseBacktestReport(value: unknown): BacktestReportCardModel | null {
@@ -43,41 +87,71 @@ export function parseBacktestReport(value: unknown): BacktestReportCardModel | n
     return null;
   }
   const metrics = isRecord(value.metrics) ? value.metrics : {};
+  const qualityStatus =
+    typeof metrics.quality_status === "string"
+      ? metrics.quality_status
+      : typeof value.quality_status === "string"
+        ? value.quality_status
+        : null;
+  const qualityFlags = uniqueStrings([
+    ...stringArray(metrics.quality_flags),
+    ...stringArray(value.quality_flags),
+  ]);
   const assumptions = isRecord(value.assumptions)
     ? value.assumptions
     : isRecord(value.config)
       ? value.config
       : {};
+  const robustnessReport = isRecord(value.robustness_report) ? value.robustness_report : {};
+  const robustnessMetrics = isRecord(robustnessReport.metrics) ? robustnessReport.metrics : {};
+  const promotionDecision = isRecord(value.promotion_decision) ? value.promotion_decision : {};
   const tradeCount =
     pickValue(metrics, ["trade_count", "trades"]) ??
     (Array.isArray(value.trades) ? value.trades.length : null);
+  const promotionReasons = stringArray(promotionDecision.reasons);
+  const warnings = uniqueStrings([
+    ...qualityFlags.map((flag) => qualityWarning(flag)),
+    ...stringArray(value.warnings),
+    ...promotionReasons,
+  ].map(userFacingBacktestText));
   return {
     kind: "report",
-    metrics: [
-      { label: "PnL", value: formatBacktestValue(pickValue(metrics, ["pnl", "net_profit", "total_return"])) },
-      { label: "Max drawdown", value: formatBacktestValue(pickValue(metrics, ["max_drawdown", "max_drawdown_pct"])) },
-      { label: "Trade count", value: formatBacktestValue(tradeCount) },
-      { label: "Win rate", value: formatBacktestValue(pickValue(metrics, ["win_rate"])) },
-      { label: "Sharpe", value: formatBacktestValue(pickValue(metrics, ["sharpe"])) },
-      { label: "Sortino", value: formatBacktestValue(pickValue(metrics, ["sortino"])) },
-    ],
-    assumptions: [
-      { label: "Symbol", value: formatBacktestValue(assumptions.symbol) },
-      { label: "Timeframe", value: formatBacktestValue(assumptions.timeframe) },
-      {
-        label: "Range",
-        value: `${formatBacktestValue(assumptions.start)} -> ${formatBacktestValue(assumptions.end)}`,
-      },
-      { label: "Initial capital", value: formatBacktestValue(assumptions.initial_capital) },
-      { label: "Fee bps", value: formatBacktestValue(assumptions.fee_bps) },
-      { label: "Slippage bps", value: formatBacktestValue(assumptions.slippage_bps) },
-    ],
-    warnings: stringArray(value.warnings),
+    metrics: visibleMetrics([
+      metric("net_pnl", "PnL", formatPnlMetric(pickValue(metrics, ["pnl", "net_profit", "total_return"]))),
+      metric("max_drawdown", "Max drawdown", formatBacktestValue(pickValue(metrics, ["max_drawdown", "max_drawdown_pct"]))),
+      metric("trade_count", "Trade count", formatBacktestValue(tradeCount)),
+      metric("win_rate", "Win rate", formatBacktestValue(pickValue(metrics, ["win_rate"]))),
+      metric("sharpe", "Sharpe", formatBacktestValue(pickValue(metrics, ["sharpe"]))),
+      metric("sortino", "Sortino", formatBacktestValue(pickValue(metrics, ["sortino"]))),
+    ]),
+    assumptions: visibleMetrics([
+      metric("symbol", "Symbol", formatBacktestValue(assumptions.symbol)),
+      metric("timeframe", "Signal timeframe", formatBacktestValue(pickValue(assumptions, ["signal_timeframe", "timeframe"]))),
+      metric("candle_timeframe", "Candle timeframe", formatBacktestValue(pickValue(assumptions, ["candle_timeframe"]))),
+      metric("range", "Range", `${formatBacktestValue(assumptions.start)} -> ${formatBacktestValue(assumptions.end)}`),
+      metric("initial_capital", "Initial capital", formatBacktestValue(assumptions.initial_capital)),
+      metric("fee_bps", "Fee bps", formatBacktestValue(assumptions.fee_bps)),
+      metric("slippage_bps", "Slippage bps", formatBacktestValue(assumptions.slippage_bps)),
+    ]),
+    robustness: visibleMetrics([
+      metric("robustness", "Robustness", formatBacktestValue(robustnessReport.status)),
+      metric("sample_size", "Sample size", formatBacktestValue(robustnessMetrics.sample_size)),
+      metric("backtest_days", "Backtest days", formatBacktestValue(robustnessMetrics.backtest_days)),
+      metric("max_loss_streak", "Max loss streak", formatBacktestValue(robustnessMetrics.max_loss_streak)),
+    ]),
+    promotionDecision:
+      typeof promotionDecision.decision === "string"
+        ? promotionDecision.decision
+        : null,
+    promotionReasons: promotionReasons.map(userFacingBacktestText),
+    qualityStatus,
+    qualityFlags,
+    warnings,
     dataSource:
       typeof assumptions.data_source === "string"
-        ? assumptions.data_source
+        ? userFacingBacktestText(assumptions.data_source)
         : typeof value.data_source === "string"
-          ? value.data_source
+          ? userFacingBacktestText(value.data_source)
           : null,
     reproducibilityHash:
       typeof value.reproducibility_hash === "string"
@@ -86,6 +160,19 @@ export function parseBacktestReport(value: unknown): BacktestReportCardModel | n
           ? value.reproducibilityHash
           : null,
   };
+}
+
+function qualityWarning(flag: string) {
+  if (flag === "position_sizing_mismatch") {
+    return "Position sizing mismatch: repair sizing before evaluating this preview.";
+  }
+  if (flag === "commission_exceeds_capital") {
+    return "Commission exceeds initial capital; quantity sizing is likely invalid.";
+  }
+  if (flag === "large_trade_notional") {
+    return "Trade notional is large versus initial capital; review position sizing.";
+  }
+  return flag.replace(/_/g, " ");
 }
 
 export function parseBacktestVariantComparison(value: unknown): BacktestVariantCardModel | null {
@@ -111,6 +198,54 @@ export function parseBacktestVariantComparison(value: unknown): BacktestVariantC
   };
 }
 
+export function parseBacktestRobustnessReport(value: unknown): BacktestRobustnessCardModel | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const metrics = isRecord(value.metrics) ? value.metrics : {};
+  const assumptionReview = isRecord(value.assumption_review) ? value.assumption_review : {};
+  const tradeSamples = isRecord(value.trade_samples) ? value.trade_samples : {};
+  const checks = (Array.isArray(value.checks) ? value.checks : [])
+    .filter(isRecord)
+    .map((check) => {
+      const status: RobustnessCheckStatus =
+        check.status === "fail" || check.status === "warn" ? check.status : "pass";
+      return {
+        id: typeof check.id === "string" && check.id.trim() ? check.id : "check",
+        message: formatBacktestValue(check.message),
+        observed: formatBacktestValue(check.observed),
+        status,
+      };
+    });
+  const checkCounts = checks.reduce(
+    (counts, check) => {
+      counts[check.status] += 1;
+      return counts;
+    },
+    { fail: 0, pass: 0, warn: 0 } satisfies BacktestRobustnessCardModel["checkCounts"]
+  );
+  return {
+    kind: "robustness_report",
+    recommendation: typeof value.recommendation === "string" ? value.recommendation : null,
+    boundary: typeof value.boundary === "string" ? userFacingBacktestText(value.boundary) : null,
+    metrics: visibleMetrics([
+      metric("trade_count", "Trade count", formatBacktestValue(metrics.trade_count)),
+      metric("win_rate", "Win rate", formatBacktestValue(metrics.win_rate)),
+      metric("max_drawdown", "Max drawdown", formatBacktestValue(metrics.max_drawdown_pct)),
+      metric("profit_factor", "Profit factor", formatBacktestValue(metrics.profit_factor)),
+      metric("net_profit", "Net profit", formatBacktestValue(metrics.net_profit_pct)),
+      metric("fee_bps", "Fee bps", formatBacktestValue(assumptionReview.fee_bps)),
+      metric("slippage_bps", "Slippage bps", formatBacktestValue(assumptionReview.slippage_bps)),
+    ]),
+    checkCounts,
+    checks,
+    tradeSampleCount: Array.isArray(tradeSamples.sample) ? tradeSamples.sample.length : 0,
+    topLoserCount: Array.isArray(tradeSamples.top_losers) ? tradeSamples.top_losers.length : 0,
+    topWinnerCount: Array.isArray(tradeSamples.top_winners) ? tradeSamples.top_winners.length : 0,
+    warnings: stringArray(assumptionReview.warnings).map(userFacingBacktestText),
+  };
+}
+
 export function formatBacktestValue(value: unknown): string {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Number.isInteger(value)
@@ -118,9 +253,35 @@ export function formatBacktestValue(value: unknown): string {
       : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
   }
   if (typeof value === "string" && value.trim()) {
-    return value;
+    return userFacingBacktestText(value);
   }
   return "N/A";
+}
+
+function userFacingBacktestText(value: string): string {
+  return value
+    .replace(/PineForge local Pine preview evidence only/gi, "Local sandbox preview evidence only")
+    .replace(/PineForge local Pine preview evidence/gi, "Local sandbox preview evidence")
+    .replace(/PineForge \(Local Preview\)/gi, "Local preview")
+    .replace(/PineForge Preview/gi, "Backtest Preview")
+    .replace(/PineForge compile\/backtest/gi, "local preview")
+    .replace(/PineForge local Pine preview/gi, "local sandbox preview")
+    .replace(/PineForge output/gi, "Local sandbox preview output")
+    .replace(/pineforge-engine/gi, "local preview")
+    .replace(/pineforge-runner/gi, "local preview")
+    .replace(/PineForge/gi, "local preview");
+}
+
+function formatPnlMetric(value: unknown): string {
+  if (isRecord(value)) {
+    const absolute = formatBacktestValue(value.absolute);
+    const percentage = formatBacktestValue(value.percentage);
+    if (absolute !== "N/A" && percentage !== "N/A") {
+      return `${absolute} (${percentage}%)`;
+    }
+    return absolute !== "N/A" ? absolute : percentage;
+  }
+  return formatBacktestValue(value);
 }
 
 function pickValue(record: Record<string, unknown>, keys: string[]): unknown {
@@ -137,6 +298,10 @@ function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
     : [];
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

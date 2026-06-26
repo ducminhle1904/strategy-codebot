@@ -53,11 +53,25 @@ def valid_spec() -> dict[str, Any]:
     }
 
 
+def pine_code() -> str:
+    return """//@version=6
+strategy("E2E EMA RSI", overlay=true, initial_capital=10000)
+fast = ta.ema(close, 12)
+slow = ta.ema(close, 26)
+rsi = ta.rsi(close, 14)
+if ta.crossover(fast, slow) and rsi < 70
+    strategy.entry("Long", strategy.long)
+strategy.exit("Long exit", "Long", stop=close * 0.98, limit=close * 1.04)
+"""
+
+
 def backtest_config(**overrides: Any) -> dict[str, Any]:
     config = {
-        "engine": "backtest-kit",
+        "engine": "pineforge",
+        "exchange": "binance",
         "symbol": "BTC/USDT",
         "timeframe": "1h",
+        "candle_timeframe": "1m",
         "start": "2024-01-01",
         "end": "2024-01-03",
         "initial_capital": 10000,

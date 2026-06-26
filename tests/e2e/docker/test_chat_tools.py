@@ -37,22 +37,22 @@ def _tool_output(frames: list[dict], tool_id: str) -> dict:
 
 def test_chat_tool_creates_backtest_plan() -> None:
     _headers, _conversation_id, frames = _stream_agent_message(
-        "Create a Backtest Kit plan for BTC 1h local preview.",
+        "Create a local preview plan for BTC 1h.",
         workspace="e2e-chat-plan",
     )
     output = _tool_output(frames, "create_backtest_plan")
-    assert output["backtest_config"]["engine"] == "backtest-kit"
+    assert "engine" not in output["backtest_config"]
     assert "TradingView proof" in " ".join(output["warnings"])
 
 
 def test_chat_tool_queues_backtest_preview_and_worker_completes_child_run() -> None:
     headers, _conversation_id, frames = _stream_agent_message(
-        "Run and queue a Backtest Kit backtest preview now.",
+        "Run and queue a backtest preview now.",
         workspace="e2e-chat-run",
     )
     output = _tool_output(frames, "run_backtest_preview")
     assert output["status"] == "queued"
-    assert output["evidence_label"] == "Backtest Kit local preview evidence only"
+    assert output["evidence_label"] == "Local sandbox preview evidence only"
     with client(timeout=60.0) as api:
         child_frames = wait_for_run_events(api, headers, output["run_id"])
     assert child_frames[-1]["event"] == "run.completed"
@@ -65,16 +65,15 @@ def test_chat_tool_queues_backtest_preview_and_worker_completes_child_run() -> N
         """,
         (output["run_id"],),
     )
-    assert any(artifact["kind"] == "backtest_strategy_logic" for artifact in artifacts)
     report_artifact = next(artifact for artifact in artifacts if artifact["kind"] == "backtest_report")
     with client(timeout=30.0) as api:
         report = api.get(f"/v1/artifacts/{report_artifact['id']}", headers=headers).json()["content"]
-    assert report["execution_semantics"] == "semantic_strategy_logic"
+    assert report["execution_semantics"] == "model_generated_pine_pineforge"
 
 
 def test_chat_variant_lab_queues_multiple_child_runs_with_shared_cache_key() -> None:
     headers, _conversation_id, frames = _stream_agent_message(
-        "Create a variant lab with two comparable Backtest Kit variants.",
+        "Create a variant lab with two comparable local preview variants.",
         workspace="e2e-chat-variant",
     )
     output = _tool_output(frames, "run_backtest_variant_lab")
@@ -93,16 +92,3 @@ def test_chat_variant_lab_queues_multiple_child_runs_with_shared_cache_key() -> 
         ([variant["run_id"] for variant in output["variants"]],),
     )
     assert rows == [{"status": "completed", "count": 2}]
-
-
-def test_phase_five_planning_tools_are_labeled_and_do_not_add_blocked_runtime_dependencies() -> None:
-    cases = [
-        ("Create PineTS preview plan for this Pine strategy.", "create_pinets_preview_plan", "not TradingView validation"),
-        ("Create signals market context plan.", "create_signals_market_context_plan", "@backtest-kit/signals"),
-        ("Create graph multi-timeframe pipeline plan.", "create_graph_pipeline_plan", "@backtest-kit/graph"),
-        ("Create Sidekick export scaffold plan.", "create_sidekick_export_plan", "Sidekick does not run"),
-    ]
-    for index, (prompt, tool_id, expected_text) in enumerate(cases):
-        _headers, _conversation_id, frames = _stream_agent_message(prompt, workspace=f"e2e-chat-phase5-{index}")
-        output = _tool_output(frames, tool_id)
-        assert expected_text.lower() in str(output).lower()

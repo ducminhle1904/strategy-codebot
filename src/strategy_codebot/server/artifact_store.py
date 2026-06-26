@@ -10,8 +10,11 @@ class LocalArtifactStore:
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root) if root is not None else repo_root() / ".strategy-codebot" / "api-artifacts"
 
+    def run_path(self, run_id: str) -> Path:
+        return self.root / "runs" / run_id
+
     def run_dir(self, run_id: str) -> Path:
-        path = self.root / "runs" / run_id
+        path = self.run_path(run_id)
         path.mkdir(parents=True, exist_ok=True)
         return path
 

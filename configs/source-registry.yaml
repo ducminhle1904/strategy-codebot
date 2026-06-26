@@ -92,6 +92,73 @@ sources:
     market_tags: [general, crypto, forex]
     platform_tags: [general, pine_v6, mql5]
     stages: [strategy_reasoning, strategy_coding, balanced_review, repair]
+  - id: internal-trading-skill-integration
+    platform: general
+    type: internal
+    knowledge_type: strategy_pattern
+    trust_level: high
+    path: docs/trading/strategy-playbooks/trading-skill-integration.md
+    freshness_ttl_days: 90
+    domain_tags: [strategy_design, risk, anti_overfit, validation, backtest, quality, learning_loop]
+    market_tags: [general, crypto, forex]
+    platform_tags: [general, pine_v6]
+    stages: [strategy_reasoning, strategy_coding, balanced_review, repair]
+    notes: Curated repo summary of reviewed trading-skill patterns; no raw external skill text is promoted.
+  - id: tradermonty-backtest-expert-skill
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://raw.githubusercontent.com/tradermonty/claude-trading-skills/main/skills/backtest-expert/SKILL.md
+    freshness_ttl_days: 90
+    domain_tags: [education, backtest, anti_overfit, validation]
+    market_tags: [general]
+    platform_tags: [general]
+    stages: [balanced_review, repair]
+    notes: External reference only; curate summaries/checklists through review before retrieval.
+  - id: tradermonty-edge-strategy-reviewer-skill
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://raw.githubusercontent.com/tradermonty/claude-trading-skills/main/skills/edge-strategy-reviewer/SKILL.md
+    freshness_ttl_days: 90
+    domain_tags: [education, strategy_design, quality, anti_overfit, validation]
+    market_tags: [general]
+    platform_tags: [general]
+    stages: [strategy_reasoning, balanced_review, repair]
+    notes: External reference only; curate summaries/checklists through review before retrieval.
+  - id: tradermonty-technical-analyst-skill
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://raw.githubusercontent.com/tradermonty/claude-trading-skills/main/skills/technical-analyst/SKILL.md
+    freshness_ttl_days: 90
+    domain_tags: [education, strategy_design, price_action, market_regime]
+    market_tags: [general, crypto, forex]
+    platform_tags: [general]
+    stages: [strategy_reasoning, balanced_review]
+    notes: External reference only; do not require chart images in this workflow.
+  - id: tradermonty-position-sizer-skill
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://raw.githubusercontent.com/tradermonty/claude-trading-skills/main/skills/position-sizer/SKILL.md
+    freshness_ttl_days: 90
+    domain_tags: [education, risk, position_sizing]
+    market_tags: [general, crypto, forex]
+    platform_tags: [general]
+    stages: [strategy_reasoning, strategy_coding, balanced_review, repair]
+    notes: External reference only; curate bounded sizing rules through review before retrieval.
+  - id: tradermonty-trade-memory-loop-workflow
+    platform: general
+    type: trusted_public
+    trust_level: medium
+    url: https://raw.githubusercontent.com/tradermonty/claude-trading-skills/main/workflows/trade-memory-loop.yaml
+    freshness_ttl_days: 90
+    domain_tags: [education, learning_loop, review]
+    market_tags: [general]
+    platform_tags: [general]
+    stages: [balanced_review, repair]
+    notes: External reference only; map only approval-gated lesson loop patterns into KB candidates.
   - id: babypips-school-of-pipsology
     platform: general
     type: trusted_public

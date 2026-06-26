@@ -22,6 +22,7 @@ from jsonschema import ValidationError
 
 from strategy_codebot.agent_harness import classify_failure
 from strategy_codebot.harness_types import (
+    FAILURE_CONFIGURATION_ERROR,
     FAILURE_FREE_CAPACITY_UNAVAILABLE,
     FAILURE_MISSING_CREDENTIAL,
     FAILURE_POLICY_VIOLATION,
@@ -106,6 +107,8 @@ WEB_SEARCH_DEFAULT = WEB_SEARCH_AUTO
 
 CONSERVATIVE_POSITION_SIZING_GUIDANCE = (
     "Use 1-2% account equity risk per trade, fixed units, or another explicitly bounded small-risk position sizing model. "
+    "Also state exposure or portfolio-heat assumptions such as single-strategy exposure, capped correlated positions, "
+    "and no leverage unless explicitly bounded. "
     "Never invent 100% of available capital, all-capital, entire-account, or full-balance sizing."
 )
 FULL_CAPITAL_POSITION_SIZING_PHRASES = (
@@ -122,6 +125,27 @@ FULL_CAPITAL_POSITION_SIZING_PHRASES = (
     "100% of account",
     "100% of equity",
     "100% equity",
+)
+BOUNDED_RISK_POSITION_SIZING_PHRASES = (
+    "1%",
+    "1 percent",
+    "2%",
+    "2 percent",
+    "fixed risk",
+    "fixed fractional",
+    "fixed units",
+    "small-risk",
+    "bounded",
+)
+RISK_CONCENTRATION_ASSUMPTION_PHRASES = (
+    "portfolio heat",
+    "exposure",
+    "correlated",
+    "correlation",
+    "leverage",
+)
+DEFAULT_RISK_CONCENTRATION_ASSUMPTION = (
+    "Assume single-strategy exposure only; cap portfolio heat and correlated positions before any paper or live use."
 )
 PRICE_ACTION_ONLY_PROMPT_TERMS = ("price action only", "no indicator", "no indicators", "without indicator", "without indicators")
 PRICE_ACTION_PROMPT_TERMS = ("price action", "liquidity sweep", "sweep", "break of structure", "bos", "retest")
@@ -223,6 +247,10 @@ class LiveCredentialError(LiveError):
     code = "missing_provider_credential"
 
 
+class LiveConfigurationError(LiveError):
+    code = FAILURE_CONFIGURATION_ERROR
+
+
 class LiveProviderError(LiveError):
     code = FAILURE_PROVIDER_ERROR
 
@@ -258,6 +286,7 @@ class LiveRunOptions:
     require_web_search: bool = False
     route_health: dict[tuple[str, str], "RouteHealthState"] = field(default_factory=dict, repr=False, compare=False)
     proxy_attribution_path: Path | None = field(default=None, repr=False, compare=False)
+    runtime_preflight: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.user_tier == USER_TIER_FREE and self.workflow == WORKFLOW_MULTI_AGENT and not self.model_stage_overrides:
@@ -428,6 +457,12 @@ class LiveGenerationResult:
     free_catalog: dict[str, Any] = field(default_factory=dict)
     prompt_profile: str = PROMPT_PROFILE_DEFAULT
     market_research: dict[str, Any] = field(default_factory=dict)
+    runtime_preflight: dict[str, Any] = field(default_factory=dict)
+    llm_repair_count: int = 0
+    deterministic_repair_count: int = 0
+    post_repair_review_count: int = 0
+    provider_calls_saved: int = 0
+    repair_budget_exhausted: bool = False
 
     def metadata(self) -> dict[str, Any]:
         market_research = self.market_research or {}
@@ -445,6 +480,11 @@ class LiveGenerationResult:
             "attempts": self.attempts,
             "stages": self.stages,
             "repair_count": self.repair_count,
+            "llm_repair_count": self.llm_repair_count,
+            "deterministic_repair_count": self.deterministic_repair_count,
+            "post_repair_review_count": self.post_repair_review_count,
+            "provider_calls_saved": self.provider_calls_saved,
+            "repair_budget_exhausted": self.repair_budget_exhausted,
             "policy_findings": self.policy_findings,
             "generation_gate": self.generation_gate,
             "production_gate": self.production_gate,
@@ -457,6 +497,11 @@ class LiveGenerationResult:
             "fallback_gateway_count": self.fallback_gateway_count,
             "final_route_by_stage": self.final_route_by_stage,
             "stage_timeout_seconds": self.stage_timeout_seconds,
+            "runtime_preflight": self.runtime_preflight,
+            "runtime_environment": self.runtime_preflight.get("runtime_environment"),
+            "gateway_configured": self.runtime_preflight.get("gateway_configured"),
+            "missing_gateway_env": self.runtime_preflight.get("missing_gateway_env", []),
+            "recommended_command": self.runtime_preflight.get("recommended_command"),
             "free_catalog": self.free_catalog,
             "market_research": market_research,
             "web_search_enabled": bool(market_research.get("web_search_enabled")),
@@ -491,6 +536,11 @@ class StageRunContext:
     policy_findings: list[dict[str, str]] = field(default_factory=list)
     knowledge_context: dict[str, Any] = field(default_factory=dict)
     market_research: dict[str, Any] = field(default_factory=dict)
+    llm_repair_count: int = 0
+    deterministic_repair_count: int = 0
+    post_repair_review_count: int = 0
+    provider_calls_saved: int = 0
+    repair_budget_exhausted: bool = False
 
 
 def _iso_from_epoch(value: float | None) -> str | None:
@@ -852,6 +902,96 @@ def _stage_timeout_seconds(registry: dict[str, Any]) -> dict[str, float]:
     return {stage: _stage_route_policy(registry, stage).request_timeout_seconds for stage in sorted({*MODEL_STAGE_KEYS, STAGE_MARKET_RESEARCH})}
 
 
+def _runtime_environment() -> str:
+    if os.getenv("STRATEGY_CODEBOT_API_ARTIFACT_ROOT") or Path("/.dockerenv").exists():
+        return "api_container"
+    return "host"
+
+
+def _live_runtime_preflight(registry: dict[str, Any], options: LiveRunOptions) -> dict[str, Any]:
+    route_models: list[tuple[str, str]] = []
+    if options.model_override:
+        route_models.append(("override", options.model_override))
+    elif options.workflow == WORKFLOW_SINGLE:
+        for model in _models_for_agent(registry, "pine_specialist", model_override=options.model_override):
+            route_models.append(("single", model))
+    elif options.workflow == WORKFLOW_COMPACT_FREE:
+        for model in _models_for_stage(
+            registry,
+            STAGE_PINE_CODE_GENERATION,
+            model_stage_overrides=options.model_stage_overrides,
+            cost_profile=options.cost_profile,
+            user_tier=options.user_tier,
+            use_tier_routing=options.use_tier_routing,
+        ):
+            route_models.append((WORKFLOW_COMPACT_FREE, model))
+    else:
+        stages = list(WORKFLOW_STAGES)
+        if _web_search_should_run("", options):
+            stages.insert(0, STAGE_MARKET_RESEARCH)
+        for stage in stages:
+            for model in _models_for_stage(
+                registry,
+                STAGE_STRATEGY_REASONING if stage == STAGE_MARKET_RESEARCH else stage,
+                model_stage_overrides=options.model_stage_overrides,
+                cost_profile=options.cost_profile,
+                user_tier=options.user_tier,
+                use_tier_routing=options.use_tier_routing,
+            ):
+                route_models.append((stage, model))
+
+    missing_by_route: list[dict[str, Any]] = []
+    for stage, model in route_models:
+        route = _provider_route(model)
+        if route.gateway != "litellm_proxy":
+            continue
+        missing = route.missing_envs()
+        if missing:
+            missing_by_route.append(
+                {
+                    "stage": stage,
+                    "model": model,
+                    "gateway": route.gateway,
+                    "route_model": route.route_model,
+                    "missing_env": missing,
+                }
+            )
+    missing_gateway_env = sorted({env for item in missing_by_route for env in item["missing_env"]})
+    return {
+        "runtime_environment": _runtime_environment(),
+        "gateway_configured": not missing_gateway_env,
+        "missing_gateway_env": missing_gateway_env,
+        "missing_gateway_routes": missing_by_route,
+        "recommended_command": "docker compose exec -T api strategy-codebot harness latency-matrix ..." if missing_gateway_env else None,
+    }
+
+
+def _raise_if_runtime_misconfigured(registry: dict[str, Any], options: LiveRunOptions) -> dict[str, Any]:
+    report = _live_runtime_preflight(registry, options)
+    if report["gateway_configured"]:
+        return report
+    attempts = [
+        {
+            "stage": item["stage"],
+            "model": item["model"],
+            "gateway": item["gateway"],
+            "route_model": item["route_model"],
+            "status": STATUS_FAIL,
+            "error_code": FAILURE_CONFIGURATION_ERROR,
+            "failure_class": FAILURE_CONFIGURATION_ERROR,
+            "missing_gateway_env": item["missing_env"],
+            "runtime_environment": report["runtime_environment"],
+            "recommended_command": report["recommended_command"],
+        }
+        for item in report["missing_gateway_routes"]
+    ]
+    raise LiveConfigurationError(
+        "Live runtime is missing LiteLLM proxy environment; run inside api container or source gateway env before live evaluation.",
+        attempts=attempts,
+        diagnostics={"runtime_preflight": report},
+    )
+
+
 def generate_live(
     prompt: str,
     model_registry: Path,
@@ -887,21 +1027,26 @@ def generate_live(
         web_search=web_search,
         require_web_search=require_web_search,
     )
+    runtime_preflight = _raise_if_runtime_misconfigured(registry, options)
+    options.runtime_preflight = runtime_preflight
     _load_persistent_route_health(options)
     run_knowledge_context = build_knowledge_context(prompt) if options.knowledge_context == KNOWLEDGE_CONTEXT_AUTO else {}
     if options.workflow == WORKFLOW_SINGLE:
-        return _generate_single_live(litellm, prompt, registry, options=options, policy=policy, knowledge_context=run_knowledge_context)
-    if options.workflow == WORKFLOW_COMPACT_FREE:
-        return _generate_compact_free_live(litellm, prompt, registry, options=options, policy=policy, run_id=run_id, knowledge_context=run_knowledge_context)
-    return _generate_multi_agent_live(
-        litellm,
-        prompt,
-        registry,
-        options=options,
-        policy=policy,
-        run_id=run_id,
-        knowledge_context=run_knowledge_context,
-    )
+        result = _generate_single_live(litellm, prompt, registry, options=options, policy=policy, knowledge_context=run_knowledge_context)
+    elif options.workflow == WORKFLOW_COMPACT_FREE:
+        result = _generate_compact_free_live(litellm, prompt, registry, options=options, policy=policy, run_id=run_id, knowledge_context=run_knowledge_context)
+    else:
+        result = _generate_multi_agent_live(
+            litellm,
+            prompt,
+            registry,
+            options=options,
+            policy=policy,
+            run_id=run_id,
+            knowledge_context=run_knowledge_context,
+        )
+    result.runtime_preflight = runtime_preflight
+    return result
 
 
 def live_error_report(exc: LiveError) -> dict[str, Any]:
@@ -1861,7 +2006,25 @@ def _generate_multi_agent_live(
         },
     )
 
-    review = _run_and_record_stage(stage_context, STAGE_BALANCED_REVIEW, context_packet)
+    repair_history: list[dict[str, Any]] = []
+    repair_count = 0
+    if not _validation_allows_artifact(validation):
+        strategy_spec, pine_code, validation, context_packet, repair_count, _changed = _maybe_run_deterministic_repair(
+            stage_context,
+            prompt,
+            strategy_spec,
+            pine_code,
+            validation,
+            context_packet,
+            repair_history,
+            repair_count,
+            reason="initial_static_validation",
+        )
+
+    if not _validation_allows_artifact(validation):
+        review = _run_static_balanced_review_stage(stage_context, context_packet, validation, reason="validation_blocking_before_review")
+    else:
+        review = _run_and_record_stage(stage_context, STAGE_BALANCED_REVIEW, context_packet)
     review_output = review["payload"]["output"]
     review_output = _align_review_with_validation(review_output, validation, stage_context, STAGE_BALANCED_REVIEW)
     review["payload"]["output"] = review_output
@@ -1869,43 +2032,86 @@ def _generate_multi_agent_live(
     stage_context.review_output = review_output
     context_packet = _advance_context(context_packet, STAGE_BALANCED_REVIEW, review["payload"], artifacts={"validation": validation, "review": review_output})
 
-    repair_history: list[dict[str, Any]] = []
-    repair_count = 0
     max_repair_loops = _max_repair_loops_for_tier(registry, options.user_tier)
+    max_llm_repair_loops = _max_llm_repair_loops_for_tier(registry, options.user_tier)
+    max_post_repair_reviews = _max_post_repair_reviews_for_tier(registry, options.user_tier)
+    allow_deterministic_after_budget = _allow_deterministic_repair_after_budget(registry, options.user_tier)
     while _requires_repair(validation, review_output) and repair_count < max_repair_loops:
-        repair_count += 1
-        repair = _run_and_record_stage(stage_context, STAGE_REPAIR, context_packet, repair_iteration=repair_count)
-        repair_output = repair["payload"]["output"]
-        strategy_spec = repair_output["strategy_spec"]
-        pine_code = repair_output["pine_code"]
-        validate_payload(strategy_spec, "strategy-spec.schema.json")
-        strategy_spec = _normalize_target_platform_for_prompt(prompt, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
-        strategy_spec = _normalize_script_type_for_strategy_prompt(prompt, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
-        strategy_spec = _normalize_price_action_constraints_for_prompt(prompt, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
-        repair["payload"]["output"]["strategy_spec"] = strategy_spec
-        stage_records[-1]["output"]["strategy_spec"] = strategy_spec
-        if not isinstance(pine_code, str) or not pine_code.strip():
-            raise LiveResponseSchemaError("repair must produce non-empty pine_code.", attempts=attempts)
-        pine_code = _normalize_live_pine_code(pine_code, stage_context, STAGE_REPAIR, repair_iteration=repair_count, strategy_spec=strategy_spec)
-        pine_code = _repair_price_action_pine_if_incomplete(prompt, pine_code, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
-        repair["payload"]["output"]["pine_code"] = pine_code
-        stage_records[-1]["output"]["pine_code"] = pine_code
-        stage_context.strategy_spec = strategy_spec
-        stage_context.pine_code = pine_code
-        validation = _apply_price_action_validation(prompt, pine_code, _validate_pine_cached(pine_code, strategy_spec))
-        stage_context.validation = validation
-        repair_history.append({"iteration": repair_count, "validation_status": validation["status"], "validation": validation, "validation_failures": _validation_failures(validation), "validation_warnings": validation.get("warnings", [])})
-        stage_context.repair_count = repair_count
-        stage_context.repair_history = repair_history
-        context_packet = _advance_context(
-            context_packet,
-            STAGE_REPAIR,
-            repair["payload"],
-            artifacts={"strategy_spec": strategy_spec, "pine_code": pine_code, "validation": validation, "validation_failures": _validation_failures(validation), "repair_iteration": repair_count},
-        )
-        context_packet["current_artifacts"]["policy_findings"] = stage_context.policy_findings
-        context_packet["current_artifacts"]["normalizations"] = stage_context.normalizations
-        review = _run_and_record_stage(stage_context, STAGE_BALANCED_REVIEW, context_packet)
+        deterministic_allowed = repair_count < max_repair_loops and (stage_context.llm_repair_count < max_llm_repair_loops or allow_deterministic_after_budget)
+        if deterministic_allowed:
+            strategy_spec, pine_code, validation, context_packet, repair_count, deterministic_changed = _maybe_run_deterministic_repair(
+                stage_context,
+                prompt,
+                strategy_spec,
+                pine_code,
+                validation,
+                context_packet,
+                repair_history,
+                repair_count,
+                reason="repair_loop",
+            )
+            if deterministic_changed:
+                repair = stage_records[-1]
+            else:
+                repair = None
+        else:
+            deterministic_changed = False
+            repair = None
+
+        if not deterministic_changed:
+            if stage_context.llm_repair_count >= max_llm_repair_loops:
+                stage_context.repair_budget_exhausted = True
+                break
+            repair_count += 1
+            stage_context.llm_repair_count += 1
+            repair = _run_and_record_stage(stage_context, STAGE_REPAIR, context_packet, repair_iteration=repair_count)
+            repair_output = repair["payload"]["output"]
+            strategy_spec = repair_output["strategy_spec"]
+            pine_code = repair_output["pine_code"]
+            validate_payload(strategy_spec, "strategy-spec.schema.json")
+            strategy_spec = _normalize_target_platform_for_prompt(prompt, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
+            strategy_spec = _normalize_script_type_for_strategy_prompt(prompt, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
+            strategy_spec = _normalize_price_action_constraints_for_prompt(prompt, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
+            repair["payload"]["output"]["strategy_spec"] = strategy_spec
+            stage_records[-1]["output"]["strategy_spec"] = strategy_spec
+            if not isinstance(pine_code, str) or not pine_code.strip():
+                raise LiveResponseSchemaError("repair must produce non-empty pine_code.", attempts=attempts)
+            pine_code = _normalize_live_pine_code(pine_code, stage_context, STAGE_REPAIR, repair_iteration=repair_count, strategy_spec=strategy_spec)
+            pine_code = _repair_price_action_pine_if_incomplete(prompt, pine_code, strategy_spec, stage_context, STAGE_REPAIR, repair_iteration=repair_count)
+            repair["payload"]["output"]["pine_code"] = pine_code
+            stage_records[-1]["output"]["pine_code"] = pine_code
+            stage_context.strategy_spec = strategy_spec
+            stage_context.pine_code = pine_code
+            validation = _apply_price_action_validation(prompt, pine_code, _validate_pine_cached(pine_code, strategy_spec))
+            stage_context.validation = validation
+            repair_history.append(
+                {
+                    "iteration": repair_count,
+                    "repair_source": "llm",
+                    "validation_status": validation["status"],
+                    "validation": validation,
+                    "validation_failures": _validation_failures(validation),
+                    "validation_warnings": validation.get("warnings", []),
+                }
+            )
+            stage_context.repair_count = repair_count
+            stage_context.repair_history = repair_history
+            context_packet = _advance_context(
+                context_packet,
+                STAGE_REPAIR,
+                repair["payload"],
+                artifacts={"strategy_spec": strategy_spec, "pine_code": pine_code, "validation": validation, "validation_failures": _validation_failures(validation), "repair_iteration": repair_count, "repair_source": "llm"},
+            )
+            context_packet["current_artifacts"]["policy_findings"] = stage_context.policy_findings
+            context_packet["current_artifacts"]["normalizations"] = stage_context.normalizations
+
+        if not _validation_allows_artifact(validation):
+            review = _run_static_balanced_review_stage(stage_context, context_packet, validation, reason="validation_blocking_after_repair", repair_iteration=repair_count)
+        elif stage_context.post_repair_review_count >= max_post_repair_reviews:
+            review = _run_static_balanced_review_stage(stage_context, context_packet, validation, reason="post_repair_review_budget_exhausted", repair_iteration=repair_count)
+        else:
+            stage_context.post_repair_review_count += 1
+            review = _run_and_record_stage(stage_context, STAGE_BALANCED_REVIEW, context_packet)
         review_output = review["payload"]["output"]
         review_output = _align_review_with_validation(review_output, validation, stage_context, STAGE_BALANCED_REVIEW, repair_iteration=repair_count)
         review["payload"]["output"] = review_output
@@ -1915,6 +2121,9 @@ def _generate_multi_agent_live(
         repair_history[-1]["review_verdict"] = review_output["verdict"]
         repair_history[-1]["required_fixes"] = review_output.get("required_fixes", [])
         repair_history[-1]["rationale"] = review_output.get("rationale")
+
+    if _requires_repair(validation, review_output):
+        stage_context.repair_budget_exhausted = True
 
     final_policy_findings = find_policy_claims(json.dumps({"strategy_spec": strategy_spec, "pine_code": pine_code}, ensure_ascii=False))
     stage_context.policy_findings.extend(final_policy_findings)
@@ -1940,6 +2149,11 @@ def _generate_multi_agent_live(
                 "review_verdict": review_output.get("verdict"),
                 "required_fixes": review_output.get("required_fixes", []),
                 "repair_attempts_exhausted": _requires_repair(validation, review_output),
+                "repair_budget_exhausted": stage_context.repair_budget_exhausted,
+                "llm_repair_count": stage_context.llm_repair_count,
+                "deterministic_repair_count": stage_context.deterministic_repair_count,
+                "post_repair_review_count": stage_context.post_repair_review_count,
+                "provider_calls_saved": stage_context.provider_calls_saved,
                 "review": review_output,
                 "policy_findings": blocking_policy_findings,
             }
@@ -1956,6 +2170,8 @@ def _generate_multi_agent_live(
     final_stage = stage_records[-1]
     generation_gate = _generation_gate(validation)
     production_gate = _production_gate(validation, review_output, stage_context.policy_findings, repair_count)
+    repair_loop_metrics = _repair_loop_metrics(stage_context)
+    production_gate.update(repair_loop_metrics)
     workflow_trace = {
         "run_id": run_id,
         "workflow": WORKFLOW_MULTI_AGENT,
@@ -1980,6 +2196,7 @@ def _generate_multi_agent_live(
         "web_search_decision_reason": market_research.get("web_search_decision_reason"),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        **repair_loop_metrics,
         "route_health_snapshot": _route_health_snapshot(options.route_health),
         "cooldown_skips": _cooldown_skips(attempts),
         "fallback_count": _fallback_count(attempts),
@@ -1993,6 +2210,7 @@ def _generate_multi_agent_live(
             "review_verdict": review_output["verdict"],
             "required_fixes": review_output.get("required_fixes", []),
             "repair_count": repair_count,
+            **repair_loop_metrics,
             "generation_gate": generation_gate,
             "production_gate": production_gate,
         },
@@ -2011,6 +2229,11 @@ def _generate_multi_agent_live(
         stages=[_stage_metadata(stage) for stage in stage_records],
         workflow_trace=workflow_trace,
         repair_count=repair_count,
+        llm_repair_count=stage_context.llm_repair_count,
+        deterministic_repair_count=stage_context.deterministic_repair_count,
+        post_repair_review_count=stage_context.post_repair_review_count,
+        provider_calls_saved=stage_context.provider_calls_saved,
+        repair_budget_exhausted=stage_context.repair_budget_exhausted,
         policy_findings=stage_context.policy_findings,
         generation_gate=generation_gate,
         production_gate=production_gate,
@@ -2037,22 +2260,22 @@ def _normalize_live_pine_code(
     normalized, action = _normalize_pine_version_header(code)
     if action["changed"]:
         action.update({"stage": stage, "repair_iteration": repair_iteration})
-        context.normalizations.append(action)
-        if context.stage_records:
-            context.stage_records[-1].setdefault("normalization", []).append(action)
+        _append_normalization(context, action)
     normalized, action = _normalize_repaint_lookahead(normalized)
     if action["changed"]:
         action.update({"stage": stage, "repair_iteration": repair_iteration})
-        context.normalizations.append(action)
-        if context.stage_records:
-            context.stage_records[-1].setdefault("normalization", []).append(action)
+        _append_normalization(context, action)
     normalized, action = _normalize_script_declaration_for_strategy_spec(normalized, strategy_spec)
     if action["changed"]:
         action.update({"stage": stage, "repair_iteration": repair_iteration})
-        context.normalizations.append(action)
-        if context.stage_records:
-            context.stage_records[-1].setdefault("normalization", []).append(action)
+        _append_normalization(context, action)
     return normalized
+
+
+def _append_normalization(context: StageRunContext, action: dict[str, Any], *, attach_to_current_stage: bool = True) -> None:
+    context.normalizations.append(action)
+    if attach_to_current_stage and context.stage_records:
+        context.stage_records[-1].setdefault("normalization", []).append(action)
 
 
 def _repair_price_action_pine_if_incomplete(
@@ -2063,6 +2286,7 @@ def _repair_price_action_pine_if_incomplete(
     stage: str,
     *,
     repair_iteration: int | None = None,
+    attach_to_current_stage: bool = True,
 ) -> str:
     if not _price_action_pine_needs_template_repair(prompt, code):
         return code
@@ -2077,10 +2301,31 @@ def _repair_price_action_pine_if_incomplete(
         "missing_strategy_exit": "strategy.exit" not in code,
         "forbidden_indicators": [token for token, _label in PRICE_ACTION_FORBIDDEN_PINE_TERMS if token in code.lower()],
     }
-    context.normalizations.append(action)
-    if context.stage_records:
-        context.stage_records[-1].setdefault("normalization", []).append(action)
+    _append_normalization(context, action, attach_to_current_stage=attach_to_current_stage)
     return repaired
+
+
+def _normalize_live_pine_code_without_stage_attachment(
+    code: str,
+    context: StageRunContext,
+    stage: str,
+    *,
+    repair_iteration: int | None,
+    strategy_spec: dict[str, Any],
+) -> str:
+    normalized, action = _normalize_pine_version_header(code)
+    if action["changed"]:
+        action.update({"stage": stage, "repair_iteration": repair_iteration})
+        _append_normalization(context, action, attach_to_current_stage=False)
+    normalized, action = _normalize_repaint_lookahead(normalized)
+    if action["changed"]:
+        action.update({"stage": stage, "repair_iteration": repair_iteration})
+        _append_normalization(context, action, attach_to_current_stage=False)
+    normalized, action = _normalize_script_declaration_for_strategy_spec(normalized, strategy_spec)
+    if action["changed"]:
+        action.update({"stage": stage, "repair_iteration": repair_iteration})
+        _append_normalization(context, action, attach_to_current_stage=False)
+    return normalized
 
 
 def _price_action_pine_needs_template_repair(prompt: str, code: str) -> bool:
@@ -2434,6 +2679,7 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
     final_attempt = _last_failed_attempt(context.attempts)
     failure_class = final_attempt.get("failure_class") or classify_failure(final_attempt.get("error_code"), final_attempt.get("error"))
     validation_failures = _validation_failures(context.validation)
+    repair_loop_metrics = _repair_loop_metrics(context)
     final_decision = {
         "status": STATUS_FAIL,
         "failure_class": failure_class,
@@ -2449,9 +2695,11 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "review_validation_disagreement": final_attempt.get("review_validation_disagreement", False),
         "repair_attempts_exhausted": final_attempt.get("repair_attempts_exhausted", False),
         "repair_count": context.repair_count,
+        **repair_loop_metrics,
     }
     generation_gate = _generation_gate(context.validation or {})
     production_gate = _production_gate(context.validation or {}, context.review_output or {}, context.policy_findings, context.repair_count)
+    production_gate.update(repair_loop_metrics)
     final_decision["generation_gate"] = generation_gate
     final_decision["production_gate"] = production_gate
     workflow_trace = {
@@ -2478,6 +2726,7 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "web_search_decision_reason": context.market_research.get("web_search_decision_reason"),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        **repair_loop_metrics,
         "route_health_snapshot": _route_health_snapshot(context.options.route_health),
         "cooldown_skips": _cooldown_skips(context.attempts),
         "fallback_count": _fallback_count(context.attempts),
@@ -2501,6 +2750,7 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "attempts": context.attempts,
         "stages": [_stage_metadata(stage) for stage in context.stage_records],
         "repair_count": context.repair_count,
+        **repair_loop_metrics,
         "validation": context.validation or {},
         "validation_status": (context.validation or {}).get("status"),
         "validation_failures": _validation_failures(context.validation),
@@ -2612,6 +2862,201 @@ def _record_stage_payload_normalizations(
             context.stage_records[-1].setdefault("normalization", []).append(action)
 
 
+def _record_local_stage(
+    context: StageRunContext,
+    stage: str,
+    context_packet: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    model: str,
+    fallback_reason: str,
+    repair_iteration: int | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    stage_context_packet = _stage_context_packet(stage, context_packet)
+    input_metrics = _context_size_fields(stage, stage_context_packet, [])
+    timing = _timing_fields(started_at=_now_iso(), completed_at=_now_iso(), duration_ms=0, request_timeout_seconds=0)
+    context.provider_calls_saved += 1
+    context.attempts.append(
+        {
+            "model": model,
+            "provider": "local",
+            "stage": stage,
+            "attempt": 1,
+            "status": STATUS_PASS,
+            "fallback": True,
+            "fallback_reason": fallback_reason,
+            "saved_provider_call": True,
+            **(extra_fields or {}),
+        }
+    )
+    stage_result = {
+        "stage": stage,
+        "model": model,
+        "provider": "local",
+        "gateway": "local",
+        "route_provider": "local",
+        "route_model": model,
+        "latency_ms": 0,
+        "usage": {},
+        "policy_findings": [],
+        "provider_warnings": [],
+        "proxy_metadata": {},
+        "payload": payload,
+        "raw_response": {"fallback": True, "fallback_reason": fallback_reason} if context.options.save_raw_provider else {},
+        "repair_iteration": repair_iteration,
+        "timing": timing,
+        "context_refs": list(stage_context_packet.get("context_refs", [])),
+        "stage_timeout_seconds": 0,
+        "fallback": True,
+        "fallback_reason": fallback_reason,
+        "saved_provider_call": True,
+        **input_metrics,
+        **(extra_fields or {}),
+    }
+    _record_stage(stage_result, context.stage_records, context.raw_responses)
+    return stage_result
+
+
+def _static_review_payload(validation: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    failures = _validation_failures(validation)
+    if failures:
+        verdict = "needs_fix"
+        required_fixes = [f"{failure.get('name')}: {failure.get('details')}" for failure in failures]
+    else:
+        verdict = STATUS_PASS
+        required_fixes = []
+    return {
+        "stage": STAGE_BALANCED_REVIEW,
+        "output": {
+            "verdict": verdict,
+            "required_fixes": required_fixes,
+            "rationale": f"Deterministic static review used because {reason}; static validation remains authoritative.",
+        },
+        "assumptions": ["No provider review content was used for this local static review decision."],
+        "handoff_notes": "review_static_validation_fallback",
+        "policy_observations": [],
+    }
+
+
+def _run_static_balanced_review_stage(
+    context: StageRunContext,
+    context_packet: dict[str, Any],
+    validation: dict[str, Any],
+    *,
+    reason: str,
+    repair_iteration: int | None = None,
+) -> dict[str, Any]:
+    payload = _static_review_payload(validation, reason=reason)
+    _validate_stage_payload(STAGE_BALANCED_REVIEW, payload)
+    return _record_local_stage(
+        context,
+        STAGE_BALANCED_REVIEW,
+        context_packet,
+        payload,
+        model="local/static-balanced-review",
+        fallback_reason="static_validation_review",
+        repair_iteration=repair_iteration,
+        extra_fields={"review_source": "deterministic_static", "provider_review_skipped_reason": reason},
+    )
+
+
+def _maybe_run_deterministic_repair(
+    context: StageRunContext,
+    prompt: str,
+    strategy_spec: dict[str, Any],
+    pine_code: str,
+    validation: dict[str, Any],
+    context_packet: dict[str, Any],
+    repair_history: list[dict[str, Any]],
+    repair_count: int,
+    *,
+    reason: str,
+) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any], int, bool]:
+    repair_iteration = repair_count + 1
+    before_spec = deepcopy(strategy_spec)
+    before_code = pine_code
+    before_normalization_count = len(context.normalizations)
+    strategy_spec = _normalize_target_platform_for_prompt(prompt, strategy_spec, context, STAGE_REPAIR, repair_iteration=repair_iteration)
+    strategy_spec = _normalize_script_type_for_strategy_prompt(prompt, strategy_spec, context, STAGE_REPAIR, repair_iteration=repair_iteration)
+    strategy_spec = _normalize_price_action_constraints_for_prompt(prompt, strategy_spec, context, STAGE_REPAIR, repair_iteration=repair_iteration)
+    pine_code = _normalize_live_pine_code_without_stage_attachment(
+        pine_code,
+        context,
+        STAGE_REPAIR,
+        repair_iteration=repair_iteration,
+        strategy_spec=strategy_spec,
+    )
+    pine_code = _repair_price_action_pine_if_incomplete(
+        prompt,
+        pine_code,
+        strategy_spec,
+        context,
+        STAGE_REPAIR,
+        repair_iteration=repair_iteration,
+        attach_to_current_stage=False,
+    )
+    changed = strategy_spec != before_spec or pine_code != before_code or len(context.normalizations) != before_normalization_count
+    if not changed:
+        return strategy_spec, pine_code, validation, context_packet, repair_count, False
+
+    validate_payload(strategy_spec, "strategy-spec.schema.json")
+    validation = _apply_price_action_validation(prompt, pine_code, _validate_pine_cached(pine_code, strategy_spec))
+    payload = {
+        "stage": STAGE_REPAIR,
+        "output": {"strategy_spec": strategy_spec, "pine_code": pine_code},
+        "assumptions": ["Deterministic repair only applied bounded static/Pine normalization rules."],
+        "handoff_notes": "deterministic_repair_applied",
+        "policy_observations": [],
+    }
+    _validate_stage_payload(STAGE_REPAIR, payload)
+    _record_local_stage(
+        context,
+        STAGE_REPAIR,
+        context_packet,
+        payload,
+        model="local/deterministic-repair",
+        fallback_reason="deterministic_repair",
+        repair_iteration=repair_iteration,
+        extra_fields={"repair_source": "deterministic"},
+    )
+    repair_count = repair_iteration
+    context.deterministic_repair_count += 1
+    context.strategy_spec = strategy_spec
+    context.pine_code = pine_code
+    context.validation = validation
+    repair_history.append(
+        {
+            "iteration": repair_count,
+            "repair_source": "deterministic",
+            "saved_provider_call": True,
+            "reason": reason,
+            "validation_status": validation["status"],
+            "validation": validation,
+            "validation_failures": _validation_failures(validation),
+            "validation_warnings": validation.get("warnings", []),
+        }
+    )
+    context.repair_count = repair_count
+    context.repair_history = repair_history
+    context_packet = _advance_context(
+        context_packet,
+        STAGE_REPAIR,
+        payload,
+        artifacts={
+            "strategy_spec": strategy_spec,
+            "pine_code": pine_code,
+            "validation": validation,
+            "validation_failures": _validation_failures(validation),
+            "repair_iteration": repair_count,
+            "repair_source": "deterministic",
+        },
+    )
+    context_packet["current_artifacts"]["policy_findings"] = context.policy_findings
+    context_packet["current_artifacts"]["normalizations"] = context.normalizations
+    return strategy_spec, pine_code, validation, context_packet, repair_count, True
+
+
 def _run_stage(
     context: StageRunContext,
     stage: str,
@@ -2662,7 +3107,7 @@ def _run_stage(
                 "attempt": 1,
                 "status": STATUS_PASS,
                 "fallback": True,
-                "fallback_reason": "malformed_provider_response",
+                "fallback_reason": call.raw_response.get("fallback_reason", "review_provider_failed"),
             }
         )
     context.policy_findings.extend(call.policy_findings)
@@ -2687,7 +3132,7 @@ def _run_stage(
         "stage_timeout_seconds": _stage_route_policy(context.registry, stage).request_timeout_seconds,
         **input_metrics,
         **({"fallback_used": pass_attempt.get("fallback_used"), "fallback_from": pass_attempt.get("fallback_from")} if pass_attempt.get("fallback_used") else {}),
-        **({"fallback": True, "fallback_reason": "malformed_provider_response"} if call.provider == "local" else {}),
+        **({"fallback": True, "fallback_reason": call.raw_response.get("fallback_reason", "review_provider_failed")} if call.provider == "local" else {}),
     }
 
 
@@ -2697,11 +3142,13 @@ def _balanced_review_fallback(stage: str, context_packet: dict[str, Any], recent
     non_skipped_attempts = [attempt for attempt in recent_attempts if attempt.get("status") != STATUS_SKIPPED]
     if not non_skipped_attempts:
         return None
-    if any(attempt.get("error_code") != "malformed_provider_response" for attempt in non_skipped_attempts):
+    fallback_error_codes = {"malformed_provider_response", "provider_timeout"}
+    if any(attempt.get("error_code") not in fallback_error_codes and attempt.get("failure_class") not in fallback_error_codes for attempt in non_skipped_attempts):
         return None
     validation = context_packet.get("current_artifacts", {}).get("validation")
     if not isinstance(validation, dict):
         return None
+    fallback_reason = "malformed_provider_response" if all(attempt.get("error_code") == "malformed_provider_response" for attempt in non_skipped_attempts) else "review_provider_failed"
     failures = _validation_failures(validation)
     if failures:
         verdict = "needs_fix"
@@ -2714,17 +3161,17 @@ def _balanced_review_fallback(stage: str, context_packet: dict[str, Any], recent
         "output": {
             "verdict": verdict,
             "required_fixes": required_fixes,
-            "rationale": "Deterministic fallback after provider returned malformed structured review JSON after retries; static validation is authoritative.",
+            "rationale": "Deterministic fallback after provider review failed or timed out after retries; static validation is authoritative.",
         },
         "assumptions": ["Provider review content was not parseable; fallback used static validation and existing gates only."],
         "handoff_notes": "review_structured_output_fallback",
         "policy_observations": [],
     }
     _validate_stage_payload(STAGE_BALANCED_REVIEW, payload)
-    warning = f"balanced_review provider returned malformed structured JSON after {len(recent_attempts)} attempts; used deterministic static-validation fallback."
+    warning = f"balanced_review provider failed or timed out after {len(recent_attempts)} attempts; used deterministic static-validation fallback."
     return ProviderCallResult(
         payload=payload,
-        raw_response={"fallback": True, "fallback_reason": "malformed_provider_response", "attempt_count": len(recent_attempts)},
+        raw_response={"fallback": True, "fallback_reason": fallback_reason, "attempt_count": len(recent_attempts)},
         usage={},
         model="local/balanced-review-fallback",
         provider="local",
@@ -3117,13 +3564,35 @@ def _models_for_user_tier(registry: dict[str, Any], stage: str, *, user_tier: st
 
 
 def _max_repair_loops_for_tier(registry: dict[str, Any], user_tier: str) -> int:
-    tiers = registry.get("model_tiers")
-    if not isinstance(tiers, dict):
-        return MAX_REPAIR_LOOPS
-    tier_config = tiers.get(user_tier, {})
-    if not isinstance(tier_config, dict):
+    tier_config = _tier_config(registry, user_tier)
+    if not tier_config:
         return MAX_REPAIR_LOOPS
     return int(tier_config.get("max_repair_loops", MAX_REPAIR_LOOPS))
+
+
+def _tier_config(registry: dict[str, Any], user_tier: str) -> dict[str, Any]:
+    tiers = registry.get("model_tiers")
+    if not isinstance(tiers, dict):
+        return {}
+    tier_config = tiers.get(user_tier, {})
+    if not isinstance(tier_config, dict):
+        return {}
+    return tier_config
+
+
+def _max_llm_repair_loops_for_tier(registry: dict[str, Any], user_tier: str) -> int:
+    tier_config = _tier_config(registry, user_tier)
+    return int(tier_config.get("max_llm_repair_loops", _max_repair_loops_for_tier(registry, user_tier)))
+
+
+def _max_post_repair_reviews_for_tier(registry: dict[str, Any], user_tier: str) -> int:
+    tier_config = _tier_config(registry, user_tier)
+    return int(tier_config.get("max_post_repair_reviews", _max_repair_loops_for_tier(registry, user_tier)))
+
+
+def _allow_deterministic_repair_after_budget(registry: dict[str, Any], user_tier: str) -> bool:
+    tier_config = _tier_config(registry, user_tier)
+    return bool(tier_config.get("allow_deterministic_repair_after_budget", True))
 
 
 def _models_for_stage(registry: dict[str, Any], stage: str, *, model_stage_overrides: dict[str, str], cost_profile: str, user_tier: str = DEFAULT_USER_TIER, use_tier_routing: bool = True) -> list[str]:
@@ -3798,6 +4267,9 @@ def _validate_single_payload(payload: dict[str, Any]) -> None:
     payload["strategy_spec"], normalization = _normalize_full_capital_position_sizing(payload["strategy_spec"])
     if normalization:
         payload.setdefault("normalizations", []).append({"stage": "single", **normalization})
+    payload["strategy_spec"], normalization = _normalize_risk_concentration_assumption(payload["strategy_spec"])
+    if normalization:
+        payload.setdefault("normalizations", []).append({"stage": "single", **normalization})
     validate_payload(payload["strategy_spec"], "strategy-spec.schema.json")
     _validate_position_sizing_quality(payload["strategy_spec"])
     pine_code = payload.get("pine_code")
@@ -3814,6 +4286,10 @@ def _validate_stage_payload(stage: str, payload: dict[str, Any]) -> None:
     if stage in {STAGE_STRATEGY_CODING, STAGE_REPAIR}:
         payload["output"]["strategy_spec"] = _prune_nulls(payload["output"]["strategy_spec"])
         normalized_spec, normalization = _normalize_full_capital_position_sizing(payload["output"]["strategy_spec"])
+        payload["output"]["strategy_spec"] = normalized_spec
+        if normalization:
+            payload.setdefault("normalizations", []).append({"stage": stage, **normalization})
+        normalized_spec, normalization = _normalize_risk_concentration_assumption(payload["output"]["strategy_spec"])
         payload["output"]["strategy_spec"] = normalized_spec
         if normalization:
             payload.setdefault("normalizations", []).append({"stage": stage, **normalization})
@@ -3896,6 +4372,35 @@ def _normalize_full_capital_position_sizing(strategy_spec: dict[str, Any]) -> tu
         "to": normalized["position_sizing"],
         "matched_phrase": matched_phrase,
         "reason": "unsafe_full_capital_position_sizing",
+    }
+
+
+def _normalize_risk_concentration_assumption(strategy_spec: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    risk_text = " ".join(
+        str(part)
+        for part in (
+            strategy_spec.get("position_sizing"),
+            *(strategy_spec.get("risk_rules") or []),
+            *(strategy_spec.get("constraints") or []),
+        )
+        if part
+    ).lower()
+    has_bounded_risk = any(phrase in risk_text for phrase in BOUNDED_RISK_POSITION_SIZING_PHRASES)
+    has_concentration_assumption = any(phrase in risk_text for phrase in RISK_CONCENTRATION_ASSUMPTION_PHRASES)
+    if not has_bounded_risk or has_concentration_assumption:
+        return strategy_spec, None
+    normalized = deepcopy(strategy_spec)
+    risk_rules = normalized.get("risk_rules")
+    if isinstance(risk_rules, list):
+        normalized["risk_rules"] = [*risk_rules, DEFAULT_RISK_CONCENTRATION_ASSUMPTION]
+    else:
+        normalized["risk_rules"] = [DEFAULT_RISK_CONCENTRATION_ASSUMPTION]
+    return normalized, {
+        "kind": "risk_concentration_assumption",
+        "changed": True,
+        "from": None,
+        "to": DEFAULT_RISK_CONCENTRATION_ASSUMPTION,
+        "reason": "missing_exposure_or_portfolio_heat_assumption",
     }
 
 
@@ -4100,6 +4605,14 @@ def _record_stage(stage_result: dict[str, Any], stage_records: list[dict[str, An
     if stage_result.get("fallback_used"):
         stage_record["fallback_used"] = stage_result["fallback_used"]
         stage_record["fallback_from"] = stage_result.get("fallback_from")
+    for key in (
+        "saved_provider_call",
+        "repair_source",
+        "review_source",
+        "provider_review_skipped_reason",
+    ):
+        if key in stage_result:
+            stage_record[key] = stage_result.get(key)
     if stage_result.get("repair_iteration"):
         stage_record["repair_iteration"] = stage_result["repair_iteration"]
     if stage_result.get("raw_response"):
@@ -4165,6 +4678,10 @@ def _stage_metadata(stage_record: dict[str, Any]) -> dict[str, Any]:
         **({"fallback": stage_record["fallback"], "fallback_reason": stage_record.get("fallback_reason")} if "fallback" in stage_record else {}),
         **({"fallback_used": stage_record["fallback_used"], "fallback_from": stage_record.get("fallback_from")} if "fallback_used" in stage_record else {}),
         **({"repair_iteration": stage_record["repair_iteration"]} if "repair_iteration" in stage_record else {}),
+        **({"saved_provider_call": stage_record["saved_provider_call"]} if "saved_provider_call" in stage_record else {}),
+        **({"repair_source": stage_record["repair_source"]} if "repair_source" in stage_record else {}),
+        **({"review_source": stage_record["review_source"]} if "review_source" in stage_record else {}),
+        **({"provider_review_skipped_reason": stage_record["provider_review_skipped_reason"]} if "provider_review_skipped_reason" in stage_record else {}),
         **(
             {
                 "web_search_enabled": stage_record.get("web_search_enabled"),
@@ -4341,6 +4858,16 @@ def _production_gate(
         "policy_warning_count": len(policy_warnings),
         "policy_block_count": len(policy_blocks),
         "repair_count": repair_count,
+    }
+
+
+def _repair_loop_metrics(context: StageRunContext) -> dict[str, Any]:
+    return {
+        "llm_repair_count": context.llm_repair_count,
+        "deterministic_repair_count": context.deterministic_repair_count,
+        "post_repair_review_count": context.post_repair_review_count,
+        "provider_calls_saved": context.provider_calls_saved,
+        "repair_budget_exhausted": context.repair_budget_exhausted,
     }
 
 

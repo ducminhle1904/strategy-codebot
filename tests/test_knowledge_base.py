@@ -21,6 +21,8 @@ from strategy_codebot.knowledge_base import (
     propose_candidate,
     propose_failure_candidate,
     reject_candidate,
+    review_candidate_for_auto_promotion,
+    review_candidates_for_auto_promotion,
     resolve_embedding_config,
     search_knowledge,
     snapshot_trusted_source,
@@ -46,7 +48,13 @@ def test_knowledge_index_builds_required_types_and_schema(tmp_path: Path) -> Non
     assert all("embedding_model" in chunk for chunk in index["chunks"])
     assert any(item["id"] == "internal-crypto-playbook" and item["market_tags"] == ["crypto"] for item in index["items"])
     assert any(item["id"] == "internal-forex-playbook" and item["market_tags"] == ["forex"] for item in index["items"])
+    assert any(
+        item["id"] == "internal-trading-skill-integration"
+        and {"backtest", "quality", "learning_loop"} <= set(item["domain_tags"])
+        for item in index["items"]
+    )
     assert any(source["id"] == "babypips-school-of-pipsology" and source["type"] == "external_ref" for source in index["sources"])
+    assert any(source["id"] == "tradermonty-backtest-expert-skill" and source["type"] == "external_ref" for source in index["sources"])
     assert index["retrieval_index"]["source_map"]
     assert index["retrieval_index"]["tag_map"]["crypto"]
     assert all("section_title" in chunk and "token_frequencies" in chunk for chunk in index["chunks"])
@@ -252,6 +260,18 @@ def test_playbooks_keep_risk_boundary_retrievable(tmp_path: Path) -> None:
     assert any(chunk["source_id"] == "internal-risk-policy" for chunk in result["retrieved_chunks"])
     assert "internal-risk-policy" in result["required_source_hits"]
     assert result["low_confidence"] is False
+
+
+def test_trading_skill_integration_retrieves_robustness_checklist(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    build_knowledge_index(index_path=index_path)
+
+    result = search_knowledge("Review a local preview strategy for sample size, slippage stress, invalidation, and overfit risk", index_path=index_path)
+
+    assert any(chunk["source_id"] == "internal-trading-skill-integration" for chunk in result["retrieved_chunks"])
+    combined = " ".join(chunk["text"].lower() for chunk in result["retrieved_chunks"])
+    assert "sample size" in combined
+    assert "slippage" in combined
 
 
 def test_local_query_embedding_cache_hits_repeated_query(tmp_path: Path) -> None:
@@ -462,6 +482,322 @@ def test_candidate_reject_updates_status(tmp_path: Path) -> None:
     assert store["candidates"][0]["status"] == "rejected"
 
 
+def test_guarded_auto_review_promotes_safe_validator_lesson(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "fail", "cases": [{"id": "case-a"}]})
+    candidate = propose_candidate(
+        "Pine generation must keep the exact version header on the first line before static validation repair.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        trust_level="agent_reviewed",
+        metadata={"learning": {"evidence_count": 1, "extractor": "test"}},
+    )
+
+    review = review_candidate_for_auto_promotion(candidate["candidate_id"], index_path=index_path, candidates_path=candidates_path)
+    result = search_knowledge("exact version header static validation repair", index_path=index_path)
+    store = load_candidates(candidates_path)
+
+    assert review["promotion_decision"] == "auto_approved"
+    assert review["status"] == "auto_approved"
+    assert store["candidates"][0]["status"] == "auto_approved"
+    assert store["candidates"][0]["metadata"]["promotion"]["quality_score"] == 1.0
+    assert any(chunk["item_id"] == review["approval"]["item_id"] for chunk in result["retrieved_chunks"])
+
+
+def test_guarded_auto_review_keeps_performance_claim_for_review(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "pass"})
+    candidate = propose_candidate(
+        "This strategy shows a strong market edge and better performance in January conditions.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+
+    review = review_candidate_for_auto_promotion(candidate["candidate_id"], index_path=index_path, candidates_path=candidates_path)
+    store = load_candidates(candidates_path)
+
+    assert review["promotion_decision"] == "needs_review"
+    assert review["review_required_reason"] == "trading_performance_claim_requires_review"
+    assert store["candidates"][0]["status"] == "needs_review"
+
+
+def test_guarded_auto_review_rejects_live_trading_claim(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "pass"})
+    candidate = propose_candidate(
+        "This lesson certifies broker execution is live-ready with no-loss protection.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+
+    review = review_candidate_for_auto_promotion(candidate["candidate_id"], index_path=index_path, candidates_path=candidates_path)
+
+    assert review["promotion_decision"] == "auto_rejected"
+    assert review["status"] == "rejected"
+    assert load_candidates(candidates_path)["candidates"][0]["status"] == "rejected"
+
+
+def test_guarded_auto_review_requires_existing_artifact_evidence(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    build_knowledge_index(index_path=index_path)
+    candidate = propose_candidate(
+        "Pine repair should summarize static validator failures before changing generated code.",
+        evidence_ref=str(tmp_path / "runs" / "missing" / "eval-report.json"),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+
+    review = review_candidate_for_auto_promotion(candidate["candidate_id"], index_path=index_path, candidates_path=candidates_path)
+
+    assert review["promotion_decision"] == "needs_review"
+    assert review["review_required_reason"] == "missing_artifact_evidence"
+
+
+def test_guarded_auto_review_accepts_repeated_file_evidence(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    first_evidence = tmp_path / "runs" / "run-01" / "eval-report.json"
+    second_evidence = tmp_path / "runs" / "run-02" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(first_evidence, {"status": "fail"})
+    write_json(second_evidence, {"status": "fail"})
+    lesson = "Static validation repair should preserve strategy declaration arguments while fixing Pine syntax."
+    candidate = propose_candidate(
+        lesson,
+        evidence_ref=str(first_evidence),
+        path=candidates_path,
+        dedupe_key="validator-repeat",
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+    )
+    propose_candidate(
+        lesson,
+        evidence_ref=str(second_evidence),
+        path=candidates_path,
+        dedupe_key="validator-repeat",
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+    )
+
+    review = review_candidate_for_auto_promotion(candidate["candidate_id"], index_path=index_path, candidates_path=candidates_path)
+
+    assert review["promotion_decision"] == "auto_approved"
+    assert review["status"] == "auto_approved"
+
+
+def test_guarded_auto_review_batch_rebuilds_local_index_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "fail"})
+    first = propose_candidate(
+        "Static validation repair should preserve the Pine version header.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+    second = propose_candidate(
+        "Static validation repair should preserve risk exit rules.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+    from strategy_codebot import knowledge_base as kb
+
+    original_chunks_for_items = kb._chunks_for_items
+    calls = 0
+
+    def counted_chunks_for_items(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_chunks_for_items(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "_chunks_for_items", counted_chunks_for_items)
+
+    reviews = review_candidates_for_auto_promotion(
+        [first["candidate_id"], second["candidate_id"]],
+        index_path=index_path,
+        candidates_path=candidates_path,
+    )
+
+    assert calls == 2
+    assert [review["promotion_decision"] for review in reviews] == ["auto_approved", "auto_approved"]
+    assert {candidate["status"] for candidate in load_candidates(candidates_path)["candidates"]} == {"auto_approved"}
+
+
+def test_guarded_auto_review_batch_retrieval_failure_does_not_block_other(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "fail"})
+    first = propose_candidate(
+        "Static validation repair should preserve the Pine version header.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+    second = propose_candidate(
+        "Static validation repair should preserve risk exit rules.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+
+    monkeypatch.setattr(
+        "strategy_codebot.knowledge_base._verify_learning_retrieval_dry_run_batch",
+        lambda candidates, **_kwargs: {
+            str(candidates[0]["candidate_id"]): {"status": "fail", "reason": "not_retrieved"},
+            str(candidates[1]["candidate_id"]): {"status": "pass", "retrieved": True},
+        },
+    )
+
+    reviews = review_candidates_for_auto_promotion(
+        [first["candidate_id"], second["candidate_id"]],
+        index_path=index_path,
+        candidates_path=candidates_path,
+    )
+    statuses = {candidate["candidate_id"]: candidate["status"] for candidate in load_candidates(candidates_path)["candidates"]}
+
+    assert reviews[0]["promotion_decision"] == "needs_review"
+    assert reviews[0]["review_required_reason"] == "retrieval_verification_failed"
+    assert reviews[1]["promotion_decision"] == "auto_approved"
+    assert statuses[first["candidate_id"]] == "needs_review"
+    assert statuses[second["candidate_id"]] == "auto_approved"
+
+
+def test_guarded_auto_review_blocks_retrieval_verification_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "fail"})
+    candidate = propose_candidate(
+        "Static validation repair should keep risk exits present after syntax cleanup.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+    monkeypatch.setattr(
+        "strategy_codebot.knowledge_base._verify_learning_retrieval_dry_run",
+        lambda *args, **kwargs: {"status": "fail", "reason": "not_retrieved"},
+    )
+
+    review = review_candidate_for_auto_promotion(candidate["candidate_id"], index_path=index_path, candidates_path=candidates_path)
+
+    assert review["promotion_decision"] == "needs_review"
+    assert review["review_required_reason"] == "retrieval_verification_failed"
+
+
+def test_guarded_auto_review_llm_pass_cannot_override_deterministic_fail(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    build_knowledge_index(index_path=index_path)
+    candidate = propose_candidate(
+        "Static validation repair should keep Pine version header before executable code.",
+        evidence_ref=str(tmp_path / "runs" / "missing" / "eval-report.json"),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+
+    review = review_candidate_for_auto_promotion(
+        candidate["candidate_id"],
+        index_path=index_path,
+        candidates_path=candidates_path,
+        llm_judge=lambda _candidate: {
+            "generalizable": True,
+            "unsafe_claims": [],
+            "requires_human_review": False,
+            "reason": "safe",
+            "confidence": "high",
+        },
+    )
+
+    assert review["promotion_decision"] == "needs_review"
+    assert review["review_required_reason"] == "missing_artifact_evidence"
+
+
+def test_guarded_auto_review_llm_review_blocks_otherwise_safe_candidate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    evidence_path = tmp_path / "runs" / "run-01" / "eval-report.json"
+    build_knowledge_index(index_path=index_path)
+    write_json(evidence_path, {"status": "fail"})
+    candidate = propose_candidate(
+        "Static validation repair should keep risk exits present after syntax cleanup.",
+        evidence_ref=str(evidence_path),
+        path=candidates_path,
+        candidate_type="procedural",
+        lesson_kind="pine_static_validation",
+        confidence="high",
+        metadata={"learning": {"evidence_count": 1}},
+    )
+
+    review = review_candidate_for_auto_promotion(
+        candidate["candidate_id"],
+        index_path=index_path,
+        candidates_path=candidates_path,
+        llm_judge=lambda _candidate: {
+            "generalizable": False,
+            "unsafe_claims": [],
+            "requires_human_review": True,
+            "reason": "too_specific",
+            "confidence": "medium",
+        },
+    )
+
+    assert review["promotion_decision"] == "needs_review"
+    assert review["review_required_reason"] == "llm_requires_review"
+
+
 def test_failure_candidate_is_pending_and_deduped(tmp_path: Path) -> None:
     candidates_path = tmp_path / "kb" / "candidates.json"
     failure = {
@@ -519,12 +855,47 @@ def test_learn_from_run_auto_approves_repeated_safe_validator_lesson(tmp_path: P
     assert report["status"] == "pass"
     assert report["promoted_count"] == 1
     assert second_report["promoted_count"] == 1
-    assert store["candidates"][0]["status"] == "approved"
+    assert store["candidates"][0]["status"] == "auto_approved"
     assert store["candidates"][0]["confidence"] == "high"
     assert store["candidates"][0]["trust_level"] == "agent_reviewed"
     assert sum(1 for item in index["items"] if item["id"] == approved_item_id) == 1
     assert any(chunk["item_id"] == approved_item_id for chunk in result["retrieved_chunks"])
     assert any(chunk["item_id"] == approved_item_id for chunk in live_style_result["retrieved_chunks"])
+
+
+def test_learn_from_run_extracts_backtest_robustness_lessons(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    candidates_path = tmp_path / "kb" / "candidates.json"
+    artifacts_root = tmp_path / "artifacts"
+    build_knowledge_index(index_path=index_path)
+    for run in ("run-01", "run-02"):
+        write_json(
+            artifacts_root / run / "backtest-report.json",
+            {
+                "status": "completed",
+                "robustness_report": {
+                    "status": "warn",
+                    "checks": {
+                        "sample_size": {
+                            "status": "warn",
+                            "message": "Low closed-trade sample; keep the result in manual review.",
+                        }
+                    },
+                },
+                "promotion_decision": {"decision": "manual_review"},
+            },
+        )
+
+    report = learn_from_run(artifacts_root, index_path=index_path, candidates_path=candidates_path)
+    result = search_knowledge("local preview low closed-trade sample manual review preview profit evidence", index_path=index_path)
+
+    assert report["promoted_count"] == 0
+    assert report["skipped_count"] == 1
+    assert report["skipped"][0]["lesson_kind"] == "backtest_robustness"
+    assert report["skipped"][0]["validator_check"] == "sample_size"
+    assert report["skipped"][0]["review_required_reason"] == "trading_performance_claim_requires_review"
+    assert "PineForge" not in report["skipped"][0]["lesson"]
+    assert not any(chunk["source_type"] == "approved_candidate" for chunk in result["retrieved_chunks"])
 
 
 def test_learn_from_run_manual_mode_dedupes_without_approval(tmp_path: Path) -> None:

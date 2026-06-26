@@ -5,8 +5,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from strategy_codebot.server.auth import AuthContext
+from strategy_codebot.server.artifact_kinds import INTERNAL_ARTIFACT_KINDS
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.models import Artifact
+from strategy_codebot.server.models import BacktestEquitySummary
+from strategy_codebot.server.models import BacktestReport
+from strategy_codebot.server.models import BacktestTradeIndex
 from strategy_codebot.server.models import AssistantRun
 from strategy_codebot.server.models import ConversationMemory
 from strategy_codebot.server.models import ConversationMessage
@@ -26,6 +30,8 @@ from strategy_codebot.server.models import Workspace
 from strategy_codebot.server.models import WorkspaceMembership
 from strategy_codebot.server.repository import ArtifactRecord
 from strategy_codebot.server.repository import ArtifactInput
+from strategy_codebot.server.repository import ArtifactPageRecord
+from strategy_codebot.server.repository import ArtifactVisibilityFilter
 from strategy_codebot.server.repository import AccountUsageSummaryRecord
 from strategy_codebot.server.repository import AssistantRunRecord
 from strategy_codebot.server.repository import ConversationRecord
@@ -44,6 +50,10 @@ from strategy_codebot.server.repository import RunEventSummaryRecord
 from strategy_codebot.server.repository import StrategySpecRecord
 from strategy_codebot.server.repository import TERMINAL_RUN_STATUSES
 from strategy_codebot.server.repository import bounded_state_message_limit
+from strategy_codebot.server.repository import bounded_artifact_page_limit
+from strategy_codebot.server.repository import CONVERSATION_ARTIFACT_STATE_LIMIT
+from strategy_codebot.server.repository import decode_artifact_page_cursor
+from strategy_codebot.server.repository import encode_artifact_page_cursor
 from strategy_codebot.server.repository import PolicyFindingRecord
 from strategy_codebot.server.repository import ToolCallRecord
 from strategy_codebot.server.repository import UsageLedgerRecord
@@ -379,8 +389,41 @@ class SQLAlchemyConversationRepository:
                 .limit(1)
             ).first()
             artifacts: list[ArtifactRecord] = []
+            conversation_artifact_rows = session.scalars(
+                select(Artifact)
+                .where(
+                    Artifact.conversation_id == conversation.id,
+                    Artifact.owner_user_id == auth.user_id,
+                    Artifact.workspace_id == auth.workspace_id,
+                    Artifact.kind.notin_(tuple(INTERNAL_ARTIFACT_KINDS)),
+                )
+                .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+                .limit(CONVERSATION_ARTIFACT_STATE_LIMIT + 1)
+            ).all()
+            conversation_artifacts_page = [_artifact_record(row) for row in conversation_artifact_rows]
+            conversation_artifacts = conversation_artifacts_page[:CONVERSATION_ARTIFACT_STATE_LIMIT]
+            conversation_artifacts_next_cursor = (
+                encode_artifact_page_cursor(conversation_artifacts[-1])
+                if len(conversation_artifacts_page) > CONVERSATION_ARTIFACT_STATE_LIMIT and conversation_artifacts
+                else None
+            )
             events: list[RunEventRecord] = []
+            conversation_events: list[RunEventRecord] = []
             latest_strategy_spec = None
+            if event_limit > 0:
+                conversation_event_rows = session.scalars(
+                    select(RunEvent)
+                    .where(
+                        RunEvent.conversation_id == conversation.id,
+                        RunEvent.owner_user_id == auth.user_id,
+                        RunEvent.workspace_id == auth.workspace_id,
+                    )
+                    .order_by(RunEvent.created_at.desc(), RunEvent.sequence.desc(), RunEvent.id.desc())
+                    .limit(max(event_limit * 4, event_limit))
+                ).all()
+                conversation_events = [
+                    _run_event_record(row) for row in reversed(conversation_event_rows)
+                ]
             if latest_run is not None:
                 latest_strategy_spec = session.scalars(
                     select(StrategySpec)
@@ -422,7 +465,10 @@ class SQLAlchemyConversationRepository:
                 message_limit=bounded_message_limit,
                 latest_run=_run_record(latest_run) if latest_run is not None else None,
                 latest_run_artifacts=artifacts,
+                conversation_artifacts=conversation_artifacts,
+                conversation_artifacts_next_cursor=conversation_artifacts_next_cursor,
                 latest_run_events=events,
+                conversation_run_events=conversation_events,
                 latest_strategy_spec=(
                     _strategy_spec_record(latest_strategy_spec)
                     if latest_strategy_spec is not None
@@ -957,6 +1003,219 @@ class SQLAlchemyConversationRepository:
                 return None
             return _artifact_record(artifact)
 
+    def list_workspace_artifacts_page(
+        self,
+        auth: AuthContext,
+        *,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord:
+        with self._session_factory() as session:
+            return self._list_artifact_page(
+                session,
+                auth,
+                limit=limit,
+                cursor=cursor,
+                visibility=visibility,
+            )
+
+    def list_conversation_artifacts_page(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord | None:
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            return self._list_artifact_page(
+                session,
+                auth,
+                conversation_id=conversation.id,
+                limit=limit,
+                cursor=cursor,
+                visibility=visibility,
+            )
+
+    def _list_artifact_page(
+        self,
+        session: Session,
+        auth: AuthContext,
+        *,
+        conversation_id: str | None = None,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord:
+        bounded_limit = bounded_artifact_page_limit(limit)
+        cursor_value = decode_artifact_page_cursor(cursor)
+        filters = [
+            Artifact.owner_user_id == auth.user_id,
+            Artifact.workspace_id == auth.workspace_id,
+        ]
+        if conversation_id is not None:
+            filters.append(Artifact.conversation_id == conversation_id)
+        if visibility != "all":
+            filters.append(Artifact.kind.notin_(tuple(INTERNAL_ARTIFACT_KINDS)))
+        if cursor_value is not None:
+            cursor_created_at, cursor_id = cursor_value
+            filters.append(
+                or_(
+                    Artifact.created_at < cursor_created_at,
+                    (Artifact.created_at == cursor_created_at) & (Artifact.id < cursor_id),
+                )
+            )
+        rows = session.scalars(
+            select(Artifact)
+            .where(*filters)
+            .order_by(Artifact.created_at.desc(), Artifact.id.desc())
+            .limit(bounded_limit + 1)
+        ).all()
+        page = [_artifact_record(row) for row in rows]
+        items = page[:bounded_limit]
+        next_cursor = encode_artifact_page_cursor(items[-1]) if len(page) > bounded_limit and items else None
+        return ArtifactPageRecord(items=items, next_cursor=next_cursor)
+
+    def get_backtest_summary(self, auth: AuthContext, run_id: str) -> dict | None:
+        with self._session_factory() as session:
+            run = _authorized_run(session, auth, run_id)
+            if run is None:
+                return None
+            report = session.scalar(
+                select(BacktestReport).where(
+                    BacktestReport.run_id == run.id,
+                    BacktestReport.owner_user_id == auth.user_id,
+                    BacktestReport.workspace_id == auth.workspace_id,
+                )
+            )
+            if report is None:
+                return None
+            return _backtest_report_summary(report)
+
+    def get_backtest_summaries(self, auth: AuthContext, run_ids: list[str]) -> dict[str, dict]:
+        unique_run_ids = list(dict.fromkeys(run_ids))
+        if not unique_run_ids:
+            return {}
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(BacktestReport)
+                .join(AssistantRun, AssistantRun.id == BacktestReport.run_id)
+                .where(
+                    BacktestReport.run_id.in_(unique_run_ids),
+                    BacktestReport.owner_user_id == auth.user_id,
+                    BacktestReport.workspace_id == auth.workspace_id,
+                    AssistantRun.owner_user_id == auth.user_id,
+                    AssistantRun.workspace_id == auth.workspace_id,
+                )
+            ).all()
+            return {row.run_id: _backtest_report_summary(row) for row in rows}
+
+    def resolve_backtest_report_run_id(self, auth: AuthContext, conversation_id: str, requested_run_id: str) -> str | None:
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            requested = session.scalar(
+                select(BacktestReport.run_id)
+                .join(AssistantRun, AssistantRun.id == BacktestReport.run_id)
+                .where(
+                    BacktestReport.run_id == requested_run_id,
+                    BacktestReport.owner_user_id == auth.user_id,
+                    BacktestReport.workspace_id == auth.workspace_id,
+                    AssistantRun.conversation_id == conversation.id,
+                    AssistantRun.owner_user_id == auth.user_id,
+                    AssistantRun.workspace_id == auth.workspace_id,
+                )
+            )
+            if requested is not None:
+                return requested
+            return session.scalar(
+                select(BacktestReport.run_id)
+                .join(AssistantRun, AssistantRun.id == BacktestReport.run_id)
+                .where(
+                    BacktestReport.owner_user_id == auth.user_id,
+                    BacktestReport.workspace_id == auth.workspace_id,
+                    AssistantRun.conversation_id == conversation.id,
+                    AssistantRun.owner_user_id == auth.user_id,
+                    AssistantRun.workspace_id == auth.workspace_id,
+                    AssistantRun.status == "completed",
+                )
+                .order_by(BacktestReport.created_at.desc(), AssistantRun.updated_at.desc(), AssistantRun.id.desc())
+                .limit(1)
+            )
+
+    def query_backtest_trades(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        bucket: str | None = None,
+        limit: int = 20,
+    ) -> list[dict] | None:
+        with self._session_factory() as session:
+            run = _authorized_run(session, auth, run_id)
+            if run is None:
+                return None
+            query = select(BacktestTradeIndex).where(
+                BacktestTradeIndex.run_id == run.id,
+                BacktestTradeIndex.owner_user_id == auth.user_id,
+                BacktestTradeIndex.workspace_id == auth.workspace_id,
+            )
+            if bucket:
+                query = query.where(BacktestTradeIndex.bucket == bucket)
+            rows = session.scalars(query.order_by(BacktestTradeIndex.trade_rank.asc()).limit(max(1, min(limit, 200)))).all()
+            return [
+                {
+                    "bucket": row.bucket,
+                    "trade_rank": row.trade_rank,
+                    "opened_at": row.opened_at.isoformat() if row.opened_at else None,
+                    "closed_at": row.closed_at.isoformat() if row.closed_at else None,
+                    "pnl_cost": float(row.pnl_cost) if row.pnl_cost is not None else None,
+                    "pnl_percentage": float(row.pnl_percentage) if row.pnl_percentage is not None else None,
+                    "trade": row.payload_json,
+                }
+                for row in rows
+            ]
+
+    def get_backtest_equity_summary(self, auth: AuthContext, run_id: str) -> dict | None:
+        with self._session_factory() as session:
+            run = _authorized_run(session, auth, run_id)
+            if run is None:
+                return None
+            summary = session.scalar(
+                select(BacktestEquitySummary).where(
+                    BacktestEquitySummary.run_id == run.id,
+                    BacktestEquitySummary.owner_user_id == auth.user_id,
+                    BacktestEquitySummary.workspace_id == auth.workspace_id,
+                )
+            )
+            if summary is None:
+                return None
+            return _backtest_equity_summary(summary)
+
+    def get_backtest_equity_summaries(self, auth: AuthContext, run_ids: list[str]) -> dict[str, dict]:
+        unique_run_ids = list(dict.fromkeys(run_ids))
+        if not unique_run_ids:
+            return {}
+        with self._session_factory() as session:
+            rows = session.scalars(
+                select(BacktestEquitySummary)
+                .join(AssistantRun, AssistantRun.id == BacktestEquitySummary.run_id)
+                .where(
+                    BacktestEquitySummary.run_id.in_(unique_run_ids),
+                    BacktestEquitySummary.owner_user_id == auth.user_id,
+                    BacktestEquitySummary.workspace_id == auth.workspace_id,
+                    AssistantRun.owner_user_id == auth.user_id,
+                    AssistantRun.workspace_id == auth.workspace_id,
+                )
+            ).all()
+            return {row.run_id: _backtest_equity_summary(row) for row in rows}
+
     def create_validation_report(
         self,
         auth: AuthContext,
@@ -1417,6 +1676,32 @@ def _artifact_record(artifact: Artifact) -> ArtifactRecord:
         metadata_json=artifact.metadata_json,
         created_at=_utc_aware(artifact.created_at),
     )
+
+
+def _backtest_report_summary(report: BacktestReport) -> dict:
+    return {
+        "run_id": report.run_id,
+        "engine": report.engine,
+        "evidence_label": report.evidence_label,
+        "execution_semantics": report.execution_semantics,
+        "symbol": report.symbol,
+        "signal_timeframe": report.signal_timeframe,
+        "candle_timeframe": report.candle_timeframe,
+        "metrics": report.metrics_json,
+        "assumptions": report.assumptions_json or [],
+        "warnings": report.warnings_json or [],
+        "reproducibility_hash": report.reproducibility_hash,
+    }
+
+
+def _backtest_equity_summary(summary: BacktestEquitySummary) -> dict:
+    return {
+        "run_id": summary.run_id,
+        "sample_resolution": summary.sample_resolution,
+        "points": summary.points_json,
+        "drawdown_windows": summary.drawdown_windows_json or [],
+        "monthly_returns": summary.monthly_returns_json or [],
+    }
 
 
 def _strategy_spec_record(spec: StrategySpec) -> StrategySpecRecord:

@@ -2,8 +2,11 @@ import { z } from "zod";
 
 import {
   AccountUsageResponseSchema,
+  ActionRegistryResponseSchema,
   ArtifactContentResponseSchema,
+  ArtifactListResponseSchema,
   ArtifactPreviewResponseSchema,
+  BacktestApprovalDecisionResponseSchema,
   BackendErrorResponseSchema,
   ConversationCreateSchema,
   ConversationListResponseSchema,
@@ -26,8 +29,12 @@ import {
   RunEventSchema,
   RunObservabilityResponseSchema,
   RunSchema,
+  type BacktestApprovalDecisionRequest,
+  type BacktestApprovalDecisionResponse,
   type AccountUsageResponse,
+  type ActionRegistryResponse,
   type ArtifactContentResponse,
+  type ArtifactListResponse,
   type ArtifactPreviewResponse,
   type Conversation,
   type ConversationCreate,
@@ -74,6 +81,7 @@ export type BackendHeaderOptions = {
   internalAuthSecret?: string;
   body?: unknown;
   requestId?: string;
+  traceId?: string;
   idempotencyKey?: string;
   lastEventId?: string;
   createOperation?: boolean;
@@ -89,6 +97,7 @@ export const DEFAULT_API_BASE_URL =
 
 export type RequestOptions = {
   requestId?: string;
+  traceId?: string;
   idempotencyKey?: string;
   signal?: AbortSignal;
 };
@@ -99,6 +108,12 @@ export type MessageCreateOptions = RequestOptions & {
 
 export type StreamOptions = RequestOptions & {
   lastEventId?: string;
+};
+
+type ArtifactListOptions = {
+  cursor?: string | null;
+  limit?: number;
+  visibility?: "user" | "all";
 };
 
 export class BackendClientError extends Error {
@@ -144,9 +159,7 @@ export class BackendClient {
   }
 
   ready(): Promise<ReadyResponse> {
-    return this.request("/ready", {
-      responseSchema: ReadyResponseSchema,
-    });
+    return this.readinessRequest("/ready");
   }
 
   me(): Promise<MeResponse> {
@@ -158,6 +171,12 @@ export class BackendClient {
   getProviderStatus(): Promise<ProviderStatusResponse> {
     return this.request("/v1/provider/status", {
       responseSchema: ProviderStatusResponseSchema,
+    });
+  }
+
+  getActionRegistry(): Promise<ActionRegistryResponse> {
+    return this.request("/v1/action-registry", {
+      responseSchema: ActionRegistryResponseSchema,
     });
   }
 
@@ -175,9 +194,7 @@ export class BackendClient {
       method: "POST",
       body: ConversationCreateSchema.parse(payload),
       responseSchema: ConversationSchema,
-      idempotencyKey: options.idempotencyKey,
-      requestId: options.requestId,
-      createOperation: true,
+      ...createOperationOptions(options),
     });
   }
 
@@ -196,7 +213,7 @@ export class BackendClient {
       method: "PATCH",
       body: ConversationUpdateSchema.parse(payload),
       responseSchema: ConversationSchema,
-      requestId: options.requestId,
+      ...correlationOptions(options),
     });
   }
 
@@ -207,7 +224,7 @@ export class BackendClient {
     return this.request(`/v1/conversations/${encodePath(conversationId)}`, {
       method: "DELETE",
       responseSchema: ConversationSchema,
-      requestId: options.requestId,
+      ...correlationOptions(options),
     });
   }
 
@@ -223,6 +240,25 @@ export class BackendClient {
     return this.request(`/v1/conversations/${encodePath(conversationId)}/state`, {
       responseSchema: ConversationStateResponseSchema,
     });
+  }
+
+  decideBacktestApproval(
+    conversationId: string,
+    approvalId: string,
+    payload: BacktestApprovalDecisionRequest,
+    options: RequestOptions = {}
+  ): Promise<BacktestApprovalDecisionResponse> {
+    return this.request(
+      `/v1/conversations/${encodePath(
+        conversationId
+      )}/backtest-approvals/${encodePath(approvalId)}`,
+      {
+        body: payload,
+        method: "POST",
+        responseSchema: BacktestApprovalDecisionResponseSchema,
+        ...correlationOptions(options),
+      }
+    );
   }
 
   listMessages(conversationId: string): Promise<MessageListResponse> {
@@ -251,9 +287,7 @@ export class BackendClient {
         method: "POST",
         body: MessageCreateSchema.parse(payload),
         responseSchema: MessageSchema,
-        idempotencyKey: options.idempotencyKey,
-        requestId: options.requestId,
-        createOperation: true,
+        ...createOperationOptions(options),
       }
     );
   }
@@ -274,10 +308,8 @@ export class BackendClient {
       {
         method: "POST",
         body: MessageCreateSchema.parse(payload),
-        idempotencyKey: options.idempotencyKey,
-        requestId: options.requestId,
         signal: options.signal,
-        createOperation: true,
+        ...createOperationOptions(options),
       }
     );
   }
@@ -290,17 +322,14 @@ export class BackendClient {
       method: "POST",
       body: RunCreateSchema.parse(payload),
       responseSchema: RunCreateResponseSchema,
-      idempotencyKey: options.idempotencyKey,
-      requestId: options.requestId,
-      createOperation: true,
+      ...createOperationOptions(options),
     });
   }
 
   streamRunEvents(runId: string, options: StreamOptions = {}): Promise<Response> {
     return this.streamRequest(`/v1/runs/${encodePath(runId)}/events`, {
-      lastEventId: options.lastEventId,
-      requestId: options.requestId,
       signal: options.signal,
+      ...streamCorrelationOptions(options),
     });
   }
 
@@ -309,9 +338,8 @@ export class BackendClient {
     options: StreamOptions = {}
   ): Promise<Response> {
     return this.streamRequest(`/v1/runs/${encodePath(runId)}/progress`, {
-      lastEventId: options.lastEventId,
-      requestId: options.requestId,
       signal: options.signal,
+      ...streamCorrelationOptions(options),
     });
   }
 
@@ -335,9 +363,7 @@ export class BackendClient {
     return this.request(`/v1/runs/${encodePath(runId)}/retry`, {
       method: "POST",
       responseSchema: RunSchema,
-      idempotencyKey: options.idempotencyKey,
-      requestId: options.requestId,
-      createOperation: true,
+      ...createOperationOptions(options),
     });
   }
 
@@ -363,6 +389,26 @@ export class BackendClient {
     });
   }
 
+  listConversationArtifacts(
+    conversationId: string,
+    options: ArtifactListOptions = {}
+  ): Promise<ArtifactListResponse> {
+    return this.request(
+      `/v1/conversations/${encodePath(conversationId)}/artifacts${artifactListQuery(options)}`,
+      {
+        responseSchema: ArtifactListResponseSchema,
+      }
+    );
+  }
+
+  listWorkspaceArtifacts(
+    options: ArtifactListOptions = {}
+  ): Promise<ArtifactListResponse> {
+    return this.request(`/v1/artifacts${artifactListQuery(options)}`, {
+      responseSchema: ArtifactListResponseSchema,
+    });
+  }
+
   getFeedbackOptions(): Promise<FeedbackOptionsResponse> {
     return this.request("/v1/feedback/options", {
       responseSchema: FeedbackOptionsResponseSchema,
@@ -377,9 +423,7 @@ export class BackendClient {
       method: "POST",
       body: FeedbackCreateSchema.parse(payload),
       responseSchema: FeedbackSchema,
-      idempotencyKey: options.idempotencyKey,
-      requestId: options.requestId,
-      createOperation: true,
+      ...createOperationOptions(options),
     });
   }
 
@@ -399,6 +443,22 @@ export class BackendClient {
       throw backendError(response.status, payload);
     }
     return options.responseSchema.parse(payload);
+  }
+
+  private async readinessRequest(path: string): Promise<ReadyResponse> {
+    const response = await this.fetcher(this.buildUrl(path), {
+      method: "GET",
+      headers: this.headers(),
+    });
+    const payload = await readJson(response);
+    const parsed = ReadyResponseSchema.safeParse(payload);
+    if (parsed.success) {
+      return parsed.data;
+    }
+    if (!response.ok) {
+      throw backendError(response.status, payload);
+    }
+    return ReadyResponseSchema.parse(payload);
   }
 
   private async streamRequest(
@@ -450,11 +510,39 @@ type StreamRequestOptions = HeaderOptions & {
 type HeaderOptions = {
   body?: unknown;
   requestId?: string;
+  traceId?: string;
   idempotencyKey?: string;
   lastEventId?: string;
   createOperation?: boolean;
   signal?: AbortSignal;
 };
+
+function correlationOptions(options: RequestOptions = {}): Pick<HeaderOptions, "idempotencyKey" | "requestId" | "traceId"> {
+  return {
+    idempotencyKey: options.idempotencyKey,
+    requestId: options.requestId,
+    traceId: options.traceId,
+  };
+}
+
+function createOperationOptions(
+  options: RequestOptions = {}
+): Pick<HeaderOptions, "createOperation" | "idempotencyKey" | "requestId" | "traceId"> {
+  return {
+    ...correlationOptions(options),
+    createOperation: true,
+  };
+}
+
+function streamCorrelationOptions(
+  options: StreamOptions = {}
+): Pick<HeaderOptions, "lastEventId" | "requestId" | "traceId"> {
+  return {
+    lastEventId: options.lastEventId,
+    requestId: options.requestId,
+    traceId: options.traceId,
+  };
+}
 
 export function parseBackendSseEvents(text: string): RunEvent[] {
   return parseSseJsonPayloads(text).map((payload) => RunEventSchema.parse(payload));
@@ -484,6 +572,9 @@ export function buildBackendHeaders(options: BackendHeaderOptions = {}): Headers
   }
   if (options.requestId) {
     headers.set("X-Request-Id", options.requestId);
+  }
+  if (options.traceId) {
+    headers.set("X-Trace-Id", options.traceId);
   }
   if (options.lastEventId) {
     headers.set("Last-Event-ID", options.lastEventId);
@@ -552,4 +643,18 @@ function encodePath(value: string): string {
 function queryString(params: URLSearchParams): string {
   const serialized = params.toString();
   return serialized ? `?${serialized}` : "";
+}
+
+function artifactListQuery(options: ArtifactListOptions): string {
+  const query = new URLSearchParams();
+  if (options.cursor) {
+    query.set("cursor", options.cursor);
+  }
+  if (options.limit !== undefined) {
+    query.set("limit", String(options.limit));
+  }
+  if (options.visibility) {
+    query.set("visibility", options.visibility);
+  }
+  return queryString(query);
 }

@@ -72,6 +72,26 @@ export function providerDisplay(
   };
 }
 
+export function providerRouteReady(provider?: ProviderStatusResponse) {
+  if (!provider) {
+    return false;
+  }
+  if (typeof provider.route_ready === "boolean") {
+    return provider.route_ready;
+  }
+  return provider.configured && provider.available;
+}
+
+export function providerFallbackEnabled(provider?: ProviderStatusResponse) {
+  if (!provider) {
+    return false;
+  }
+  if (typeof provider.fallback_enabled === "boolean") {
+    return provider.fallback_enabled;
+  }
+  return provider.model_routing_mode === "registry";
+}
+
 export function formatUsageNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }

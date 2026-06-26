@@ -45,14 +45,14 @@ def test_run_response_and_replayed_events_include_correlation_ids(tmp_path: Path
 
     response = client.post(
         "/v1/runs",
-        headers={**AUTH_A, "X-Request-Id": "req_client_observability"},
+        headers={**AUTH_A, "X-Request-Id": "req_client_observability", "X-Trace-Id": "trace_client_observability"},
         json={"conversation_id": conversation["id"], "strategy_spec": valid_spec()},
     )
 
     assert response.status_code == 201, response.text
     run = response.json()
     assert run["request_id"] == "req_client_observability"
-    assert run["trace_id"].startswith("trace_")
+    assert run["trace_id"] == "trace_client_observability"
     assert run["conversation_id"] == conversation["id"]
 
     frames = parse_sse(client.get(f"/v1/runs/{run['id']}/events", headers=AUTH_A).text)
@@ -78,7 +78,7 @@ def test_agent_sse_and_observability_summary_include_usage_tool_and_latency(tmp_
 
     stream = client.post(
         f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
-        headers={**AUTH_A, "X-Request-Id": "req_agent_stream"},
+        headers={**AUTH_A, "X-Request-Id": "req_agent_stream", "X-Trace-Id": "trace_agent_stream"},
         json={"content": "Generate a review-only Pine strategy."},
     )
 
@@ -86,6 +86,7 @@ def test_agent_sse_and_observability_summary_include_usage_tool_and_latency(tmp_
     frames = parse_sse(stream.text)
     run_id = frames[0]["data"]["run_id"]
     trace_id = frames[0]["data"]["trace_id"]
+    assert trace_id == "trace_agent_stream"
     assert all(frame["data"]["request_id"] == "req_agent_stream" for frame in frames)
     assert all(frame["data"]["trace_id"] == trace_id for frame in frames)
 
@@ -198,8 +199,8 @@ def test_trading_chat_safety_eval_cases_at_api_boundary(tmp_path: Path) -> None:
     assert [
         event
         for event in unsafe_events
-        if event not in {"model.reasoning.delta", "provider.started"}
-    ] == ["policy.blocked", "message.delta", "run.completed"]
+        if event not in {"model.reasoning.delta", "provider.started", "provider.route"}
+    ] == ["chat.response_intent", "chat.suggestions.updated", "policy.blocked", "message.delta", "run.completed"]
 
     safe_llm = FakeLLMClient([LLMClientEvent(type="message.delta", text="Education only: trading strategies can lose money and need manual validation.")])
     safe_client = TestClient(create_app(repository=create_sqlite_repository(), artifact_root=tmp_path / "safe", llm_client=safe_llm))

@@ -6,7 +6,10 @@ const clerkConfigured = Boolean(
   process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY && process.env.CLERK_SECRET_KEY
 );
 const isProtectedApiRoute = clerkConfigured
-  ? createRouteMatcher(["/api/backend(.*)", "/api/chat(.*)"])
+  ? createRouteMatcher([
+      "/api/backend(.*)",
+      "/api/copilotkit-chat(.*)",
+    ])
   : null;
 
 const middleware = clerkConfigured

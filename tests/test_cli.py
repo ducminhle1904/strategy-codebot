@@ -121,6 +121,72 @@ def test_cli_models_gateways_smoke_route_reports_connection_error(tmp_path: Path
     assert "api_key" not in json.dumps(report).lower()
 
 
+def test_cli_models_gateways_qwen_latency_writes_direct_proxy_payload_rows(tmp_path: Path, monkeypatch) -> None:
+    out_path = tmp_path / "qwen-latency.json"
+    payload_path = tmp_path / "captured-payload.json"
+    write_json(
+        payload_path,
+        {
+            "messages": [{"role": "user", "content": "Return JSON."}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "captured",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"ok": {"type": "boolean"}, "note": {"type": "string"}},
+                        "required": ["ok", "note"],
+                    },
+                },
+            },
+        },
+    )
+
+    calls: list[str] = []
+
+    def completion(**kwargs):
+        calls.append(kwargs["model"])
+        return {
+            "choices": [{"message": {"content": json.dumps({"ok": True, "note": "done"})}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14},
+            "_hidden_params": {
+                "custom_llm_provider": "openrouter",
+                "additional_headers": {
+                    "llm_provider-x-litellm-response-duration-ms": "1000",
+                    "llm_provider-x-litellm-overhead-duration-ms": "20",
+                },
+            },
+        }
+
+    monkeypatch.setitem(sys.modules, "litellm", types.SimpleNamespace(completion=completion))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter")
+    monkeypatch.setenv("LITELLM_PROXY_API_KEY", "test-proxy")
+    monkeypatch.setenv("LITELLM_PROXY_API_BASE", "https://litellm-proxy.example/v1")
+
+    result = runner.invoke(
+        app,
+        ["models", "gateways", "qwen-latency", "--captured-payload", str(payload_path), "--out", str(out_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    report = load_json(out_path)
+    assert [row["path"] for row in report["rows"]] == [
+        "direct_openrouter_tiny",
+        "litellm_alias_tiny",
+        "litellm_alias_captured_payload",
+    ]
+    assert all(row["status"] == "pass" for row in report["rows"])
+    assert report["rows"][0]["upstream_provider_ms"] == 1000
+    assert report["rows"][0]["proxy_overhead_ms"] == 20
+    assert calls == [
+        "openrouter/qwen/qwen3-coder-next",
+        "openai/paid_low.pine_code_generation",
+        "openai/paid_low.pine_code_generation",
+    ]
+
+
 def test_cli_doctor_exits_nonzero_on_failed_report(monkeypatch, tmp_path: Path) -> None:
     out_path = tmp_path / "doctor.json"
 
@@ -1410,7 +1476,7 @@ def test_cli_knowledge_learn_from_run_auto_promotes_candidate(tmp_path: Path) ->
     assert result.exit_code == 0, result.output
     report = load_json(report_path)
     assert report["promoted_count"] == 1
-    assert load_json(candidates_path)["candidates"][0]["status"] == "approved"
+    assert load_json(candidates_path)["candidates"][0]["status"] == "auto_approved"
 
 
 def test_cli_knowledge_trusted_source_snapshot_summary_and_approval(tmp_path: Path, monkeypatch) -> None:

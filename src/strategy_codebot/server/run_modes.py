@@ -1,7 +1,17 @@
+import os
+
+from strategy_codebot.server.backtest_ohlcv_contract import BACKTEST_OHLCV_DEFAULT_EXCHANGE
+from strategy_codebot.server.backtest_ohlcv_contract import BACKTEST_OHLCV_EXCHANGES
+from strategy_codebot.server.backtest_ohlcv_contract import BACKTEST_EXECUTABLE_TIMEFRAMES
+from strategy_codebot.server.backtest_ohlcv_contract import BACKTEST_MAX_COST_BPS
+from strategy_codebot.server.backtest_ohlcv_contract import BACKTEST_RUN_EVENTS
+
 RUN_MODE_DRY_RUN = "dry-run"
 RUN_MODE_AGENT = "agent"
 RUN_MODE_LIVE_GENERATION = "live-generation"
 RUN_MODE_BACKTEST_PREVIEW = "backtest-preview"
+CHAT_BACKTEST_SUMMARY_JOB_TYPE = "chat-backtest-summary"
+PREVIEW_COMPATIBILITY_REPAIR_JOB_TYPE = "preview-compatibility-repair"
 
 RUN_MODES = (
     RUN_MODE_DRY_RUN,
@@ -21,17 +31,28 @@ BACKTEST_ACTIVE_LIMITS_BY_TIER = {
 BACKTEST_DEFAULT_ACTIVE_LIMIT = BACKTEST_ACTIVE_LIMITS_BY_TIER["paid_low"]
 BACKTEST_MAX_VARIANTS = 6
 BACKTEST_JOB_MAX_ATTEMPTS = 3
-BACKTEST_RUNTIME_BOUNDARY = {
-    "engine": "backtest-kit",
-    "allowed_api": ["Backtest.run"],
+CHAT_BACKTEST_SUMMARY_JOB_MAX_ATTEMPTS = 2
+PREVIEW_COMPATIBILITY_REPAIR_JOB_MAX_ATTEMPTS = 2
+BACKTEST_ENGINE_PINEFORGE = "pineforge"
+BACKTEST_ENGINES = (BACKTEST_ENGINE_PINEFORGE,)
+BACKTEST_ENGINE_DEFAULT = BACKTEST_ENGINE_PINEFORGE
+PINEFORGE_RUNTIME_BOUNDARY = {
+    "engine": BACKTEST_ENGINE_PINEFORGE,
+    "allowed_api": ["pineforge-runner", "pineforge-engine-native"],
     "blocked_api": [
-        "Live.background",
+        "alerts",
         "broker_credentials",
         "paper_trading",
         "live_trading",
         "telegram_alerts",
+        "external_data_fetch",
     ],
 }
+
+
+def backtest_default_engine() -> str:
+    configured = os.getenv("BACKTEST_ENGINE_DEFAULT", BACKTEST_ENGINE_DEFAULT).strip().lower()
+    return configured if configured in BACKTEST_ENGINES else BACKTEST_ENGINE_DEFAULT
 
 
 def backtest_active_limit_for_tier(tier: str | None) -> int:
@@ -45,11 +66,14 @@ def backtest_job_limits_for_tier(tier: str | None) -> dict[str, int]:
     }
 
 
-def backtest_runtime_boundary() -> dict[str, object]:
+def backtest_runtime_boundary(engine: str = BACKTEST_ENGINE_PINEFORGE) -> dict[str, object]:
+    if engine != BACKTEST_ENGINE_PINEFORGE:
+        raise ValueError(f"Unsupported backtest engine: {engine}")
+    boundary = PINEFORGE_RUNTIME_BOUNDARY
     return {
-        "engine": BACKTEST_RUNTIME_BOUNDARY["engine"],
-        "allowed_api": list(BACKTEST_RUNTIME_BOUNDARY["allowed_api"]),
-        "blocked_api": list(BACKTEST_RUNTIME_BOUNDARY["blocked_api"]),
+        "engine": boundary["engine"],
+        "allowed_api": list(boundary["allowed_api"]),
+        "blocked_api": list(boundary["blocked_api"]),
     }
 
 

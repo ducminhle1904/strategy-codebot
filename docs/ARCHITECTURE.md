@@ -119,14 +119,15 @@ interaction.
 
 ## Backtest Preview Worker Boundary
 
-Backtest Kit integration uses a separate Node/TypeScript worker. The Python API
+PineForge integration uses a separate Node/TypeScript worker plus a dedicated
+`pineforge-runner` service. The Python API
 creates queued `backtest-preview` runs and persists `run_jobs`; workers lease
 jobs from Postgres, write artifacts under the shared artifact root, and append
-typed run events. The API process does not execute Backtest Kit directly.
+typed run events. The API process does not execute PineForge directly.
 
 Backtest preview reports are local preview evidence only. They are not
 TradingView proof, MQL5 proof, live-trading evidence, broker execution evidence,
-or profitability claims. Allowed worker runtime is limited to Backtest Kit local
+or profitability claims. Allowed worker runtime is limited to PineForge local
 preview execution and read-only market data adapters; live, paper, broker,
 Telegram, and Docker live surfaces remain blocked.
 

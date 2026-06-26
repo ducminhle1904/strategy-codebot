@@ -16,4 +16,4 @@ Use `docs/templates/story.md` for new records.
 | US-006 | Self-improving knowledge | Existing | Phase 4 |
 | US-007 | CLI productization | Existing | Phase 5 |
 | [US-008](US-008-saas-chat-trading-api-server.md) | SaaS chat trading API server | Planned | API Initiative Phase 0 |
-| [US-009](US-009-backtest-kit-preview-worker.md) | Backtest Kit preview worker | Planned | Phase 6 |
+| [US-009](US-009-pineforge-preview-worker.md) | PineForge preview worker | Planned | Phase 6 |

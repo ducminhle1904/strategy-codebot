@@ -2,9 +2,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypedDict
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,16 +13,41 @@ from starlette.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from strategy_codebot import __version__
+from strategy_codebot.pine import validate_pineforge_pine
 from strategy_codebot.schemas import validate_payload as validate_schema_payload
+from strategy_codebot.server.action_registry import ACTION_REGISTRY
+from strategy_codebot.server.agent_logging import agent_log
+from strategy_codebot.server.artifact_kinds import BACKTEST_DASHBOARD_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import BACKTEST_PLAN_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import BACKTEST_REPORT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import BACKTEST_TRADES_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import BACKTEST_VARIANT_COMPARISON_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import EVIDENCE_ARTIFACT_KINDS
+from strategy_codebot.server.artifact_kinds import INTERNAL_ARTIFACT_KINDS
+from strategy_codebot.server.artifact_kinds import REPORT_ARTIFACT_KINDS
+from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import TRACE_ARTIFACT_KINDS
+from strategy_codebot.server.artifact_kinds import USER_ARTIFACT_KINDS
 from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext, require_auth_context
 from strategy_codebot.server.database import create_sqlalchemy_repository
 from strategy_codebot.server.llm_clients import LLMClient
 from strategy_codebot.server.llm_clients import ProviderConfigurationError
 from strategy_codebot.server.llm_clients import ResponsesClient
-from strategy_codebot.server.llm_tools import _build_backtest_strategy_logic
+from strategy_codebot.server.llm_tools import _required_pineforge_pine
+from strategy_codebot.server.llm_tools import decide_backtest_preview_approval
 from strategy_codebot.server.llm_orchestrator import LLMOrchestrator
 from strategy_codebot.server.market_data import MarketDataGateway
+from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
+from strategy_codebot.server.knowledge_learning import require_knowledge_admin
+from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
+from strategy_codebot.server.model_routing import MODEL_STAGE_BALANCED_REVIEW
+from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
+from strategy_codebot.server.model_routing import MODEL_STAGE_REPAIR
+from strategy_codebot.server.model_routing import gateway_env_report
+from strategy_codebot.server.model_routing import load_model_registry
+from strategy_codebot.server.model_routing import normalize_user_tier
+from strategy_codebot.server.model_routing import resolve_routes
 from strategy_codebot.server.observability import append_stage_event
 from strategy_codebot.server.observability import build_observability_summary
 from strategy_codebot.server.observability import ensure_harness_evidence_artifact
@@ -43,19 +69,25 @@ from strategy_codebot.server.repository import ArtifactRecord
 from strategy_codebot.server.repository import AssistantRunRecord
 from strategy_codebot.server.repository import ConversationSidebarRecord
 from strategy_codebot.server.repository import ConversationRepository
+from strategy_codebot.server.repository import CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT
+from strategy_codebot.server.repository import CONVERSATION_ARTIFACT_STATE_LIMIT
 from strategy_codebot.server.repository import InMemoryConversationRepository
 from strategy_codebot.server.repository import MessageRecord
 from strategy_codebot.server.repository import RunEventRecord
 from strategy_codebot.server.repository import TERMINAL_RUN_STATUSES
 from strategy_codebot.server.run_modes import RUN_MODE_AGENT
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
+from strategy_codebot.server.run_modes import BACKTEST_ENGINE_PINEFORGE
 from strategy_codebot.server.run_modes import RUN_MODE_LIVE_GENERATION
 from strategy_codebot.server.run_modes import RUN_MODES
 from strategy_codebot.server.run_modes import backtest_job_limits_for_tier
 from strategy_codebot.server.run_modes import backtest_runtime_boundary
 from strategy_codebot.server.schemas import ArtifactContentResponse
+from strategy_codebot.server.schemas import ArtifactListResponse
 from strategy_codebot.server.schemas import ArtifactResponse
 from strategy_codebot.server.schemas import ArtifactPreviewResponse
+from strategy_codebot.server.schemas import BacktestApprovalDecisionRequest
+from strategy_codebot.server.schemas import BacktestApprovalDecisionResponse
 from strategy_codebot.server.schemas import AccountUsageResponse
 from strategy_codebot.server.schemas import ConversationCreate
 from strategy_codebot.server.schemas import ConversationListResponse
@@ -68,6 +100,12 @@ from strategy_codebot.server.schemas import FeedbackCreate
 from strategy_codebot.server.schemas import FeedbackOption
 from strategy_codebot.server.schemas import FeedbackOptionsResponse
 from strategy_codebot.server.schemas import FeedbackResponse
+from strategy_codebot.server.schemas import KnowledgeCandidateCreate
+from strategy_codebot.server.schemas import KnowledgeCandidateListResponse
+from strategy_codebot.server.schemas import KnowledgeCandidateResponse
+from strategy_codebot.server.schemas import KnowledgeAutoReviewRequest
+from strategy_codebot.server.schemas import KnowledgeLearningRequest
+from strategy_codebot.server.schemas import KnowledgeLearningResponse
 from strategy_codebot.server.schemas import MessageCreate
 from strategy_codebot.server.schemas import MessageListResponse
 from strategy_codebot.server.schemas import MessageResponse
@@ -103,6 +141,8 @@ from strategy_codebot.server.streaming import transient_delta_event
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.worker import InlineRunWorker
 from strategy_codebot.server.worker import RunWorker
+
+logger = logging.getLogger(__name__)
 
 ARTIFACT_PREVIEW_DEFAULT_BYTES = 16 * 1024
 ARTIFACT_PREVIEW_MAX_BYTES = 64 * 1024
@@ -275,6 +315,11 @@ def create_app(
         budget_config=run_budget_config,
         market_data_gateway=market_data_gateway,
     )
+    knowledge_learning_service = KnowledgeLearningService(
+        conversation_repository,
+        artifact_store,
+        llm_client=llm_orchestrator.client,
+    )
     api = FastAPI(title="Strategy Codebot API", version=__version__)
     if cors_origins:
         api.add_middleware(
@@ -328,6 +373,7 @@ def create_app(
         except Exception as exc:
             configured = False
             reason = exc.__class__.__name__
+        routing_status = _user_safe_model_routing_status(auth, configured)
         return ProviderStatusResponse(
             configured=configured,
             available=configured and "agent" in capability.allowed_message_modes,
@@ -336,9 +382,222 @@ def create_app(
             allowed_message_modes=capability.allowed_message_modes,
             allowed_run_modes=capability.allowed_run_modes,
             fallback_mode="deterministic",
+            model_routing_mode=routing_status["model_routing_mode"],
+            model_tier=routing_status["model_tier"],
+            selected_stage_defaults=routing_status["selected_stage_defaults"],
+            available_gateways=routing_status["available_gateways"],
+            route_ready=routing_status["route_ready"],
+            fallback_enabled=routing_status["fallback_enabled"],
+            user_message=routing_status["user_message"],
             status="ready" if configured else "not_configured",
             reason=reason,
         )
+
+    @api.get("/v1/action-registry")
+    def get_action_registry(
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> dict[str, Any]:
+        _ = auth
+        return {
+            "version": 1,
+            "actions": [
+                entry.payload(available=True)
+                for entry in ACTION_REGISTRY
+            ],
+        }
+
+    @api.get("/v1/knowledge/candidates", response_model=KnowledgeCandidateListResponse)
+    def list_knowledge_candidates(
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> KnowledgeCandidateListResponse:
+        require_knowledge_admin(auth)
+        return KnowledgeCandidateListResponse(**knowledge_learning_service.list_candidates())
+
+    @api.post(
+        "/v1/knowledge/candidates",
+        response_model=KnowledgeCandidateResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_knowledge_candidate(
+        payload: KnowledgeCandidateCreate,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        require_knowledge_admin(auth)
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="knowledge.candidate.create")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body=payload.model_dump(mode="json"),
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_201_CREATED)
+        try:
+            candidate = knowledge_learning_service.propose_candidate(
+                lesson=payload.lesson,
+                evidence_ref=payload.evidence_ref,
+                candidate_type=payload.candidate_type,
+                confidence=payload.confidence,
+                trust_level=payload.trust_level,
+                source_uri=payload.source_uri,
+                metadata=payload.metadata,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        response = KnowledgeCandidateResponse(**candidate)
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_201_CREATED)
+
+    @api.post("/v1/knowledge/candidates/{candidate_id}/approve", response_model=KnowledgeCandidateResponse)
+    def approve_knowledge_candidate(
+        candidate_id: str,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        require_knowledge_admin(auth)
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="knowledge.candidate.approve")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={"candidate_id": candidate_id},
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        try:
+            response = KnowledgeCandidateResponse(**knowledge_learning_service.approve_candidate(auth, candidate_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge candidate not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post("/v1/knowledge/candidates/{candidate_id}/reject", response_model=KnowledgeCandidateResponse)
+    def reject_knowledge_candidate(
+        candidate_id: str,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        require_knowledge_admin(auth)
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="knowledge.candidate.reject")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={"candidate_id": candidate_id},
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        try:
+            response = KnowledgeCandidateResponse(**knowledge_learning_service.reject_candidate(auth, candidate_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge candidate not found") from exc
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post("/v1/knowledge/candidates/{candidate_id}/auto-review", response_model=KnowledgeCandidateResponse)
+    def auto_review_knowledge_candidate(
+        candidate_id: str,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        require_knowledge_admin(auth)
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="knowledge.candidate.auto_review")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={"candidate_id": candidate_id},
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        try:
+            response = KnowledgeCandidateResponse(**knowledge_learning_service.auto_review_candidate(auth, candidate_id))
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge candidate not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post("/v1/knowledge/candidates/auto-review", response_model=KnowledgeCandidateListResponse)
+    def auto_review_knowledge_candidates(
+        payload: KnowledgeAutoReviewRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        require_knowledge_admin(auth)
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="knowledge.candidates.auto_review")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body=payload.model_dump(mode="json"),
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        try:
+            response = KnowledgeCandidateListResponse(**knowledge_learning_service.auto_review_candidates(auth, payload.candidate_ids))
+        except KeyError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Knowledge candidate not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post("/v1/runs/{run_id}/knowledge-learning", response_model=KnowledgeLearningResponse)
+    def extract_run_knowledge_candidates(
+        run_id: str,
+        payload: KnowledgeLearningRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        require_knowledge_admin(auth)
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="knowledge.run_learning")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={"run_id": run_id, **payload.model_dump(mode="json")},
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        run = conversation_repository.get_run(auth, run_id)
+        if run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        try:
+            report = knowledge_learning_service.extract_run_candidates(auth, run, approval_mode=payload.approval_mode)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        response = KnowledgeLearningResponse(**report)
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
 
     @api.get("/v1/account/usage", response_model=AccountUsageResponse)
     def get_account_usage(
@@ -451,6 +710,15 @@ def create_app(
         snapshot = conversation_repository.get_conversation_state_snapshot(auth, conversation_id)
         if snapshot is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        state_artifacts_by_id = {
+            artifact.id: artifact
+            for artifact in [*snapshot.latest_run_artifacts, *snapshot.conversation_artifacts]
+        }
+        state_preview_summaries = _artifact_preview_summary_batch(
+            list(state_artifacts_by_id.values()),
+            auth=auth,
+            repository=conversation_repository,
+        )
         return ConversationStateResponse(
             conversation=ConversationResponse.model_validate(snapshot.conversation),
             messages=[MessageResponse.model_validate(message) for message in snapshot.messages],
@@ -458,10 +726,23 @@ def create_app(
             messages_truncated=snapshot.messages_truncated,
             message_limit=snapshot.message_limit,
             latest_run=RunResponse.model_validate(snapshot.latest_run) if snapshot.latest_run is not None else None,
-            latest_run_artifacts=[
-                _artifact_response(artifact) for artifact in snapshot.latest_run_artifacts
-            ],
+            latest_run_artifacts=_artifact_responses(
+                snapshot.latest_run_artifacts,
+                auth=auth,
+                repository=conversation_repository,
+                preview_summaries=state_preview_summaries,
+            ),
+            conversation_artifacts=_artifact_responses(
+                snapshot.conversation_artifacts,
+                auth=auth,
+                repository=conversation_repository,
+                preview_summaries=state_preview_summaries,
+            ),
+            conversation_artifacts_next_cursor=snapshot.conversation_artifacts_next_cursor,
             latest_run_events=[_run_event_response(event) for event in snapshot.latest_run_events],
+            conversation_run_events=[
+                _run_event_response(event) for event in snapshot.conversation_run_events
+            ],
             feedback_targets=_feedback_targets(
                 snapshot.conversation.id,
                 snapshot.messages,
@@ -470,6 +751,90 @@ def create_app(
             ),
             strategy_profile=_strategy_profile(snapshot),
         )
+
+    @api.get("/v1/conversations/{conversation_id}/artifacts", response_model=ArtifactListResponse)
+    def list_conversation_artifacts(
+        conversation_id: str,
+        limit: int = Query(
+            default=CONVERSATION_ARTIFACT_STATE_LIMIT,
+            ge=1,
+            le=CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT,
+        ),
+        cursor: str | None = Query(default=None),
+        visibility: Literal["user", "all"] = Query(default="user"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> ArtifactListResponse:
+        try:
+            page = conversation_repository.list_conversation_artifacts_page(
+                auth,
+                conversation_id,
+                limit=limit,
+                cursor=cursor,
+                visibility=visibility,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact cursor") from exc
+        if page is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        return ArtifactListResponse(
+            items=_artifact_responses(page.items, auth=auth, repository=conversation_repository),
+            next_cursor=page.next_cursor,
+        )
+
+    @api.get("/v1/artifacts", response_model=ArtifactListResponse)
+    def list_workspace_artifacts(
+        limit: int = Query(
+            default=CONVERSATION_ARTIFACT_STATE_LIMIT,
+            ge=1,
+            le=CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT,
+        ),
+        cursor: str | None = Query(default=None),
+        visibility: Literal["user", "all"] = Query(default="user"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> ArtifactListResponse:
+        try:
+            page = conversation_repository.list_workspace_artifacts_page(
+                auth,
+                limit=limit,
+                cursor=cursor,
+                visibility=visibility,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact cursor") from exc
+        return ArtifactListResponse(
+            items=_artifact_responses(page.items, auth=auth, repository=conversation_repository),
+            next_cursor=page.next_cursor,
+        )
+
+    @api.post(
+        "/v1/conversations/{conversation_id}/backtest-approvals/{approval_id}",
+        response_model=BacktestApprovalDecisionResponse,
+    )
+    def decide_backtest_approval(
+        conversation_id: str,
+        approval_id: str,
+        payload: BacktestApprovalDecisionRequest,
+        request: Request,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> BacktestApprovalDecisionResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="backtest.approval")
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        try:
+            result = decide_backtest_preview_approval(
+                conversation_repository,
+                artifact_store,
+                auth,
+                conversation_id=conversation_id,
+                approval_id=approval_id,
+                decision=payload.decision,
+            )
+        except ValueError as exc:
+            message = str(exc)
+            status_code = status.HTTP_404_NOT_FOUND if "not found" in message.lower() else status.HTTP_409_CONFLICT
+            raise HTTPException(status_code=status_code, detail=message) from exc
+        return BacktestApprovalDecisionResponse.model_validate(result)
 
     @api.get("/v1/conversations/{conversation_id}/messages", response_model=MessageListResponse)
     def list_conversation_messages(
@@ -487,9 +852,11 @@ def create_app(
         request: Request,
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+        x_trace_id: str | None = Header(default=None, alias="X-Trace-Id"),
         auth: AuthContext = Depends(require_auth_context),
     ):
         request_id = x_request_id or opaque_id("req")
+        trace_id = x_trace_id or opaque_id("trace")
         try:
             controls.check_write(auth, ip_address=_client_ip(request), surface="run.create")
             idempotency = controls.begin_idempotency(
@@ -525,6 +892,7 @@ def create_app(
                 payload.strategy_spec,
                 policy_decision.blocked_finding,
                 request_id=request_id,
+                trace_id=trace_id,
             )
             if blocked is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
@@ -544,6 +912,7 @@ def create_app(
                     payload.strategy_spec,
                     budget_policy_finding(exc),
                     request_id=request_id,
+                    trace_id=trace_id,
                 )
                 if blocked is None:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
@@ -554,21 +923,28 @@ def create_app(
                 status="queued",
                 mode=payload.mode,
                 request_id=request_id,
+                trace_id=trace_id,
             )
             if run is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
             conversation_repository.create_strategy_spec(auth, run.id, payload.strategy_spec, "backtest-preview.v1")
             backtest_config = payload.backtest_config.model_dump(mode="json") if payload.backtest_config else {}
-            strategy_logic = _build_backtest_strategy_logic(payload.strategy_spec, backtest_config, payload.strategy_logic)
+            pine_code = _required_pineforge_pine(payload.pine_code, payload.strategy_spec)
+            validation = validate_pineforge_pine(pine_code, payload.strategy_spec)
+            if validation["status"] == "fail":
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={"code": "pineforge_validation_failed", "validation": validation},
+                )
             job = conversation_repository.create_run_job(
                 auth,
                 run.id,
                 job_type=RUN_MODE_BACKTEST_PREVIEW,
                 payload_json={
                     "strategy_spec": payload.strategy_spec,
-                    "strategy_logic": strategy_logic,
+                    "pine_code": pine_code,
                     "backtest_config": backtest_config,
-                    "runtime": backtest_runtime_boundary(),
+                    "runtime": backtest_runtime_boundary(BACKTEST_ENGINE_PINEFORGE),
                     "limits": backtest_job_limits_for_tier(auth.user_tier),
                 },
             )
@@ -594,7 +970,7 @@ def create_app(
                         "symbol": backtest_config.get("symbol"),
                         "timeframe": backtest_config.get("timeframe"),
                         "data_source": backtest_config.get("data_source"),
-                        "execution_semantics": "semantic_strategy_logic",
+                        "execution_semantics": "model_generated_pine_pineforge",
                     },
                 )
                 result = RunnerIntegrationResult(run=run, artifacts=[])
@@ -607,6 +983,7 @@ def create_app(
                         conversation_id=conversation.id,
                         strategy_spec=payload.strategy_spec,
                         request_id=request_id,
+                        trace_id=trace_id,
                     )
                 )
             except (ProviderConfigurationError, SecurityControlError) as exc:
@@ -624,6 +1001,7 @@ def create_app(
                     payload.strategy_spec,
                     budget_policy_finding(exc),
                     request_id=request_id,
+                    trace_id=trace_id,
                 )
                 if blocked is None:
                     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
@@ -634,6 +1012,7 @@ def create_app(
                 status="running",
                 mode=payload.mode,
                 request_id=request_id,
+                trace_id=trace_id,
             )
             if run is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
@@ -663,7 +1042,7 @@ def create_app(
             retry_of_run_id=result.run.retry_of_run_id,
             request_id=result.run.request_id,
             trace_id=result.run.trace_id,
-            artifacts=[_artifact_response(artifact) for artifact in result.artifacts],
+            artifacts=_artifact_responses(result.artifacts, auth=auth, repository=conversation_repository),
         )
         return _complete_idempotent_response(controls, idempotency, response, status.HTTP_201_CREATED)
 
@@ -680,9 +1059,11 @@ def create_app(
         mode: str = Query(default="deterministic", pattern="^(deterministic|agent)$"),
         idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
         x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+        x_trace_id: str | None = Header(default=None, alias="X-Trace-Id"),
         auth: AuthContext = Depends(require_auth_context),
     ):
         request_id = x_request_id or opaque_id("req")
+        trace_id = x_trace_id or opaque_id("trace")
         try:
             controls.check_write(auth, ip_address=_client_ip(request), surface="message.create")
             idempotency = controls.begin_idempotency(
@@ -713,6 +1094,18 @@ def create_app(
         )
         if message is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        agent_log(
+            logger,
+            "info",
+            "message.persisted",
+            component="api",
+            conversation_id=conversation_id,
+            message_id=message.id,
+            request_id=request_id,
+            role=message.role,
+            text_len=len(message.content),
+            trace_id=trace_id,
+        )
         _maybe_generate_conversation_title(
             repository=conversation_repository,
             llm_orchestrator=llm_orchestrator,
@@ -724,6 +1117,19 @@ def create_app(
         )
         if stream:
             if mode == "agent":
+                agent_log(
+                    logger,
+                    "info",
+                    "backend.stream.opened",
+                    component="api",
+                    conversation_id=conversation_id,
+                    language=payload.language,
+                    message_id=message.id,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    user_tier=auth.user_tier,
+                    web_search=payload.web_search,
+                )
                 return StreamingResponse(
                     _idempotent_sse_stream(
                         llm_orchestrator.stream_chat(
@@ -733,6 +1139,7 @@ def create_app(
                             message_content=message.content,
                             current_message_id=message.id,
                             request_id=request_id,
+                            trace_id=trace_id,
                             web_search=payload.web_search,
                         ),
                         controls,
@@ -741,7 +1148,13 @@ def create_app(
                     media_type="text/event-stream",
                     status_code=status.HTTP_200_OK,
                 )
-            run = conversation_repository.create_run(auth, conversation_id, status="running", request_id=request_id)
+            run = conversation_repository.create_run(
+                auth,
+                conversation_id,
+                status="running",
+                request_id=request_id,
+                trace_id=trace_id,
+            )
             if run is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
             return StreamingResponse(
@@ -936,7 +1349,7 @@ def create_app(
         )
         preview, truncated, line_count, language = _artifact_preview(artifact, content, max_bytes)
         truncated = truncated or truncated_by_read
-        base = _artifact_response(artifact).model_dump()
+        base = _artifact_response(artifact, auth=auth, repository=conversation_repository).model_dump()
         return ArtifactPreviewResponse(
             **base,
             preview=preview,
@@ -953,7 +1366,7 @@ def create_app(
     ) -> ArtifactContentResponse:
         artifact, content = _authorized_artifact_content(conversation_repository, artifact_store, auth, artifact_id)
         return ArtifactContentResponse(
-            **_artifact_response(artifact).model_dump(),
+            **_artifact_response(artifact, auth=auth, repository=conversation_repository).model_dump(),
             content=redact_value(content),
         )
 
@@ -968,8 +1381,9 @@ def _create_blocked_run_response(
     finding: PolicyFinding,
     *,
     request_id: str | None = None,
+    trace_id: str | None = None,
 ) -> RunCreateResponse | None:
-    run = repository.create_run(auth, conversation_id, status="blocked", request_id=request_id)
+    run = repository.create_run(auth, conversation_id, status="blocked", request_id=request_id, trace_id=trace_id)
     if run is None:
         return None
     append_stage_event(repository, auth, run, "policy", 0, status="blocked")
@@ -1375,8 +1789,15 @@ def _string_list(value: Any) -> list[str]:
     return []
 
 
-def _artifact_response(artifact: ArtifactRecord) -> ArtifactResponse:
+def _artifact_response(
+    artifact: ArtifactRecord,
+    *,
+    auth: AuthContext | None = None,
+    repository: ConversationRepository | None = None,
+    preview_summary: dict[str, Any] | None = None,
+) -> ArtifactResponse:
     visibility, category = _artifact_visibility_and_category(artifact)
+    presentation = _artifact_presentation(artifact, visibility=visibility, category=category)
     return ArtifactResponse(
         id=artifact.id,
         run_id=artifact.run_id,
@@ -1389,8 +1810,206 @@ def _artifact_response(artifact: ArtifactRecord) -> ArtifactResponse:
         metadata_json=redact_value(artifact.metadata_json),
         visibility=visibility,
         category=category,
+        presentation=presentation,
+        preview_summary=_artifact_preview_summary(
+            artifact,
+            auth=auth,
+            repository=repository,
+            preview_summary=preview_summary,
+        ),
         created_at=artifact.created_at,
     )
+
+
+def _artifact_responses(
+    artifacts: list[ArtifactRecord],
+    *,
+    auth: AuthContext,
+    repository: ConversationRepository,
+    preview_summaries: dict[str, dict[str, Any]] | None = None,
+) -> list[ArtifactResponse]:
+    summaries = preview_summaries or _artifact_preview_summary_batch(artifacts, auth=auth, repository=repository)
+    return [
+        _artifact_response(
+            artifact,
+            auth=auth,
+            repository=repository,
+            preview_summary=summaries.get(artifact.id),
+        )
+        for artifact in artifacts
+    ]
+
+
+def _artifact_preview_summary(
+    artifact: ArtifactRecord,
+    *,
+    auth: AuthContext | None = None,
+    repository: ConversationRepository | None = None,
+    preview_summary: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if preview_summary is not None:
+        return preview_summary
+    metadata_summary = _artifact_preview_summary_from_metadata(artifact)
+    if metadata_summary is not None:
+        return metadata_summary
+    if auth is None or repository is None:
+        return None
+    return _backtest_dashboard_preview_summary_from_index(artifact, auth=auth, repository=repository)
+
+
+def _artifact_preview_summary_from_metadata(artifact: ArtifactRecord) -> dict[str, Any] | None:
+    metadata = artifact.metadata_json
+    if isinstance(metadata, dict):
+        preview_summary = metadata.get("preview_summary")
+        if isinstance(preview_summary, dict):
+            redacted = redact_value(preview_summary)
+            return redacted if isinstance(redacted, dict) else None
+    return None
+
+
+def _artifact_preview_summary_batch(
+    artifacts: list[ArtifactRecord],
+    *,
+    auth: AuthContext,
+    repository: ConversationRepository,
+) -> dict[str, dict[str, Any]]:
+    summaries: dict[str, dict[str, Any]] = {}
+    backtest_artifacts: list[ArtifactRecord] = []
+    for artifact in artifacts:
+        metadata_summary = _artifact_preview_summary_from_metadata(artifact)
+        if metadata_summary is not None:
+            summaries[artifact.id] = metadata_summary
+        elif artifact.kind == BACKTEST_DASHBOARD_ARTIFACT_KIND and artifact.run_id:
+            backtest_artifacts.append(artifact)
+    run_ids = [artifact.run_id for artifact in backtest_artifacts if artifact.run_id]
+    if not run_ids:
+        return summaries
+    backtest_summaries = repository.get_backtest_summaries(auth, run_ids)
+    equity_summaries = repository.get_backtest_equity_summaries(auth, run_ids)
+    for artifact in backtest_artifacts:
+        if not artifact.run_id:
+            continue
+        summary = backtest_summaries.get(artifact.run_id)
+        if not isinstance(summary, dict):
+            continue
+        preview_summary = _backtest_dashboard_preview_summary_from_parts(
+            artifact,
+            summary=summary,
+            equity_summary=equity_summaries.get(artifact.run_id),
+        )
+        if preview_summary is not None:
+            summaries[artifact.id] = preview_summary
+    return summaries
+
+
+def _backtest_dashboard_preview_summary_from_index(
+    artifact: ArtifactRecord,
+    *,
+    auth: AuthContext,
+    repository: ConversationRepository,
+) -> dict[str, Any] | None:
+    if artifact.kind != BACKTEST_DASHBOARD_ARTIFACT_KIND or not artifact.run_id:
+        return None
+    summary = repository.get_backtest_summary(auth, artifact.run_id)
+    if not isinstance(summary, dict):
+        return None
+    equity_summary = repository.get_backtest_equity_summary(auth, artifact.run_id)
+    return _backtest_dashboard_preview_summary_from_parts(
+        artifact,
+        summary=summary,
+        equity_summary=equity_summary,
+    )
+
+
+def _backtest_dashboard_preview_summary_from_parts(
+    artifact: ArtifactRecord,
+    *,
+    summary: dict[str, Any],
+    equity_summary: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    metrics = summary.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+    equity_points = (
+        equity_summary.get("points")
+        if isinstance(equity_summary, dict) and isinstance(equity_summary.get("points"), list)
+        else []
+    )
+    return {
+        "kind": "backtest_result",
+        "run_id": artifact.run_id,
+        "symbol": _optional_string(summary.get("symbol")),
+        "timeframe": _optional_string(summary.get("signal_timeframe")),
+        "metrics": {
+            "net_pnl": _first_number(
+                _nested_number(metrics, ("pnl", "absolute")),
+                _number_from_keys(metrics, ("net_pnl", "net_profit", "pnl_cost")),
+            ),
+            "return_pct": _first_number(
+                _nested_number(metrics, ("pnl", "percentage")),
+                _number_from_keys(metrics, ("return_pct", "net_profit_pct", "total_return")),
+            ),
+            "max_drawdown": _number_from_keys(metrics, ("max_drawdown_cost", "max_drawdown_absolute")),
+            "max_drawdown_pct": _number_from_keys(metrics, ("max_drawdown_pct", "drawdown_pct", "max_drawdown")),
+            "win_rate": _number_from_keys(metrics, ("win_rate",)),
+            "winning_trades": _number_from_keys(metrics, ("winning_trades", "winners")),
+            "losing_trades": _number_from_keys(metrics, ("losing_trades", "losers")),
+            "trade_count": _number_from_keys(metrics, ("trade_count", "trades", "closed_trades")),
+            "profit_factor": _number_from_keys(metrics, ("profit_factor",)),
+        },
+        "equity_preview": _backtest_equity_preview(equity_points, limit=80),
+        "generated_at": artifact.created_at.isoformat(),
+    }
+
+
+def _backtest_equity_preview(points: list[Any], *, limit: int) -> list[dict[str, Any]]:
+    if not points:
+        return []
+    step = max(1, len(points) // limit)
+    sampled = points[::step][:limit]
+    preview: list[dict[str, Any]] = []
+    for index, point in enumerate(sampled):
+        if not isinstance(point, dict):
+            continue
+        pnl = _number_from_keys(point, ("pnl", "pnl_cost", "equity", "value"))
+        if pnl is None:
+            continue
+        preview.append(
+            {
+                "index": _first_number(_number_from_keys(point, ("index", "bar_index")), index),
+                "timestamp": _optional_string(point.get("timestamp")),
+                "pnl": pnl,
+            }
+        )
+    return preview
+
+
+def _first_number(*values: float | int | None) -> float | int | None:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _number_from_keys(record: dict[str, Any], keys: tuple[str, ...]) -> float | int | None:
+    for key in keys:
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int | float):
+            return value
+    return None
+
+
+def _nested_number(record: dict[str, Any], path: tuple[str, ...]) -> float | int | None:
+    current: Any = record
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    if isinstance(current, bool):
+        return None
+    return current if isinstance(current, int | float) else None
 
 
 def _run_event_response(event: RunEventRecord) -> RunEventResponse:
@@ -1407,51 +2026,6 @@ def _run_event_response(event: RunEventRecord) -> RunEventResponse:
     )
 
 
-USER_ARTIFACT_KINDS = {
-    "backtest_equity_curve",
-    "backtest_plan",
-    "backtest_graph_pipeline",
-    "backtest_pinets_preview",
-    "backtest_report",
-    "backtest_run_metadata",
-    "backtest_sidekick_export",
-    "backtest_signals_context",
-    "backtest_source_bundle",
-    "backtest_strategy_logic",
-    "backtest_trades",
-    "backtest_variant_comparison",
-    "market_data_cache_manifest",
-    "pine_file",
-    "mql5_file",
-    "review_report",
-    "validation_report",
-    "manual_checklist",
-}
-INTERNAL_ARTIFACT_KINDS = {
-    "agent_run",
-    "harness_evidence_summary",
-    "knowledge_context",
-    "live_error",
-    "live_metadata",
-    "live_workflow_trace",
-    "quality_report",
-    "runtime_trace_summary",
-}
-REPORT_ARTIFACT_KINDS = {
-    "backtest_report",
-    "backtest_graph_pipeline",
-    "backtest_pinets_preview",
-    "backtest_sidekick_export",
-    "backtest_signals_context",
-    "backtest_variant_comparison",
-    "review_report",
-    "validation_report",
-    "manual_checklist",
-}
-EVIDENCE_ARTIFACT_KINDS = {"harness_evidence_summary", "market_data_cache_manifest"}
-TRACE_ARTIFACT_KINDS = {"runtime_trace_summary", "live_workflow_trace", "agent_run", "live_error", "live_metadata"}
-
-
 def _artifact_visibility_and_category(artifact: ArtifactRecord) -> tuple[str, str]:
     visibility = "internal" if artifact.kind in INTERNAL_ARTIFACT_KINDS else "user"
     if artifact.kind in USER_ARTIFACT_KINDS:
@@ -1465,6 +2039,98 @@ def _artifact_visibility_and_category(artifact: ArtifactRecord) -> tuple[str, st
     if artifact.kind in TRACE_ARTIFACT_KINDS:
         return visibility, "trace"
     return visibility, "other"
+
+
+ArtifactPresentationUserKind = Literal["code", "dashboard", "report", "risk", "validation", "evidence", "raw"]
+ArtifactPresentationViewerKind = Literal["code", "backtest_dashboard", "backtest_plan", "backtest_report", "trades", "json"]
+ArtifactPresentationLanguageHint = Literal["markdown", "json", "pine", "mql5"]
+ArtifactPresentationVisibility = Literal["user", "internal"]
+
+
+class ArtifactPresentation(TypedDict):
+    dedupe_key: str
+    is_primary: bool
+    language_hint: ArtifactPresentationLanguageHint | None
+    user_kind: ArtifactPresentationUserKind
+    viewer_kind: ArtifactPresentationViewerKind
+    visibility: ArtifactPresentationVisibility
+
+
+def _artifact_presentation(artifact: ArtifactRecord, *, visibility: str, category: str) -> ArtifactPresentation:
+    kind = artifact.kind.lower()
+    name = artifact.display_name.lower()
+    user_kind = _artifact_user_kind(kind=kind, category=category, mime_type=artifact.mime_type)
+    viewer_kind = _artifact_viewer_kind(kind=kind, category=category, user_kind=user_kind)
+    return {
+        "dedupe_key": _artifact_dedupe_key(artifact, user_kind=user_kind),
+        "is_primary": _artifact_is_primary(kind=kind, name=name),
+        "language_hint": _artifact_language_hint(kind=kind, mime_type=artifact.mime_type),
+        "user_kind": user_kind,
+        "viewer_kind": viewer_kind,
+        "visibility": _artifact_presentation_visibility(visibility),
+    }
+
+
+def _artifact_user_kind(*, kind: str, category: str, mime_type: str | None) -> ArtifactPresentationUserKind:
+    if kind == BACKTEST_DASHBOARD_ARTIFACT_KIND:
+        return "dashboard"
+    if "risk" in kind:
+        return "risk"
+    if kind in {"pineforge_compile_report"} or "validation" in kind or "checklist" in kind:
+        return "validation"
+    if category == "evidence" or "evidence" in kind or kind == "pineforge_runner_manifest":
+        return "evidence"
+    if category == "code" or kind in {"pine_file", "pine_strategy_source", "mql5_file"} or "mql5" in kind or mime_type == "text/plain":
+        return "code"
+    if category == "report" or "report" in kind:
+        return "report"
+    return "raw"
+
+
+def _artifact_viewer_kind(
+    *, kind: str, category: str, user_kind: ArtifactPresentationUserKind
+) -> ArtifactPresentationViewerKind:
+    if kind == BACKTEST_DASHBOARD_ARTIFACT_KIND:
+        return "backtest_dashboard"
+    if kind == BACKTEST_PLAN_ARTIFACT_KIND:
+        return "backtest_plan"
+    if kind in {
+        BACKTEST_REPORT_ARTIFACT_KIND,
+        ROBUSTNESS_REPORT_ARTIFACT_KIND,
+        BACKTEST_VARIANT_COMPARISON_ARTIFACT_KIND,
+    }:
+        return "backtest_report"
+    if kind == BACKTEST_TRADES_ARTIFACT_KIND:
+        return "trades"
+    if user_kind == "code" or category == "code":
+        return "code"
+    return "json"
+
+
+def _artifact_is_primary(*, kind: str, name: str) -> bool:
+    return kind == BACKTEST_DASHBOARD_ARTIFACT_KIND or kind in {"pine_file", "pine_strategy_source", "mql5_file"} or name.endswith(".pine")
+
+
+def _artifact_language_hint(*, kind: str, mime_type: str | None) -> ArtifactPresentationLanguageHint | None:
+    if mime_type == "text/markdown":
+        return "markdown"
+    if mime_type == "application/json" or kind.startswith("backtest_") or kind.endswith("_report"):
+        return "json"
+    if kind in {"pine_file", "pine_strategy_source"} or "pine" in kind:
+        return "pine"
+    if kind == "mql5_file" or "mql5" in kind:
+        return "mql5"
+    return None
+
+
+def _artifact_presentation_visibility(visibility: str) -> ArtifactPresentationVisibility:
+    return "internal" if visibility == "internal" else "user"
+
+
+def _artifact_dedupe_key(artifact: ArtifactRecord, *, user_kind: ArtifactPresentationUserKind) -> str:
+    if user_kind == "code":
+        return f"code:{artifact.display_name.lower()}"
+    return f"{artifact.kind.lower()}:{artifact.display_name.lower()}"
 
 
 def _authorized_artifact_content(
@@ -1818,6 +2484,64 @@ def _workspace_capability(auth: AuthContext) -> WorkspaceCapabilityResponse:
         allowed_message_modes=allowed_message_modes,
         allowed_run_modes=allowed_run_modes,
     )
+
+
+USER_FACING_MODEL_STAGES = (
+    DEFAULT_MODEL_STAGE,
+    MODEL_STAGE_PINE_CODE_GENERATION,
+    MODEL_STAGE_BALANCED_REVIEW,
+    MODEL_STAGE_REPAIR,
+)
+
+
+def _user_safe_model_routing_status(auth: AuthContext, configured: bool) -> dict[str, Any]:
+    routing_mode = os.getenv("STRATEGY_CODEBOT_LLM_ROUTING", "registry").strip().lower() or "registry"
+    gateway_report = gateway_env_report()
+    available_gateways = [str(gateway) for gateway in gateway_report.get("available_gateways", [])]
+    model_tier = normalize_user_tier(auth.user_tier)
+    selected_stage_defaults: dict[str, str] = {}
+    fallback_enabled = False
+
+    if routing_mode == "registry":
+        try:
+            registry = load_model_registry()
+            for stage in USER_FACING_MODEL_STAGES:
+                routes = resolve_routes(registry, tier=model_tier, stage=stage)
+                selected_stage_defaults[stage] = _safe_model_route_label(routes[0]) if routes else "Unavailable"
+                fallback_enabled = fallback_enabled or len(routes) > 1
+        except Exception:
+            selected_stage_defaults = {stage: "Unavailable" for stage in USER_FACING_MODEL_STAGES}
+    else:
+        selected_stage_defaults[DEFAULT_MODEL_STAGE] = "Configured provider" if configured else "Unavailable"
+
+    route_ready = bool(configured and (routing_mode != "registry" or available_gateways or selected_stage_defaults))
+    user_message = (
+        "Model route is ready for this workspace."
+        if route_ready
+        else "Model route is not ready. Retry later or contact an admin."
+    )
+    return {
+        "model_routing_mode": routing_mode,
+        "model_tier": model_tier,
+        "selected_stage_defaults": selected_stage_defaults,
+        "available_gateways": available_gateways,
+        "route_ready": route_ready,
+        "fallback_enabled": fallback_enabled,
+        "user_message": user_message,
+    }
+
+
+def _safe_model_route_label(route: str) -> str:
+    provider, _, _model = route.partition("/")
+    if provider == "litellm_proxy":
+        return "Managed model route"
+    if provider == "openrouter":
+        return "OpenRouter route"
+    if provider in {"vercel_ai_gateway", "vercel-ai-gateway"}:
+        return "Vercel AI Gateway route"
+    if provider == "openai":
+        return "OpenAI route"
+    return "Configured model route"
 
 
 def _require_message_mode(auth: AuthContext, mode: str) -> None:

@@ -35,7 +35,13 @@ class LLMClient(Protocol):
 
     def ensure_configured(self) -> None: ...
 
-    def stream(self, *, messages: list[dict[str, str]], tools: list[dict[str, Any]]) -> Iterable[LLMClientEvent]: ...
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Iterable[LLMClientEvent]: ...
 
 
 class ResponsesClient:
@@ -48,7 +54,13 @@ class ResponsesClient:
         if not (self._api_key or os.getenv("OPENAI_API_KEY")):
             raise ProviderConfigurationError("LLM provider is not configured")
 
-    def stream(self, *, messages: list[dict[str, str]], tools: list[dict[str, Any]]) -> Iterable[LLMClientEvent]:
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Iterable[LLMClientEvent]:
         self.ensure_configured()
         try:
             from openai import OpenAI
@@ -80,6 +92,57 @@ class ResponsesClient:
             raise
 
 
+class ChatCompletionsClient:
+    def __init__(
+        self,
+        *,
+        model: str,
+        api_key: str | None,
+        base_url: str,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        self.model = model
+        self._api_key = api_key
+        self._base_url = base_url
+        self._timeout_seconds = timeout_seconds
+
+    def ensure_configured(self) -> None:
+        if not self._api_key:
+            raise ProviderConfigurationError("LLM provider is not configured")
+        if not self._base_url:
+            raise ProviderConfigurationError("LLM provider base URL is not configured")
+
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Iterable[LLMClientEvent]:
+        self.ensure_configured()
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise ProviderConfigurationError("OpenAI SDK is not installed") from exc
+
+        timeout = self._timeout_seconds or _provider_timeout_seconds()
+        client = OpenAI(api_key=self._api_key, base_url=self._base_url, timeout=timeout)
+        request_kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if tools:
+            request_kwargs["tools"] = [_chat_completion_tool(tool) for tool in tools]
+            request_kwargs["tool_choice"] = "auto"
+        try:
+            response = client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            if exc.__class__.__name__ in {"APITimeoutError", "Timeout", "ReadTimeout", "ConnectTimeout"}:
+                raise ProviderTimeoutError("Provider request timed out") from exc
+            raise
+        yield from chat_completion_events(response, model=self.model)
+
+
 class E2EFakeLLMClient:
     """Deterministic chat-model substitute for Docker E2E runs only."""
 
@@ -88,7 +151,13 @@ class E2EFakeLLMClient:
     def ensure_configured(self) -> None:
         return None
 
-    def stream(self, *, messages: list[dict[str, str]], tools: list[dict[str, Any]]) -> Iterable[LLMClientEvent]:
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Iterable[LLMClientEvent]:
         prompt = _last_user_content(messages)
         if not tools:
             yield LLMClientEvent(
@@ -115,7 +184,13 @@ class AgentsClient:
         except ImportError as exc:
             raise ProviderConfigurationError("OpenAI Agents SDK is not installed") from exc
 
-    def stream(self, *, messages: list[dict[str, str]], tools: list[dict[str, Any]]) -> Iterable[LLMClientEvent]:
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Iterable[LLMClientEvent]:
         self.ensure_configured()
         raise ProviderConfigurationError("Agents SDK adapter is not enabled for tool execution in Phase 5")
 
@@ -131,7 +206,7 @@ def _e2e_tool_calls(prompt: str) -> list[tuple[str, dict[str, Any]]]:
     lowered = prompt.lower()
     spec = _e2e_strategy_spec()
     config = _e2e_backtest_config()
-    logic = _e2e_strategy_logic()
+    pine_code = _e2e_pine_code()
     if "variant" in lowered:
         return [
             (
@@ -139,7 +214,7 @@ def _e2e_tool_calls(prompt: str) -> list[tuple[str, dict[str, Any]]]:
                 {
                     "prompt": prompt,
                     "strategy_spec": spec,
-                    "strategy_logic": logic,
+                    "pine_code": pine_code,
                     "base_backtest_config": config,
                     "variants": [
                         {"name": "baseline"},
@@ -148,28 +223,7 @@ def _e2e_tool_calls(prompt: str) -> list[tuple[str, dict[str, Any]]]:
                 },
             )
         ]
-    if "pinets" in lowered or "pine" in lowered:
-        return [("create_pinets_preview_plan", {"prompt": prompt, "strategy_spec": spec, "backtest_config": config})]
-    if "signals" in lowered or "market context" in lowered:
-        return [("create_signals_market_context_plan", {"prompt": prompt, "symbol": "BTC/USDT", "backtest_config": config})]
-    if "graph" in lowered or "multi-timeframe" in lowered:
-        return [
-            (
-                "create_graph_pipeline_plan",
-                {
-                    "prompt": prompt,
-                    "strategy_spec": spec,
-                    "base_backtest_config": config,
-                    "timeframes": ["4h", "1h"],
-                    "variants": ["baseline", "tight-risk"],
-                },
-            )
-        ]
-    if "sidekick" in lowered or "export" in lowered:
-        return [("create_sidekick_export_plan", {"prompt": prompt, "strategy_spec": spec, "project_name": "e2e-backtest-kit"})]
-    if "run" in lowered or "queue" in lowered:
-        return [("run_backtest_preview", {"prompt": prompt, "strategy_spec": spec, "strategy_logic": logic, "backtest_config": config})]
-    return [("create_backtest_plan", {"prompt": prompt, "strategy_spec": spec, "strategy_logic": logic, "backtest_config": config})]
+    return [("create_backtest_plan", {"prompt": prompt, "strategy_spec": spec, "pine_code": pine_code, "backtest_config": config})]
 
 
 def _e2e_strategy_spec() -> dict[str, Any]:
@@ -190,9 +244,11 @@ def _e2e_strategy_spec() -> dict[str, Any]:
 
 def _e2e_backtest_config() -> dict[str, Any]:
     return {
-        "engine": "backtest-kit",
+        "engine": "pineforge",
+        "exchange": "binance",
         "symbol": "BTC/USDT",
         "timeframe": "1h",
+        "candle_timeframe": "1m",
         "start": "2024-01-01",
         "end": "2024-01-03",
         "initial_capital": 10000,
@@ -202,24 +258,16 @@ def _e2e_backtest_config() -> dict[str, Any]:
     }
 
 
-def _e2e_strategy_logic() -> dict[str, Any]:
-    return {
-        "logic_version": "backtest-strategy-logic.v1",
-        "position": "long",
-        "indicators": {
-            "fast_ema": {"kind": "ema", "period": 3, "source": "close"},
-            "slow_ema": {"kind": "ema", "period": 5, "source": "close"},
-            "rsi": {"kind": "rsi", "period": 14, "source": "close"},
-        },
-        "entry": {
-            "all": [
-                {"type": "crossover", "left": "fast_ema", "right": "slow_ema"},
-                {"type": "greater_than", "left": "rsi", "right": 45},
-            ]
-        },
-        "exit": {"take_profit_pct": 4, "stop_loss_pct": 2, "max_holding_minutes": 1440},
-        "risk": {"cost": 1000},
-    }
+def _e2e_pine_code() -> str:
+    return """//@version=6
+strategy("E2E EMA RSI", overlay=true, initial_capital=10000)
+fast = ta.ema(close, 3)
+slow = ta.ema(close, 5)
+rsi = ta.rsi(close, 14)
+if ta.crossover(fast, slow) and rsi > 45
+    strategy.entry("Long", strategy.long)
+strategy.exit("Exit", "Long", stop=strategy.position_avg_price * 0.98, limit=strategy.position_avg_price * 1.04)
+"""
 
 
 def response_events(response: Any, *, model: str) -> Iterable[LLMClientEvent]:
@@ -275,6 +323,49 @@ def _usage_events(response: Any, *, model: str) -> Iterable[LLMClientEvent]:
     output_tokens = _int_value(usage, "output_tokens")
     if input_tokens or output_tokens:
         yield LLMClientEvent(type=LLM_EVENT_USAGE, model=model, input_tokens=input_tokens, output_tokens=output_tokens)
+
+
+def chat_completion_events(response: Any, *, model: str) -> Iterable[LLMClientEvent]:
+    usage = _value(response, "usage")
+    input_tokens = _int_value(usage, "prompt_tokens")
+    output_tokens = _int_value(usage, "completion_tokens")
+    if input_tokens or output_tokens:
+        yield LLMClientEvent(type=LLM_EVENT_USAGE, model=model, input_tokens=input_tokens, output_tokens=output_tokens)
+    choices = _value(response, "choices") or []
+    if not isinstance(choices, list | tuple):
+        return
+    for choice in choices:
+        message = _value(choice, "message")
+        content = _value(message, "content")
+        if content:
+            yield LLMClientEvent(type=LLM_EVENT_MESSAGE_DELTA, text=str(content), model=model)
+        tool_calls = _value(message, "tool_calls") or []
+        if not isinstance(tool_calls, list | tuple):
+            continue
+        for tool_call in tool_calls:
+            function = _value(tool_call, "function")
+            name = _value(function, "name")
+            if not name:
+                continue
+            yield LLMClientEvent(
+                type=LLM_EVENT_TOOL_CALL,
+                tool_name=str(name),
+                arguments=_json_arguments(_value(function, "arguments")),
+                model=model,
+            )
+
+
+def _chat_completion_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    if tool.get("type") != "function":
+        return tool
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.get("name"),
+            "description": tool.get("description", ""),
+            "parameters": tool.get("parameters", {}),
+        },
+    }
 
 
 def _iter_response_items(response: Any) -> Iterable[Any]:

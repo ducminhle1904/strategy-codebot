@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { BackendClient, buildBackendHeaders, parseBackendSseEvents } from "./backend-client";
-import { ConversationStateResponseSchema, KNOWN_RUN_EVENT_TYPES, RunCreateSchema } from "./backend-schemas";
+import {
+  BACKTEST_RUN_EVENT_TYPES,
+  BacktestApprovalDecisionRequestSchema,
+  BacktestConfigSchema,
+  ConversationStateResponseSchema,
+  KNOWN_RUN_EVENT_TYPES,
+  RunCreateSchema,
+} from "./backend-schemas";
 import type { StrategySpec } from "./backend-schemas";
 
 const isoNow = "2026-06-17T12:00:00+00:00";
@@ -27,16 +34,143 @@ describe("BackendClient", () => {
 
   it("keeps backtest progress events in the known event contract", () => {
     expect(KNOWN_RUN_EVENT_TYPES).toEqual(
+      expect.arrayContaining([...BACKTEST_RUN_EVENT_TYPES])
+    );
+    expect(KNOWN_RUN_EVENT_TYPES).toEqual(
       expect.arrayContaining([
-        "backtest.queued",
-        "backtest.data.started",
-        "backtest.data.completed",
-        "backtest.execution.started",
-        "backtest.execution.completed",
-        "backtest.report.completed",
-        "backtest.failed",
+        "backtest.preview.approval_required",
+        "backtest.preview.approved",
+        "backtest.preview.rejected",
+        "backtest.preview.queued",
       ])
     );
+    expect(BacktestApprovalDecisionRequestSchema.parse({ decision: "approved" }).decision).toBe(
+      "approved"
+    );
+  });
+
+  it("validates executable backtest config bounds", () => {
+    expect(
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        symbol: "BTC/USDT",
+        timeframe: "30m",
+        candle_timeframe: "1m",
+        start: "2024-01-01",
+        end: "2024-02-01",
+        initial_capital: 10000,
+        fee_bps: 10,
+        slippage_bps: 5,
+        data_source: "public-readonly-cache",
+      }).timeframe
+    ).toBe("30m");
+    expect(
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        exchange: "okx",
+        symbol: "BTC/USDT",
+        timeframe: "1h",
+        start: "2024-01-01",
+        end: "2024-02-01",
+        initial_capital: 10000,
+      }).exchange
+    ).toBe("okx");
+    expect(() =>
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        exchange: "coinbase",
+        symbol: "BTC/USDT",
+        timeframe: "1h",
+        start: "2024-01-01",
+        end: "2024-02-01",
+        initial_capital: 10000,
+      })
+    ).toThrow();
+
+    expect(() =>
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        symbol: "BTC/USDT",
+        timeframe: "4h",
+        candle_timeframe: "1m",
+        start: "2024-01-01",
+        end: "2024-02-01",
+        initial_capital: 10000,
+        fee_bps: 10,
+        slippage_bps: 5,
+        data_source: "public-readonly-cache",
+      })
+    ).toThrow();
+    expect(() =>
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        symbol: "BTC/USDT",
+        timeframe: "1h",
+        candle_timeframe: "1m",
+        start: "2024-02-01",
+        end: "2024-01-01",
+        initial_capital: 10000,
+        fee_bps: 1001,
+        slippage_bps: 5,
+        data_source: "public-readonly-cache",
+      })
+    ).toThrow();
+    expect(
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        symbol: "BTC/USDT",
+        timeframe: "1h",
+        start: "2024-01-01",
+        end: "2024-02-01",
+        initial_capital: 10000,
+        fee_bps: 10,
+        slippage_bps: 5,
+        data_source: "public-readonly-cache",
+      }).candle_timeframe
+    ).toBe("1m");
+    expect(() =>
+      BacktestConfigSchema.parse({
+        engine: "pineforge",
+        symbol: "BTC/USDT",
+        timeframe: "1h",
+        candle_timeframe: "5m",
+        start: "2024-01-01",
+        end: "2024-02-01",
+        initial_capital: 10000,
+        fee_bps: 10,
+        slippage_bps: 5,
+        data_source: "public-readonly-cache",
+      })
+    ).toThrow();
+  });
+
+  it("requires Pine source for PineForge backtest-preview run creation", () => {
+    const backtestConfig = {
+      engine: "pineforge" as const,
+      symbol: "BTC/USDT",
+      timeframe: "1h" as const,
+      start: "2024-01-01",
+      end: "2024-02-01",
+      initial_capital: 10000,
+    };
+
+    expect(() =>
+      RunCreateSchema.parse({
+        conversation_id: "conv_1",
+        strategy_spec: validStrategySpec,
+        mode: "backtest-preview",
+        backtest_config: backtestConfig,
+      })
+    ).toThrow();
+    expect(
+      RunCreateSchema.parse({
+        conversation_id: "conv_1",
+        strategy_spec: validStrategySpec,
+        pine_code: "//@version=6\nstrategy(\"x\")",
+        mode: "backtest-preview",
+        backtest_config: backtestConfig,
+      }).pine_code
+    ).toContain("strategy");
   });
 
   it("builds tenant headers through the shared header helper", () => {
@@ -47,6 +181,7 @@ describe("BackendClient", () => {
       internalAuthSecret: "secret",
       lastEventId: "evt_1",
       requestId: "req_1",
+      traceId: "trace_1",
       userId: "user_1",
       userTier: "free",
       workspaceId: "workspace_1",
@@ -60,6 +195,8 @@ describe("BackendClient", () => {
     expect(headers.get("X-Strategy-Codebot-Internal-Secret")).toBe("secret");
     expect(headers.get("Idempotency-Key")).toBe("idem_1");
     expect(headers.get("Last-Event-ID")).toBe("evt_1");
+    expect(headers.get("X-Request-Id")).toBe("req_1");
+    expect(headers.get("X-Trace-Id")).toBe("trace_1");
     expect(headers.get("Content-Type")).toBe("application/json");
   });
 
@@ -97,6 +234,146 @@ describe("BackendClient", () => {
     }
   });
 
+  it("parses unavailable readiness responses without treating them as request failures", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse(
+        {
+          status: "unavailable",
+          checks: {
+            pineforge_runner: {
+              reason: "runner unavailable",
+              status: "unavailable",
+            },
+          },
+        },
+        { status: 503 }
+      )
+    );
+    const client = new BackendClient({
+      baseUrl: "/api/backend",
+      fetcher,
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+    });
+
+    await expect(client.ready()).resolves.toEqual({
+      status: "unavailable",
+      checks: {
+        pineforge_runner: {
+          reason: "runner unavailable",
+          status: "unavailable",
+        },
+      },
+    });
+  });
+
+  it("fetches backend action registry metadata", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse({
+        version: 1,
+        actions: [
+          {
+            id: "build-robustness-report",
+            tool_id: "build_robustness_report",
+            label: "Robustness Report",
+            prompt: "Build a review-only robustness report.",
+            category: "review",
+            risk_level: "read_only",
+            next_state: "robustness_review",
+            artifact_kind: "robustness_report",
+            available: true,
+            presentation: {
+              badge_key: "read_only",
+              icon_key: "checklist",
+              visibility_key: "default",
+            },
+          },
+        ],
+      })
+    );
+    const client = new BackendClient({
+      baseUrl: "/api/backend",
+      fetcher,
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+    });
+
+    await expect(client.getActionRegistry()).resolves.toMatchObject({
+      actions: [
+        {
+          presentation: { icon_key: "checklist" },
+          tool_id: "build_robustness_report",
+        },
+      ],
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/backend/v1/action-registry",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("fetches paginated conversation artifacts with preview summaries", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse({
+        items: [
+          {
+            category: "report",
+            conversation_id: "conv_1",
+            created_at: isoNow,
+            display_name: "backtest-dashboard.json",
+            id: "artifact_1",
+            kind: "backtest_dashboard",
+            metadata_json: null,
+            mime_type: "application/json",
+            owner_user_id: "usr_1",
+            presentation: {
+              dedupe_key: "backtest_dashboard:backtest-dashboard.json",
+              is_primary: true,
+              language_hint: "json",
+              user_kind: "dashboard",
+              viewer_kind: "backtest_dashboard",
+              visibility: "user",
+            },
+            preview_summary: {
+              kind: "backtest_result",
+              metrics: { net_pnl: -1 },
+              symbol: "BNBUSDT",
+              timeframe: "1h",
+            },
+            run_id: "run_1",
+            visibility: "user",
+            workspace_id: "wsp_1",
+          },
+        ],
+        next_cursor: "cursor_2",
+      })
+    );
+    const client = new BackendClient({
+      baseUrl: "/api/backend",
+      fetcher,
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+    });
+
+    await expect(
+      client.listConversationArtifacts("conv_1", {
+        cursor: "cursor_1",
+        limit: 25,
+      })
+    ).resolves.toMatchObject({
+      items: [
+        {
+          preview_summary: { kind: "backtest_result" },
+        },
+      ],
+      next_cursor: "cursor_2",
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/backend/v1/conversations/conv_1/artifacts?cursor=cursor_1&limit=25",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
   it("injects tenant and idempotency headers for create operations", async () => {
     const fetcher = vi.fn(
       async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
@@ -120,7 +397,10 @@ describe("BackendClient", () => {
       idempotencyKeyFactory: () => "idem_1",
     });
 
-    await client.createConversation({ title: " Draft " });
+    await client.createConversation(
+      { title: " Draft " },
+      { idempotencyKey: "idem_create", requestId: "req_create", traceId: "trace_create" }
+    );
 
     expect(fetcher).toHaveBeenCalledWith(
       "https://api.example.test/v1/conversations",
@@ -133,7 +413,9 @@ describe("BackendClient", () => {
     const headers = new Headers(init?.headers);
     expect(headers.get("X-User-Id")).toBe("usr_1");
     expect(headers.get("X-Workspace-Id")).toBe("wsp_1");
-    expect(headers.get("Idempotency-Key")).toBe("idem_1");
+    expect(headers.get("Idempotency-Key")).toBe("idem_create");
+    expect(headers.get("X-Request-Id")).toBe("req_create");
+    expect(headers.get("X-Trace-Id")).toBe("trace_create");
   });
 
   it("updates conversation titles with normalized payloads", async () => {
@@ -154,13 +436,81 @@ describe("BackendClient", () => {
       fetcher,
     });
 
-    await client.updateConversationTitle("cnv_1", { title: "  Renamed  " });
+    await client.updateConversationTitle(
+      "cnv_1",
+      { title: "  Renamed  " },
+      { requestId: "req_patch", traceId: "trace_patch" }
+    );
 
     expect(fetcher).toHaveBeenCalledWith(
       "https://api.example.test/v1/conversations/cnv_1",
       expect.objectContaining({
         method: "PATCH",
         body: JSON.stringify({ title: "Renamed" }),
+      })
+    );
+    const init = fetcher.mock.calls[0]?.[1] as RequestInit | undefined;
+    const headers = new Headers(init?.headers);
+    expect(headers.get("X-Request-Id")).toBe("req_patch");
+    expect(headers.get("X-Trace-Id")).toBe("trace_patch");
+    expect(headers.get("Idempotency-Key")).toBeNull();
+  });
+
+  it("passes stream correlation headers through shared stream options", async () => {
+    const fetcher = vi.fn(async () => new Response("event: ping\ndata: {}\n\n"));
+    const client = new BackendClient({
+      baseUrl: "https://api.example.test",
+      fetcher,
+    });
+
+    await client.streamRunEvents("run_1", {
+      lastEventId: "evt_9",
+      requestId: "req_stream",
+      traceId: "trace_stream",
+    });
+
+    expect(fetcher).toHaveBeenCalledWith(
+      "https://api.example.test/v1/runs/run_1/events",
+      expect.objectContaining({ method: "GET" })
+    );
+    const init = fetcher.mock.calls[0]?.[1] as RequestInit | undefined;
+    const headers = new Headers(init?.headers);
+    expect(headers.get("Last-Event-ID")).toBe("evt_9");
+    expect(headers.get("X-Request-Id")).toBe("req_stream");
+    expect(headers.get("X-Trace-Id")).toBe("trace_stream");
+  });
+
+  it("posts backtest approval decisions to the backend approval endpoint", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse({
+        approval_id: "approval_1",
+        conversation_id: "cnv_1",
+        decision: "approved",
+        status: "queued",
+        run_id: "run_2",
+        job_id: "job_1",
+        backtest_config: { symbol: "BTC/USDT", timeframe: "1h" },
+      })
+    );
+    const client = new BackendClient({
+      baseUrl: "https://api.example.test",
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+      fetcher,
+    });
+
+    const result = await client.decideBacktestApproval(
+      "cnv_1",
+      "approval_1",
+      { decision: "approved" }
+    );
+
+    expect(result.status).toBe("queued");
+    expect(fetcher).toHaveBeenCalledWith(
+      "https://api.example.test/v1/conversations/cnv_1/backtest-approvals/approval_1",
+      expect.objectContaining({
+        body: JSON.stringify({ decision: "approved" }),
+        method: "POST",
       })
     );
   });
@@ -374,6 +724,55 @@ describe("BackendClient", () => {
         type: "progress.snapshot",
       }),
     ]);
+  });
+
+  it("lists workspace artifacts with cursor pagination", async () => {
+    const fetcher = vi.fn(async () =>
+      jsonResponse({
+        items: [
+          {
+            conversation_id: "conv_1",
+            created_at: isoNow,
+            display_name: "strategy.pine",
+            id: "art_1",
+            kind: "pine_file",
+            metadata_json: null,
+            mime_type: "text/x-pine",
+            owner_user_id: "usr_1",
+            presentation: {
+              dedupe_key: "code:strategy.pine",
+              is_primary: true,
+              language_hint: "pine",
+              user_kind: "code",
+              viewer_kind: "code",
+              visibility: "user",
+            },
+            preview_summary: null,
+            run_id: "run_1",
+            storage_key: "runs/run_1/strategy.pine",
+            workspace_id: "wsp_1",
+          },
+        ],
+        next_cursor: null,
+      })
+    );
+    const client = new BackendClient({
+      baseUrl: "/api/backend",
+      fetcher,
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+    });
+
+    await expect(
+      client.listWorkspaceArtifacts({ cursor: "cursor_1", limit: 20 })
+    ).resolves.toMatchObject({
+      items: [{ id: "art_1", kind: "pine_file" }],
+      next_cursor: null,
+    });
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/backend/v1/artifacts?cursor=cursor_1&limit=20",
+      expect.any(Object)
+    );
   });
 });
 

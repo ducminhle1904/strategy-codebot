@@ -30,6 +30,16 @@ def test_health_remains_shallow_without_provider_config() -> None:
 
 def test_ready_reports_all_backend_dependencies_when_configured(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("STRATEGY_CODEBOT_KNOWLEDGE_DATABASE_URL", raising=False)
+    monkeypatch.delenv("STRATEGY_CODEBOT_LLM_ROUTING", raising=False)
+    monkeypatch.setattr(
+        "strategy_codebot.server.readiness._pineforge_runner_check",
+        lambda: {
+            "status": "ok",
+            "backtest_default_engine": "pineforge",
+            "pineforge_runner_ready": True,
+            "pineforge_runner_version": "test",
+        },
+    )
     client = TestClient(
         create_app(
             repository=create_sqlite_repository(),
@@ -46,7 +56,12 @@ def test_ready_reports_all_backend_dependencies_when_configured(monkeypatch: pyt
     assert payload["checks"]["repository"]["status"] == "ok"
     assert payload["checks"]["artifact_store"]["status"] == "ok"
     assert payload["checks"]["security_controls"]["status"] == "ok"
-    assert payload["checks"]["llm_provider"] == {"status": "ok", "model": "fake-ready-model"}
+    llm_check = payload["checks"]["llm_provider"]
+    assert llm_check["status"] == "ok"
+    assert llm_check["model"] == "fake-ready-model"
+    assert llm_check["model_routing_mode"] == "registry"
+    assert "available_gateways" in llm_check
+    assert "missing_gateway_envs" in llm_check
     assert payload["checks"]["run_worker"]["mode"] == "inline"
     assert payload["checks"]["knowledge_base"] == {"status": "ok", "configured": False}
 

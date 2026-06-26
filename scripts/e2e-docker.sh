@@ -118,7 +118,7 @@ analysis = {
 (report_dir / "analysis.md").write_text(
     "# Docker E2E Analysis\n\n"
     f"Status: `{status}`\n\n"
-    "Use `compose-logs.txt`, pytest logs, queue snapshots, and run event captures to classify failures as API contract, worker lease/cache, Backtest Kit execution, public data dependency, web rendering, test harness, or infrastructure resource limit.\n",
+    "Use `compose-logs.txt`, pytest logs, queue snapshots, and run event captures to classify failures as API contract, worker lease/cache, PineForge execution, public data dependency, web rendering, test harness, or infrastructure resource limit.\n",
     encoding="utf-8",
 )
 PY
@@ -177,7 +177,7 @@ if [[ "$BUILD" == "1" ]]; then
 fi
 
 STARTED=1
-"${COMPOSE[@]}" up -d --build --scale "backtest-worker=$WORKERS" postgres redis litellm-proxy migration api backtest-worker web
+"${COMPOSE[@]}" up -d --build --scale "backtest-worker=$WORKERS" postgres redis litellm-proxy migration api backtest-worker chat-worker web
 
 wait_url "$STRATEGY_CODEBOT_E2E_API_BASE_URL/health" "api health"
 wait_url "$STRATEGY_CODEBOT_E2E_API_BASE_URL/ready" "api readiness"
@@ -219,7 +219,7 @@ esac
 
 {
   echo "## npm audit worker"
-  (cd "$ROOT_DIR/workers/backtest-kit" && npm audit --omit=dev) || echo "worker npm audit reported findings; see output above"
+  (cd "$ROOT_DIR/workers/backtest-worker" && npm audit --omit=dev) || echo "worker npm audit reported findings; see output above"
   echo "## npm audit web"
   (cd "$ROOT_DIR/apps/web" && npm audit --omit=dev) || echo "web npm audit reported findings; see output above"
 } | tee "$REPORT_DIR/audit.log"
@@ -230,10 +230,11 @@ esac
 import json
 from pathlib import Path
 
-worker = json.loads(Path("workers/backtest-kit/package.json").read_text())
+worker = json.loads(Path("workers/backtest-worker/package.json").read_text())
 deps = set(worker.get("dependencies", {}))
-blocked = {"@backtest-kit/sidekick", "@backtest-kit/ollama"}
-found = sorted(deps & blocked)
+blocked_exact = {"backtest-" + "kit"}
+blocked_prefix = "@backtest-" + "kit/"
+found = sorted(dep for dep in deps if dep in blocked_exact or dep.startswith(blocked_prefix))
 if found:
     raise SystemExit(f"blocked runtime dependency found: {found}")
 print("blocked runtime dependencies absent")
@@ -241,6 +242,6 @@ PY
 } | tee -a "$REPORT_DIR/audit.log"
 
 if command -v strategy-codebot >/dev/null 2>&1; then
-  strategy-codebot harness dev-trace --summary "Docker E2E Backtest Kit integration run" --evidence "$REPORT_DIR/analysis.md" || true
+  strategy-codebot harness dev-trace --summary "Docker E2E PineForge integration run" --evidence "$REPORT_DIR/analysis.md" || true
   strategy-codebot harness audit-traces --latest 1 || true
 fi

@@ -16,6 +16,7 @@ from strategy_codebot.schemas import write_json
 from strategy_codebot.tool_runtime import POLICY_OBSERVE, RUNTIME_SUMMARY_PATH
 from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
+from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
 from strategy_codebot.server.observability import StageTimer
 from strategy_codebot.server.observability import append_stage_event
 from strategy_codebot.server.observability import append_stage_started_event
@@ -197,6 +198,7 @@ def _execute_runner(
         completed = repository.set_run_status(auth, run.id, "completed")
         final_run = completed if completed is not None else run
         repository.append_run_event(auth, run.id, "run.completed", {"status": result_status, "mode": event_mode})
+        KnowledgeLearningService(repository, artifact_store).maybe_extract_run_candidates(auth, final_run)
         return RunnerIntegrationResult(run=final_run, artifacts=artifacts)
     except Exception as exc:
         failed = repository.set_run_status(auth, run.id, "failed")

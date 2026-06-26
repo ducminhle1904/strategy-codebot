@@ -123,6 +123,74 @@ def validate_pine(code: str, spec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def validate_pineforge_pine(code: str, spec: dict[str, Any]) -> dict[str, Any]:
+    validation = validate_pine(code, spec)
+    checks = list(validation["checks"])
+    warnings = list(validation["warnings"])
+    lowered_executable_code = _strip_pine_comments(code).lower()
+
+    blocked_patterns = {
+        "alert": r"\balert\s*\(",
+        "alertcondition": r"\balertcondition\s*\(",
+        "request_seed": r"\brequest\.seed\s*\(",
+        "request_security": r"\brequest\.security\s*\(",
+        "webhook": r"webhook|telegram|broker|live\s+trading|paper\s+trading",
+    }
+    blocked = [name for name, pattern in blocked_patterns.items() if re.search(pattern, lowered_executable_code)]
+    checks.append(
+        validation_check(
+            "pineforge_blocked_constructs",
+            not blocked,
+            f"Blocked PineForge POC constructs: {', '.join(blocked)}" if blocked else "No blocked offline backtest constructs found.",
+        )
+    )
+
+    has_strategy_entry = bool(re.search(r"\bstrategy\.entry\s*\(", code))
+    has_exit_or_close = bool(re.search(r"\bstrategy\.(?:exit|close)\s*\(", code))
+    checks.append(validation_check("pineforge_strategy_entry", has_strategy_entry, "PineForge POC requires at least one strategy.entry call."))
+    checks.append(
+        validation_check(
+            "pineforge_exit_logic",
+            has_exit_or_close,
+            "PineForge POC requires strategy.exit or explicit strategy.close exit logic.",
+        )
+    )
+    uses_invalid_cash_sizing = _spec_mentions_cash_notional(spec) and _uses_large_fixed_quantity(code)
+    checks.append(
+        validation_check(
+            "pineforge_position_sizing",
+            not uses_invalid_cash_sizing,
+            (
+                "Cash/notional position sizing must not be encoded as strategy.fixed quantity; "
+                "use explicit qty = cash_per_trade / close before queueing a local preview."
+            )
+            if uses_invalid_cash_sizing
+            else "No fixed-quantity encoding conflict found for cash/notional sizing.",
+        )
+    )
+
+    status = aggregate_status({check["status"] for check in checks})
+    if warnings and status == "pass":
+        status = "manual_required"
+    return {
+        **validation,
+        "status": status,
+        "checks": checks,
+        "evidence": [*validation["evidence"], "pineforge-poc-guardrail"],
+        "warnings": warnings,
+        "next_actions": (
+            ["Run PineForge local transpile/compile/backtest before treating this as local preview evidence."]
+            if status in {"pass", "manual_required"}
+            else ["Fix failing PineForge guardrail checks before queueing a PineForge preview."]
+        ),
+    }
+
+
+def _strip_pine_comments(code: str) -> str:
+    without_block_comments = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
+    return re.sub(r"//.*", "", without_block_comments)
+
+
 def manual_checklist(spec: dict[str, Any]) -> str:
     return "\n".join(
         [
@@ -147,6 +215,29 @@ def _next_actions(status: str) -> list[str]:
     if status == "manual_required":
         return ["Review warnings manually in TradingView."]
     return ["Fix failing static validation checks before manual TradingView testing."]
+
+
+def _spec_mentions_cash_notional(spec: dict[str, Any]) -> bool:
+    values: list[str] = []
+    for key in ("position_sizing", "risk_rules", "assumptions", "constraints", "user_notes"):
+        value = spec.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            values.extend(str(item) for item in value)
+    text = " ".join(values).lower()
+    return bool(re.search(r"(\$|usd|usdt|notional|cash|dollar|fixed\s+\$)", text))
+
+
+def _uses_large_fixed_quantity(code: str) -> bool:
+    strategy_call_match = re.search(r"strategy\s*\((.*?)\)", code, flags=re.IGNORECASE | re.DOTALL)
+    strategy_call = strategy_call_match.group(1) if strategy_call_match else code
+    if not re.search(r"default_qty_type\s*=\s*strategy\.fixed", strategy_call, flags=re.IGNORECASE):
+        return False
+    value_match = re.search(r"default_qty_value\s*=\s*([0-9]+(?:\.[0-9]+)?)", strategy_call, flags=re.IGNORECASE)
+    if value_match is None:
+        return False
+    return float(value_match.group(1)) >= 10
 
 
 def _escape(value: str) -> str:

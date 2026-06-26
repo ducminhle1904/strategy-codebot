@@ -17,7 +17,7 @@ describe("chat test schemas and client helpers", () => {
         target: "pine",
       })
     ).toEqual({
-      endpoint: "/api/chat",
+      endpoint: "/api/copilotkit-chat",
       body: {
         prompt: "Create a moving-average crossover strategy",
         target: "pine",

@@ -6,6 +6,8 @@ import {
   accountName,
   formatUsageCost,
   providerDisplay,
+  providerFallbackEnabled,
+  providerRouteReady,
 } from "./account-ui";
 
 const me: MeResponse = {
@@ -23,18 +25,25 @@ const me: MeResponse = {
 };
 
 function provider(overrides: Partial<ProviderStatusResponse> = {}): ProviderStatusResponse {
-  return {
+  const base = {
     allowed_message_modes: ["deterministic", "agent"],
     allowed_run_modes: ["dry-run", "agent", "live-generation"],
     available: true,
+    available_gateways: ["litellm_proxy"],
     configured: true,
     fallback_mode: "deterministic",
+    fallback_enabled: true,
+    model_routing_mode: "fixed",
+    model_tier: "free",
     reason: null,
+    route_ready: true,
+    selected_stage_defaults: { strategy_reasoning: "Managed model route" },
     status: "ready",
     tier: "free",
     tier_label: "Free",
-    ...overrides,
-  };
+    user_message: "Model route is ready for this workspace.",
+  } satisfies ProviderStatusResponse;
+  return { ...base, ...overrides } as ProviderStatusResponse;
 }
 
 describe("account UI helpers", () => {
@@ -58,6 +67,26 @@ describe("account UI helpers", () => {
       status: "needs-setup",
       title: "Needs setup",
     });
+  });
+
+  it("derives route readiness for older provider status payloads", () => {
+    const legacyReady = {
+      allowed_message_modes: ["deterministic", "agent"],
+      allowed_run_modes: ["dry-run", "agent", "live-generation"],
+      available: true,
+      available_gateways: [],
+      configured: true,
+      fallback_mode: "deterministic",
+      model_routing_mode: "fixed",
+      reason: null,
+      selected_stage_defaults: {},
+      status: "ready",
+      tier: "free",
+      tier_label: "Free",
+    } satisfies ProviderStatusResponse;
+
+    expect(providerRouteReady(legacyReady)).toBe(true);
+    expect(providerFallbackEnabled(legacyReady)).toBe(false);
   });
 
   it("formats missing usage cost without implying billing precision", () => {

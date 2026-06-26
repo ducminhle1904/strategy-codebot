@@ -19,6 +19,7 @@ from strategy_codebot.live import (
     WORKFLOW_COMPACT_FREE,
     WORKFLOW_MULTI_AGENT,
     WORKFLOW_SINGLE,
+    LiveConfigurationError,
     LiveCredentialError,
     LiveProviderError,
     LiveRunOptions,
@@ -232,6 +233,8 @@ def test_prompt_contracts_include_shared_safety_boundary() -> None:
         assert prompt_contracts.SHARED_SAFETY_BOUNDARY in content
     assert "Take-profit and profit-target rules are allowed" in prompt_contracts.SHARED_SAFETY_BOUNDARY
     assert "Never claim profitability" in prompt_contracts.SHARED_SAFETY_BOUNDARY
+    assert "portfolio-heat" in live_module.CONSERVATIVE_POSITION_SIZING_GUIDANCE
+    assert "correlated positions" in live_module.CONSERVATIVE_POSITION_SIZING_GUIDANCE
 
 
 def test_strategy_response_schema_is_openai_strict_and_nullable_for_optional_fields() -> None:
@@ -267,6 +270,19 @@ def test_stage_validation_normalizes_full_capital_position_sizing() -> None:
     assert "full balance" not in " ".join(normalized["risk_rules"]).lower()
     assert payload["normalizations"][0]["kind"] == "position_sizing"
     assert payload["normalizations"][0]["reason"] == "unsafe_full_capital_position_sizing"
+
+
+def test_stage_validation_adds_risk_concentration_assumption_for_bounded_sizing() -> None:
+    spec = _spec()
+    spec["position_sizing"] = "Risk 1% of account equity per trade."
+    spec["risk_rules"] = ["Use stop-loss and take-profit rules."]
+    payload = _stage_payload("strategy_coding", {"strategy_spec": spec})
+
+    live_module._validate_stage_payload("strategy_coding", payload)
+
+    normalized = payload["output"]["strategy_spec"]
+    assert any("portfolio heat" in rule for rule in normalized["risk_rules"])
+    assert any(action["kind"] == "risk_concentration_assumption" for action in payload["normalizations"])
 
 
 def test_pine_version_header_normalizer_moves_single_v6_directive() -> None:
@@ -883,7 +899,7 @@ def test_openai_style_routes_keep_strict_nullable_schema() -> None:
     assert strategy_spec["properties"]["constraints"]["type"] == ["array", "null"]
 
 
-def test_gateway_route_fallback_skips_missing_proxy_and_uses_openrouter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_paid_live_fails_fast_when_proxy_env_is_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     registry = {
         "defaults": {"temperature": 0.2, "max_retries": 0, "request_timeout_seconds": 60, "require_structured_output": True},
         "model_tiers": {
@@ -912,12 +928,31 @@ def test_gateway_route_fallback_skips_missing_proxy_and_uses_openrouter(monkeypa
     monkeypatch.delenv("LITELLM_PROXY_API_BASE", raising=False)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter")
 
-    result = generate_live("Create a Pine strategy", registry_path, live_options=LiveRunOptions(user_tier="paid_low"))
+    with pytest.raises(LiveConfigurationError) as exc_info:
+        generate_live("Create a Pine strategy", registry_path, live_options=LiveRunOptions(user_tier="paid_low"))
 
-    assert result.stages[0]["gateway"] == "direct"
-    assert calls[0]["model"] == "openrouter/google/gemini-2.5-flash"
-    assert result.attempts[0]["gateway"] == "litellm_proxy"
-    assert result.attempts[0]["missing_credentials"] == ["LITELLM_PROXY_API_KEY", "LITELLM_PROXY_API_BASE"]
+    error = exc_info.value
+    assert calls == []
+    assert error.code == "configuration_error"
+    assert error.attempts[0]["gateway"] == "litellm_proxy"
+    assert error.attempts[0]["failure_class"] == "configuration_error"
+    assert error.attempts[0]["missing_gateway_env"] == ["LITELLM_PROXY_API_KEY", "LITELLM_PROXY_API_BASE"]
+    preflight = error.diagnostics["runtime_preflight"]
+    assert preflight["gateway_configured"] is False
+    assert preflight["runtime_environment"] in {"host", "api_container"}
+    assert preflight["recommended_command"]
+
+
+def test_paid_live_runtime_preflight_passes_when_proxy_env_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = yaml.safe_load(Path("configs/model-registry.example.yaml").read_text(encoding="utf-8"))
+    monkeypatch.setenv("LITELLM_PROXY_API_KEY", "test-proxy")
+    monkeypatch.setenv("LITELLM_PROXY_API_BASE", "https://litellm-proxy.example/v1")
+
+    preflight = live_module._live_runtime_preflight(registry, LiveRunOptions(user_tier="paid_low"))
+
+    assert preflight["gateway_configured"] is True
+    assert preflight["missing_gateway_env"] == []
+    assert preflight["recommended_command"] is None
 
 
 def test_litellm_proxy_calls_include_safe_attribution_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1049,10 +1084,12 @@ def test_generate_live_paid_low_tier_uses_tier_routes(monkeypatch: pytest.Monkey
     result = generate_live("Create a Pine strategy", Path("configs/model-registry.example.yaml"), live_options=LiveRunOptions(user_tier="paid_low"))
 
     assert result.metadata()["user_tier"] == "paid_low"
+    assert result.metadata()["gateway_configured"] is True
+    assert result.metadata()["runtime_environment"] in {"host", "api_container"}
     assert [call["model"] for call in calls] == [
         "openai/paid_low.strategy_reasoning",
         "openai/paid_low.strategy_coding",
-        "openai/paid_low.pine_code_generation",
+        "openai/paid_low.pine_code_generation_qwen",
         "openai/paid_low.balanced_review",
     ]
     assert {stage["gateway"] for stage in result.stages} == {"litellm_proxy"}
@@ -1066,7 +1103,15 @@ def test_generate_live_paid_low_tier_uses_tier_routes(monkeypatch: pytest.Monkey
     assert "openai/paid_medium.pine_code_generation" not in [call["model"] for call in calls]
 
 
-def test_generate_live_paid_low_pine_codegen_falls_back_to_paid_medium_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generate_live_paid_low_pine_codegen_falls_back_to_paid_medium_on_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    registry = yaml.safe_load(Path("configs/model-registry.example.yaml").read_text(encoding="utf-8"))
+    registry["model_tiers"]["paid_low"]["routes_by_stage"]["pine_code_generation"] = [
+        "litellm_proxy/paid_low.pine_code_generation",
+        "litellm_proxy/paid_low.pine_code_generation_qwen",
+        "litellm_proxy/paid_medium.pine_code_generation",
+    ]
+    registry_path = tmp_path / "models.yaml"
+    registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
     options = LiveRunOptions(user_tier="paid_low", knowledge_context="off")
     calls: list[str] = []
 
@@ -1081,8 +1126,8 @@ def test_generate_live_paid_low_pine_codegen_falls_back_to_paid_medium_on_timeou
     monkeypatch.setenv("LITELLM_PROXY_API_KEY", "test-proxy")
     monkeypatch.setenv("LITELLM_PROXY_API_BASE", "https://litellm-proxy.example/v1")
 
-    first = generate_live("Create a Pine strategy", Path("configs/model-registry.example.yaml"), live_options=options)
-    second = generate_live("Create another Pine strategy", Path("configs/model-registry.example.yaml"), live_options=options)
+    first = generate_live("Create a Pine strategy", registry_path, live_options=options)
+    second = generate_live("Create another Pine strategy", registry_path, live_options=options)
 
     first_pine_attempts = [attempt for attempt in first.attempts if attempt.get("stage") == "pine_code_generation"]
     second_pine_attempts = [attempt for attempt in second.attempts if attempt.get("stage") == "pine_code_generation"]
@@ -1119,10 +1164,10 @@ def test_generate_live_skips_persisted_cooldown_route(monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         "strategy_codebot.live.load_persisted_route_health",
         lambda **kwargs: [
-            {
-                "stage": "pine_code_generation",
-                "model": "litellm_proxy/paid_low.pine_code_generation",
-                "route_model": "paid_low.pine_code_generation",
+                {
+                    "stage": "pine_code_generation",
+                    "model": "litellm_proxy/paid_low.pine_code_generation_qwen",
+                    "route_model": "paid_low.pine_code_generation_qwen",
                 "gateway": "litellm_proxy",
                 "provider": "unknown",
                 "failure_count": 2,
@@ -1147,8 +1192,8 @@ def test_generate_live_skips_persisted_cooldown_route(monkeypatch: pytest.Monkey
     pine_attempts = [attempt for attempt in result.attempts if attempt.get("stage") == "pine_code_generation"]
     assert pine_attempts[0]["status"] == "skipped"
     assert pine_attempts[0]["skip_reason"] == "route_cooldown"
-    assert pine_attempts[1]["model"] == "litellm_proxy/paid_low.pine_code_generation_qwen"
-    assert "openai/paid_low.pine_code_generation" not in calls
+    assert pine_attempts[1]["model"] == "litellm_proxy/paid_low.pine_code_generation_vercel"
+    assert "openai/paid_low.pine_code_generation_qwen" not in calls
 
 
 def test_generate_live_paid_low_repair_falls_back_to_paid_medium_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1562,6 +1607,39 @@ def test_generate_live_review_failure_runs_repair_loop(monkeypatch: pytest.Monke
     assert "repair_1" in result.raw_response["stages"]
 
 
+def test_generate_live_uses_static_review_when_validation_blocks_before_review(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    registry = yaml.safe_load(Path("configs/model-registry.example.yaml").read_text(encoding="utf-8"))
+    registry["model_tiers"]["paid_low"]["max_repair_loops"] = 1
+    registry["model_tiers"]["paid_low"]["max_llm_repair_loops"] = 0
+    registry_path = tmp_path / "models.yaml"
+    registry_path.write_text(yaml.safe_dump(registry), encoding="utf-8")
+    calls: list[str] = []
+
+    def completion(**kwargs):
+        name = kwargs["response_format"]["json_schema"]["name"]
+        calls.append(name)
+        payload = _workflow_response_for_name(name)
+        if name == "strategy_codebot_pine_code_generation":
+            payload["output"]["pine_code"] = payload["output"]["pine_code"].replace("//@version=6", "//@version=5", 1)
+        return _response(payload)
+
+    _install_litellm(monkeypatch, completion)
+    _set_quality_env(monkeypatch)
+
+    with pytest.raises(LiveProviderError) as exc:
+        generate_live("Create a Pine strategy", registry_path, save_raw_provider=True)
+
+    diagnostics = exc.value.diagnostics
+    assert "strategy_codebot_balanced_review" not in calls
+    assert "strategy_codebot_repair" not in calls
+    static_review = next(stage for stage in diagnostics["workflow_trace"]["stages"] if stage["stage"] == "balanced_review")
+    assert static_review["model"] == "local/static-balanced-review"
+    assert static_review["review_source"] == "deterministic_static"
+    assert static_review["saved_provider_call"] is True
+    assert diagnostics["final_decision"]["repair_budget_exhausted"] is True
+    assert diagnostics["final_decision"]["provider_calls_saved"] >= 1
+
+
 def test_generate_live_normalizes_license_header_before_pine_validation(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
 
@@ -1580,7 +1658,7 @@ def test_generate_live_normalizes_license_header_before_pine_validation(monkeypa
     result = generate_live("Create a Pine strategy", Path("configs/model-registry.example.yaml"))
 
     assert result.pine_code.startswith("//@version=6")
-    assert result.workflow_trace["normalizations"][0]["stage"] == "pine_code_generation"
+    assert any(action["stage"] == "pine_code_generation" for action in result.workflow_trace["normalizations"])
     assert result.workflow_trace["final_decision"]["validation_status"] == "pass"
 
 
@@ -1608,8 +1686,10 @@ def test_generate_live_allows_review_warnings_when_static_validation_passes(monk
     assert result.production_gate["status"] == "fail"
     assert result.workflow_trace["final_decision"]["status"] == "pass"
     assert result.workflow_trace["final_decision"]["production_gate"]["required_fixes"] == ["add explicit strategy.exit"]
-    assert result.repair_count == 2
-    assert "repair_2" in result.raw_response["stages"]
+    assert result.repair_count == 1
+    assert result.llm_repair_count == 1
+    assert result.repair_budget_exhausted is True
+    assert "repair_2" not in result.raw_response["stages"]
 
 
 def test_generate_live_soft_review_fix_does_not_fail_production(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1716,9 +1796,10 @@ def test_generate_live_review_pass_with_static_failure_gets_deterministic_fix_ev
     assert diagnostics["final_decision"]["required_fixes"]
     assert diagnostics["final_decision"]["blocking_validation_checks"][0]["name"] == "version_header"
     assert diagnostics["final_decision"]["repair_attempts_exhausted"] is True
+    assert diagnostics["final_decision"]["repair_budget_exhausted"] is True
     assert diagnostics["validation_failures"][0]["name"] == "version_header"
     assert diagnostics["repair_history"][-1]["validation_failures"][0]["name"] == "version_header"
-    assert any(action["kind"] == "balanced_review_validation_alignment" for action in diagnostics["normalizations"])
+    assert any(stage.get("review_source") == "deterministic_static" for stage in diagnostics["workflow_trace"]["stages"])
 
 
 def test_generate_live_rejects_schema_invalid_single_response(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,29 +1,43 @@
 import hashlib
 import json
+import math
+import os
 import re
 from copy import deepcopy
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
 from jsonschema import ValidationError, validate
 
 from strategy_codebot.knowledge_context import build_knowledge_context
 from strategy_codebot.mql5 import runner_design
-from strategy_codebot.pine import generate_pine, validate_pine
+from strategy_codebot.pine import generate_pine, validate_pine, validate_pineforge_pine
 from strategy_codebot.review import REVIEW_REPORT_PATH, write_review_report
 from strategy_codebot.schemas import schema
 from strategy_codebot.schemas import write_json
 from strategy_codebot.tool_runtime import POLICY_OBSERVE
+from strategy_codebot.server.action_registry import action_registry_backend_tool_ids
+from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
 from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
 from strategy_codebot.server.ids import opaque_id
+from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
 from strategy_codebot.server.repository import AssistantRunRecord
 from strategy_codebot.server.repository import ConversationRepository
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
 from strategy_codebot.server.run_modes import BACKTEST_MAX_VARIANTS
+from strategy_codebot.server.run_modes import BACKTEST_ENGINE_PINEFORGE
+from strategy_codebot.server.run_modes import BACKTEST_ENGINES
+from strategy_codebot.server.run_modes import BACKTEST_EXECUTABLE_TIMEFRAMES
+from strategy_codebot.server.run_modes import BACKTEST_MAX_COST_BPS
+from strategy_codebot.server.run_modes import BACKTEST_OHLCV_DEFAULT_EXCHANGE
+from strategy_codebot.server.run_modes import BACKTEST_OHLCV_EXCHANGES
+from strategy_codebot.server.run_modes import backtest_default_engine
 from strategy_codebot.server.run_modes import backtest_job_limits_for_tier
 from strategy_codebot.server.run_modes import backtest_runtime_boundary
 from strategy_codebot.server.run_modes import RUN_MODE_DRY_RUN
+from strategy_codebot.server.tool_errors import ToolExecutionError
 
 OBJECT_SCHEMA = {"type": "object"}
 MAX_USER_FACING_SOURCES = 5
@@ -31,15 +45,18 @@ PINE_STRATEGY_PATH = "pine/strategy.pine"
 MQL5_RUNNER_DESIGN_PATH = "mql5/runner-design.md"
 VALIDATION_REPORT_PATH = "validation-report.json"
 BACKTEST_PLAN_PATH = "backtest/backtest-plan.json"
-BACKTEST_PINETS_PREVIEW_PATH = "backtest/pinets-preview-plan.json"
-BACKTEST_SIGNALS_CONTEXT_PATH = "backtest/signals-market-context-plan.json"
-BACKTEST_GRAPH_PIPELINE_PATH = "backtest/graph-pipeline-plan.json"
-BACKTEST_SIDEKICK_EXPORT_PATH = "backtest/sidekick-export-plan.json"
+BACKTEST_PINEFORGE_VALIDATION_PATH = "backtest/pineforge-validation.json"
+BACKTEST_PREVIEW_BOUNDARY_COPY = (
+    "Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, "
+    "or a profitability claim."
+)
 STRATEGY_SPEC_SCHEMA_VERSION = "strategy-spec.schema.json"
 BACKTEST_DEFAULT_CONFIG = {
-    "engine": "backtest-kit",
+    "engine": BACKTEST_ENGINE_PINEFORGE,
+    "exchange": BACKTEST_OHLCV_DEFAULT_EXCHANGE,
     "symbol": "BTC/USDT",
     "timeframe": "1h",
+    "candle_timeframe": "1m",
     "start": "2024-01-01",
     "end": "2024-12-31",
     "initial_capital": 10000,
@@ -73,14 +90,16 @@ BACKTEST_CONFIG_SCHEMA = {
         "data_source",
     ],
     "properties": {
-        "engine": {"type": "string", "const": "backtest-kit"},
-        "symbol": {"type": "string", "minLength": 1},
-        "timeframe": {"type": "string", "minLength": 1},
+        "engine": {"type": "string", "enum": list(BACKTEST_ENGINES)},
+        "exchange": {"type": "string", "enum": list(BACKTEST_OHLCV_EXCHANGES)},
+        "symbol": {"type": "string", "minLength": 1, "maxLength": 64},
+        "timeframe": {"type": "string", "enum": list(BACKTEST_EXECUTABLE_TIMEFRAMES)},
+        "candle_timeframe": {"type": "string", "const": "1m"},
         "start": {"type": "string", "minLength": 1},
         "end": {"type": "string", "minLength": 1},
         "initial_capital": {"type": "number", "exclusiveMinimum": 0},
-        "fee_bps": {"type": "number", "minimum": 0},
-        "slippage_bps": {"type": "number", "minimum": 0},
+        "fee_bps": {"type": "number", "minimum": 0, "maximum": BACKTEST_MAX_COST_BPS},
+        "slippage_bps": {"type": "number", "minimum": 0, "maximum": BACKTEST_MAX_COST_BPS},
         "data_source": {"type": "string", "const": "public-readonly-cache"},
     },
 }
@@ -88,89 +107,6 @@ BACKTEST_CONFIG_OVERRIDES_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": BACKTEST_CONFIG_SCHEMA["properties"],
-}
-BACKTEST_STRATEGY_LOGIC_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["logic_version", "position", "indicators", "entry", "exit", "risk"],
-    "properties": {
-        "logic_version": {"type": "string", "const": "backtest-strategy-logic.v1"},
-        "position": {"type": "string", "const": "long"},
-        "indicators": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["fast_ema", "slow_ema"],
-            "properties": {
-                "fast_ema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["kind", "period", "source"],
-                    "properties": {
-                        "kind": {"type": "string", "const": "ema"},
-                        "period": {"type": "integer", "minimum": 2, "maximum": 500},
-                        "source": {"type": "string", "const": "close"},
-                    },
-                },
-                "slow_ema": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["kind", "period", "source"],
-                    "properties": {
-                        "kind": {"type": "string", "const": "ema"},
-                        "period": {"type": "integer", "minimum": 2, "maximum": 500},
-                        "source": {"type": "string", "const": "close"},
-                    },
-                },
-                "rsi": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "required": ["kind", "period", "source"],
-                    "properties": {
-                        "kind": {"type": "string", "const": "rsi"},
-                        "period": {"type": "integer", "minimum": 2, "maximum": 500},
-                        "source": {"type": "string", "const": "close"},
-                    },
-                },
-            },
-        },
-        "entry": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["all"],
-            "properties": {
-                "all": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["type", "left", "right"],
-                        "properties": {
-                            "type": {"type": "string", "enum": ["crossover", "crossunder", "greater_than", "less_than"]},
-                            "left": {"type": "string", "minLength": 1},
-                            "right": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "number"}]},
-                        },
-                    },
-                }
-            },
-        },
-        "exit": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["take_profit_pct", "stop_loss_pct", "max_holding_minutes"],
-            "properties": {
-                "take_profit_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
-                "stop_loss_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100},
-                "max_holding_minutes": {"type": "integer", "minimum": 1},
-            },
-        },
-        "risk": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["cost"],
-            "properties": {"cost": {"type": "number", "exclusiveMinimum": 0}},
-        },
-    },
 }
 
 
@@ -200,7 +136,11 @@ class ToolExecutionContext:
 TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
     "generate_pine": ToolDefinition(
         name="generate_pine",
-        description="Generate Pine Script v6 from a validated strategy spec.",
+        description=(
+            "Generate Pine Script v6 from a validated strategy spec. If the spec uses fixed cash/notional sizing "
+            "(for example $1,000 per trade), do not encode it as strategy.fixed default_qty_value; compute an "
+            "explicit qty such as cash_per_trade / close and pass that qty to strategy.entry."
+        ),
         parameters={
             "type": "object",
             "additionalProperties": False,
@@ -265,37 +205,43 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
     ),
     "create_backtest_plan": ToolDefinition(
         name="create_backtest_plan",
-        description="Create a Backtest Kit local preview plan, normalized backtest_config, and executable strategy_logic DSL from a user prompt.",
+        description="Create a local sandbox preview plan from model-generated PineScript v6 strategy source.",
         parameters={
             "type": "object",
             "additionalProperties": False,
-            "required": ["prompt", "strategy_spec"],
+            "required": ["prompt", "strategy_spec", "pine_code"],
             "properties": {
                 "prompt": {"type": "string", "minLength": 1},
                 "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                "strategy_logic": BACKTEST_STRATEGY_LOGIC_SCHEMA,
+                "pine_code": {"type": "string", "minLength": 1},
                 "backtest_config": BACKTEST_CONFIG_OVERRIDES_SCHEMA,
             },
         },
     ),
     "run_backtest_preview": ToolDefinition(
         name="run_backtest_preview",
-        description="Queue a sandboxed Backtest Kit local preview run. Prefer executable strategy_logic DSL for model-generated EMA/RSI strategies.",
+        description="Queue a sandboxed local Pine preview run from PineScript v6 strategy source.",
         parameters={
             "type": "object",
             "additionalProperties": False,
-            "required": ["strategy_spec", "backtest_config"],
+            "required": ["approval_id", "strategy_spec", "pine_code", "backtest_config"],
             "properties": {
+                "approval_id": {"type": "string", "minLength": 1},
                 "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                "strategy_logic": BACKTEST_STRATEGY_LOGIC_SCHEMA,
+                "pine_code": {"type": "string", "minLength": 1},
                 "backtest_config": BACKTEST_CONFIG_SCHEMA,
                 "prompt": {"type": "string"},
+                "auto_chain": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {"summary_on_complete": {"type": "boolean"}},
+                },
             },
         },
     ),
     "run_backtest_variant_lab": ToolDefinition(
         name="run_backtest_variant_lab",
-        description="Queue multiple comparable Backtest Kit local preview variants with shared cache metadata.",
+        description="Queue multiple comparable local preview variants with shared cache metadata.",
         parameters={
             "type": "object",
             "additionalProperties": False,
@@ -303,7 +249,7 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
             "properties": {
                 "prompt": {"type": "string", "minLength": 1},
                 "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                "strategy_logic": BACKTEST_STRATEGY_LOGIC_SCHEMA,
+                "pine_code": {"type": "string", "minLength": 1},
                 "base_backtest_config": BACKTEST_CONFIG_SCHEMA,
                 "variants": {
                     "type": "array",
@@ -316,7 +262,7 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
                         "properties": {
                             "name": {"type": "string", "minLength": 1},
                             "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                            "strategy_logic": BACKTEST_STRATEGY_LOGIC_SCHEMA,
+                            "pine_code": {"type": "string", "minLength": 1},
                             "backtest_config": BACKTEST_CONFIG_OVERRIDES_SCHEMA,
                         },
                     },
@@ -324,76 +270,48 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
             },
         },
     ),
-    "create_pinets_preview_plan": ToolDefinition(
-        name="create_pinets_preview_plan",
-        description="Create a PineTS local preview plan using @backtest-kit/pinets; label it explicitly as not TradingView validation.",
+    "get_backtest_summary": ToolDefinition(
+        name="get_backtest_summary",
+        description="Fetch bounded DB-indexed backtest report summary for model critique without loading raw artifacts.",
         parameters={
             "type": "object",
             "additionalProperties": False,
-            "required": ["prompt", "strategy_spec"],
+            "required": ["run_id"],
+            "properties": {"run_id": {"type": "string", "minLength": 1}},
+        },
+    ),
+    "query_backtest_trades": ToolDefinition(
+        name="query_backtest_trades",
+        description="Fetch bounded indexed trades for a completed backtest report.",
+        parameters={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["run_id"],
             "properties": {
-                "prompt": {"type": "string", "minLength": 1},
-                "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                "pine_code": {"type": "string"},
-                "backtest_config": BACKTEST_CONFIG_OVERRIDES_SCHEMA,
+                "run_id": {"type": "string", "minLength": 1},
+                "bucket": {"type": "string", "enum": ["top_loser", "top_winner", "sample"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
             },
         },
     ),
-    "create_signals_market_context_plan": ToolDefinition(
-        name="create_signals_market_context_plan",
-        description="Create an LLM-ready market-context plan using @backtest-kit/signals without routing model calls through Backtest Kit.",
+    "build_robustness_report": ToolDefinition(
+        name="build_robustness_report",
+        description="Build a review-only robustness report from a completed local backtest preview.",
         parameters={
             "type": "object",
             "additionalProperties": False,
-            "required": ["prompt"],
-            "properties": {
-                "prompt": {"type": "string", "minLength": 1},
-                "symbol": {"type": "string"},
-                "backtest_config": BACKTEST_CONFIG_OVERRIDES_SCHEMA,
-                "sections": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "default": ["order_book", "1m_history", "15m_history", "30m_history", "1h_history", "indicators"],
-                },
-            },
+            "required": ["run_id"],
+            "properties": {"run_id": {"type": "string", "minLength": 1}},
         },
     ),
-    "create_graph_pipeline_plan": ToolDefinition(
-        name="create_graph_pipeline_plan",
-        description="Create a multi-timeframe strategy pipeline plan using @backtest-kit/graph for variant composition.",
+    "get_equity_curve_sample": ToolDefinition(
+        name="get_equity_curve_sample",
+        description="Fetch downsampled DB-indexed equity curve summary for a completed backtest.",
         parameters={
             "type": "object",
             "additionalProperties": False,
-            "required": ["prompt", "strategy_spec"],
-            "properties": {
-                "prompt": {"type": "string", "minLength": 1},
-                "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                "base_backtest_config": BACKTEST_CONFIG_SCHEMA,
-                "timeframes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "default": ["4h", "15m"],
-                },
-                "variants": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "default": [],
-                },
-            },
-        },
-    ),
-    "create_sidekick_export_plan": ToolDefinition(
-        name="create_sidekick_export_plan",
-        description="Create a Sidekick export/scaffold plan; Sidekick is not used inside API runtime.",
-        parameters={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["prompt", "strategy_spec"],
-            "properties": {
-                "prompt": {"type": "string", "minLength": 1},
-                "strategy_spec": STRATEGY_SPEC_SCHEMA,
-                "project_name": {"type": "string"},
-            },
+            "required": ["run_id"],
+            "properties": {"run_id": {"type": "string", "minLength": 1}},
         },
     ),
 }
@@ -543,21 +461,31 @@ def _knowledge_check_tool(arguments: dict[str, Any], context: ToolExecutionConte
 
 
 def _knowledge_proposal_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    filename = "knowledge-proposal.json"
     proposal = {
         "status": "manual_review_required",
         "summary": arguments["summary"],
         "recommendations": ["Review this proposal before changing knowledge documents."],
     }
     out_dir = context.artifact_store.run_dir(context.run.id)
-    path = out_dir / "knowledge-proposal.json"
+    path = out_dir / filename
+    candidate = KnowledgeLearningService(context.repository, context.artifact_store).propose_candidate(
+        lesson=arguments["summary"],
+        evidence_ref=f"run:{context.run.id}:knowledge_proposal",
+        candidate_type="episodic",
+        source_uri=f"run:{context.run.id}:knowledge_proposal",
+        metadata={"source": "knowledge_proposal_tool"},
+    )
+    proposal["candidate_id"] = candidate["candidate_id"]
+    proposal["candidate_status"] = candidate["status"]
     write_json(path, proposal)
     artifact = context.repository.create_artifact(
         context.auth,
         context.run.id,
         kind="knowledge_proposal",
         mime_type="application/json",
-        display_name="knowledge-proposal.json",
-        storage_key=context.artifact_store.storage_key(context.run.id, "knowledge-proposal.json"),
+        display_name=filename,
+        storage_key=context.artifact_store.storage_key(context.run.id, filename),
         metadata_json={"source": "llm_orchestrator"},
     )
     if artifact is not None:
@@ -567,37 +495,59 @@ def _knowledge_proposal_tool(arguments: dict[str, Any], context: ToolExecutionCo
             "artifact.created",
             {"artifact_id": artifact.id, "kind": artifact.kind, "display_name": artifact.display_name},
         )
-    return {"proposal": proposal, "artifact_id": artifact.id if artifact else None}
+    if not candidate.get("deduped"):
+        context.repository.append_run_event(
+            context.auth,
+            context.run.id,
+            "knowledge.candidate.created",
+            candidate,
+        )
+    return {"proposal": proposal, "artifact_id": artifact.id if artifact else None, "candidate_id": candidate["candidate_id"], "status": candidate["status"]}
 
 
 def _create_backtest_plan_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
     prompt = arguments["prompt"]
     strategy_spec = arguments["strategy_spec"]
+    approval_id = opaque_id("approval")
     backtest_config = _build_backtest_config(
         prompt,
         strategy_spec=strategy_spec,
         overrides=arguments.get("backtest_config"),
     )
-    strategy_logic = _build_backtest_strategy_logic(strategy_spec, backtest_config, arguments.get("strategy_logic"))
+    pine_code = _required_pineforge_pine(arguments.get("pine_code"), strategy_spec)
+    validation = validate_pineforge_pine(pine_code, strategy_spec)
+    pine_artifact, validation_artifact = _persist_pineforge_validation_artifacts(
+        context,
+        pine_code=pine_code,
+        validation=validation,
+        source="llm_orchestrator.create_backtest_plan.pineforge",
+    )
+    if validation["status"] == "fail":
+        _raise_pine_validation_error(
+            message="Backtest plan failed because local Pine validation failed.",
+            pine_artifact_id=pine_artifact.id if pine_artifact else None,
+            validation_artifact_id=validation_artifact.id if validation_artifact else None,
+            validation=validation,
+        )
     plan = {
         "kind": "backtest_plan",
-        "engine": "backtest-kit",
+        "approval_id": approval_id,
+        "approval_status": "pending",
+        "requires_user_approval": True,
         "prompt": prompt,
         "strategy_spec": strategy_spec,
-        "strategy_logic": strategy_logic,
-        "execution_semantics": "semantic_strategy_logic",
-        "backtest_config": backtest_config,
+        "pine_code": pine_code,
+        "pine_code_artifact_id": pine_artifact.id if pine_artifact else None,
+        "validation_artifact_id": validation_artifact.id if validation_artifact else None,
+        "backtest_config": _user_facing_backtest_config(backtest_config),
         "assumptions": [
-            "Backtest Kit output is local preview evidence only.",
+            "Local sandbox preview output is review-only evidence.",
             "Public read-only market data and cache are used; no broker, paper, or live execution is allowed.",
-            "Fee and slippage are explicit inputs and may not match any venue's final execution semantics.",
-            "strategy_logic is a constrained deterministic DSL; arbitrary model-generated code is not executed.",
+            "The model-generated PineScript is statically guarded before local preview.",
         ],
         "warnings": [
-            "This is not TradingView proof, MQL5 proof, or live-trading evidence.",
-            "Review the generated report artifacts before changing strategy logic.",
+            BACKTEST_PREVIEW_BOUNDARY_COPY,
         ],
-        "runtime_boundary": backtest_runtime_boundary(),
     }
     artifact = _persist_json_artifact(
         context,
@@ -607,38 +557,279 @@ def _create_backtest_plan_tool(arguments: dict[str, Any], context: ToolExecution
         payload=plan,
         source="llm_orchestrator.create_backtest_plan",
     )
+    context.repository.append_run_event(
+        context.auth,
+        context.run.id,
+        "backtest.preview.approval_required",
+        {
+            "approval_id": approval_id,
+            "artifact_id": artifact.id if artifact else None,
+            "requires_user_approval": True,
+            "status": "pending",
+            "symbol": backtest_config["symbol"],
+            "timeframe": backtest_config["timeframe"],
+            "boundary": BACKTEST_PREVIEW_BOUNDARY_COPY,
+        },
+    )
     return {
-        "backtest_config": backtest_config,
-        "strategy_logic": strategy_logic,
-        "execution_semantics": plan["execution_semantics"],
+        "approval_id": approval_id,
+        "approval_status": "pending",
+        "requires_user_approval": True,
+        "strategy_spec": strategy_spec,
+        "backtest_config": _user_facing_backtest_config(backtest_config),
+        "pine_code": pine_code,
+        "validation": validation,
         "artifact_id": artifact.id if artifact else None,
+        "pine_code_artifact_id": pine_artifact.id if pine_artifact else None,
         "warnings": plan["warnings"],
         "assumptions": plan["assumptions"],
     }
 
 
 def _run_backtest_preview_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    approval_id = str(arguments.get("approval_id") or "").strip()
+    if not approval_id:
+        raise ValueError("run_backtest_preview requires an approved backtest approval_id")
+    _ensure_backtest_preview_approved(context, approval_id)
+    config = _normalize_backtest_config(arguments["backtest_config"])
+    pine_code = _required_pineforge_pine(arguments.get("pine_code"), arguments["strategy_spec"])
+    validation = validate_pineforge_pine(pine_code, arguments["strategy_spec"])
+    pine_artifact, validation_artifact = _persist_pineforge_validation_artifacts(
+        context,
+        pine_code=pine_code,
+        validation=validation,
+        source="llm_orchestrator.run_backtest_preview.pineforge",
+    )
+    if validation["status"] == "fail":
+        _raise_pine_validation_error(
+            message="Backtest preview failed because local Pine validation failed.",
+            pine_artifact_id=pine_artifact.id if pine_artifact else None,
+            validation_artifact_id=validation_artifact.id if validation_artifact else None,
+            validation=validation,
+        )
     queued = _queue_backtest_preview(
         context,
         strategy_spec=arguments["strategy_spec"],
-        strategy_logic=_build_backtest_strategy_logic(
-            arguments["strategy_spec"],
-            arguments["backtest_config"],
-            arguments.get("strategy_logic"),
-        ),
-        backtest_config=arguments["backtest_config"],
-        metadata={"source_tool": "run_backtest_preview", "prompt": arguments.get("prompt")},
+        backtest_config=config,
+        metadata={
+            "source_tool": "run_backtest_preview",
+            "prompt": arguments.get("prompt"),
+            "approval_id": approval_id,
+        },
+        pine_code=pine_code,
+        auto_chain=arguments.get("auto_chain") if isinstance(arguments.get("auto_chain"), dict) else None,
     )
     return {
         "run_id": queued["run_id"],
         "job_id": queued["job_id"],
         "status": "queued",
         "mode": RUN_MODE_BACKTEST_PREVIEW,
-        "backtest_config": queued["backtest_config"],
-        "strategy_logic": queued["strategy_logic"],
-        "execution_semantics": "semantic_strategy_logic",
-        "evidence_label": "Backtest Kit local preview evidence only",
+        "backtest_config": _user_facing_backtest_config(queued["backtest_config"]),
+        "evidence_label": "Local sandbox preview evidence only",
+        "validation": validation,
     }
+
+
+def decide_backtest_preview_approval(
+    repository: ConversationRepository,
+    artifact_store: LocalArtifactStore,
+    auth: AuthContext,
+    *,
+    conversation_id: str,
+    approval_id: str,
+    decision: str,
+) -> dict[str, Any]:
+    approval_id = approval_id.strip()
+    decision = decision.strip().lower()
+    if decision not in {"approved", "rejected"}:
+        raise ValueError("decision must be approved or rejected")
+    plan_record = _find_backtest_plan_for_approval(repository, artifact_store, auth, conversation_id, approval_id)
+    plan = plan_record["plan"]
+    source_run = plan_record["run"]
+    status = _backtest_preview_approval_status(plan_record["events"], approval_id)
+    if status == "queued":
+        return {
+            "approval_id": approval_id,
+            "conversation_id": conversation_id,
+            "decision": "approved",
+            "status": "queued",
+            "run_id": plan_record["queued_run_id"],
+            "job_id": plan_record["queued_job_id"],
+            "backtest_config": plan.get("backtest_config"),
+        }
+    if status == "rejected" and decision == "approved":
+        raise ValueError("Backtest approval was already rejected")
+    if status == "approved" and decision == "rejected":
+        raise ValueError("Backtest approval was already approved")
+    if decision == "rejected":
+        repository.append_run_event(
+            auth,
+            source_run.id,
+            "backtest.preview.rejected",
+            {
+                "approval_id": approval_id,
+                "artifact_id": plan_record["artifact_id"],
+                "status": "rejected",
+                "boundary": BACKTEST_PREVIEW_BOUNDARY_COPY,
+            },
+        )
+        return {
+            "approval_id": approval_id,
+            "conversation_id": conversation_id,
+            "decision": decision,
+            "status": "rejected",
+            "backtest_config": plan.get("backtest_config"),
+        }
+
+    repository.append_run_event(
+        auth,
+        source_run.id,
+        "backtest.preview.approved",
+        {
+            "approval_id": approval_id,
+            "artifact_id": plan_record["artifact_id"],
+            "status": "approved",
+            "boundary": BACKTEST_PREVIEW_BOUNDARY_COPY,
+        },
+    )
+    context = ToolExecutionContext(
+        repository=repository,
+        artifact_store=artifact_store,
+        auth=auth,
+        run=source_run,
+    )
+    try:
+        queued = _queue_backtest_preview(
+            context,
+            strategy_spec=plan["strategy_spec"],
+            backtest_config=_normalize_backtest_config(plan["backtest_config"]),
+            metadata={
+                "source_tool": "confirm_backtest_preview",
+                "approval_id": approval_id,
+                "backtest_plan_artifact_id": plan_record["artifact_id"],
+            },
+            pine_code=plan["pine_code"],
+            auto_chain={"summary_on_complete": True},
+        )
+    except Exception as exc:
+        repository.append_run_event(
+            auth,
+            source_run.id,
+            "backtest.preview.failed",
+            {
+                "approval_id": approval_id,
+                "artifact_id": plan_record["artifact_id"],
+                "error": exc.__class__.__name__,
+                "message": str(exc),
+                "boundary": BACKTEST_PREVIEW_BOUNDARY_COPY,
+            },
+        )
+        raise
+    queued_payload = {
+        "approval_id": approval_id,
+        "artifact_id": plan_record["artifact_id"],
+        "child_run_id": queued["run_id"],
+        "job_id": queued["job_id"],
+        "status": "queued",
+        "boundary": BACKTEST_PREVIEW_BOUNDARY_COPY,
+    }
+    repository.append_run_event(auth, source_run.id, "backtest.preview.queued", queued_payload)
+    repository.append_run_event(
+        auth,
+        source_run.id,
+        "chat.auto_chain.waiting_for_backtest",
+        {"child_run_id": queued["run_id"], "status": "queued", "approval_id": approval_id},
+    )
+    return {
+        "approval_id": approval_id,
+        "conversation_id": conversation_id,
+        "decision": decision,
+        "status": "queued",
+        "run_id": queued["run_id"],
+        "job_id": queued["job_id"],
+        "backtest_config": _user_facing_backtest_config(queued["backtest_config"]),
+    }
+
+
+def _ensure_backtest_preview_approved(context: ToolExecutionContext, approval_id: str) -> None:
+    snapshot = context.repository.get_conversation_state_snapshot(
+        context.auth,
+        context.run.conversation_id,
+        event_limit=500,
+    )
+    if snapshot is None:
+        raise ValueError("Conversation not found for backtest approval")
+    status = _backtest_preview_approval_status(snapshot.conversation_run_events, approval_id)
+    if status not in {"approved", "queued"}:
+        raise ValueError("run_backtest_preview is blocked until the user approves the backtest plan")
+
+
+def _find_backtest_plan_for_approval(
+    repository: ConversationRepository,
+    artifact_store: LocalArtifactStore,
+    auth: AuthContext,
+    conversation_id: str,
+    approval_id: str,
+) -> dict[str, Any]:
+    snapshot = repository.get_conversation_state_snapshot(auth, conversation_id, event_limit=500)
+    if snapshot is None:
+        raise ValueError("Conversation not found")
+    for artifact in snapshot.conversation_artifacts:
+        if artifact.kind != "backtest_plan":
+            continue
+        content = artifact_store.read_content(artifact)
+        if not isinstance(content, dict) or content.get("approval_id") != approval_id:
+            continue
+        run = repository.get_run(auth, artifact.run_id) if artifact.run_id else None
+        if run is None:
+            raise ValueError("Backtest plan source run not found")
+        if not isinstance(content.get("strategy_spec"), dict) or not isinstance(content.get("backtest_config"), dict):
+            raise ValueError("Backtest plan artifact is incomplete")
+        if not isinstance(content.get("pine_code"), str) or not content["pine_code"].strip():
+            raise ValueError("Backtest plan artifact is missing Pine source")
+        queued_run_id, queued_job_id = _queued_backtest_preview_for_approval(
+            snapshot.conversation_run_events,
+            approval_id,
+        )
+        return {
+            "artifact_id": artifact.id,
+            "plan": content,
+            "run": run,
+            "events": snapshot.conversation_run_events,
+            "queued_run_id": queued_run_id,
+            "queued_job_id": queued_job_id,
+        }
+    raise ValueError("Backtest approval not found")
+
+
+def _backtest_preview_approval_status(events: list[Any], approval_id: str) -> str:
+    status = "pending"
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if payload.get("approval_id") != approval_id:
+            continue
+        if event.type == "backtest.preview.rejected":
+            status = "rejected"
+        elif event.type == "backtest.preview.queued":
+            status = "queued"
+        elif event.type == "backtest.preview.approved" and status != "queued":
+            status = "approved"
+        elif event.type == "backtest.preview.approval_required" and status == "pending":
+            status = "pending"
+    return status
+
+
+def _queued_backtest_preview_for_approval(events: list[Any], approval_id: str) -> tuple[str | None, str | None]:
+    for event in reversed(events):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.type == "backtest.preview.queued" and payload.get("approval_id") == approval_id:
+            child_run_id = payload.get("child_run_id")
+            job_id = payload.get("job_id")
+            return (
+                child_run_id if isinstance(child_run_id, str) else None,
+                job_id if isinstance(job_id, str) else None,
+            )
+    return None, None
 
 
 def _run_backtest_variant_lab_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
@@ -646,18 +837,23 @@ def _run_backtest_variant_lab_tool(arguments: dict[str, Any], context: ToolExecu
         raise ValueError(f"Backtest variant limit exceeded: {BACKTEST_MAX_VARIANTS}")
     group_id = opaque_id("variant")
     base_config = _normalize_backtest_config(arguments["base_backtest_config"])
-    shared_cache_key = _backtest_cache_key(base_config)
+    prepared_variants = [
+        (
+            index,
+            variant,
+            variant.get("strategy_spec") or arguments["strategy_spec"],
+            _normalize_backtest_config({**base_config, **variant.get("backtest_config", {})}),
+        )
+        for index, variant in enumerate(arguments["variants"])
+    ]
+    cache_keys = [_backtest_cache_key(config) for _index, _variant, _variant_spec, config in prepared_variants]
+    shared_cache_key = cache_keys[0] if len(set(cache_keys)) == 1 else None
     queued_variants: list[dict[str, Any]] = []
-    for index, variant in enumerate(arguments["variants"]):
-        config = _normalize_backtest_config({**base_config, **variant.get("backtest_config", {})})
+    for (index, variant, variant_spec, config), variant_cache_key in zip(prepared_variants, cache_keys):
+        variant_pine_code = _required_pineforge_pine(variant.get("pine_code") or arguments.get("pine_code"), variant_spec)
         queued = _queue_backtest_preview(
             context,
-            strategy_spec=variant.get("strategy_spec") or arguments["strategy_spec"],
-            strategy_logic=_build_backtest_strategy_logic(
-                variant.get("strategy_spec") or arguments["strategy_spec"],
-                config,
-                variant.get("strategy_logic") or arguments.get("strategy_logic"),
-            ),
+            strategy_spec=variant_spec,
             backtest_config=config,
             metadata={
                 "source_tool": "run_backtest_variant_lab",
@@ -666,7 +862,9 @@ def _run_backtest_variant_lab_tool(arguments: dict[str, Any], context: ToolExecu
                 "variant_index": index,
                 "variant_name": variant["name"],
                 "shared_cache_key": shared_cache_key,
+                "variant_cache_key": variant_cache_key,
             },
+            pine_code=variant_pine_code,
         )
         queued_variants.append(
             {
@@ -674,20 +872,21 @@ def _run_backtest_variant_lab_tool(arguments: dict[str, Any], context: ToolExecu
                 "run_id": queued["run_id"],
                 "job_id": queued["job_id"],
                 "status": "queued",
-                "backtest_config": config,
-                "strategy_logic": queued["strategy_logic"],
+                "backtest_config": _user_facing_backtest_config(config),
+                "cache_key": variant_cache_key,
             }
         )
     comparison = {
         "kind": "backtest_variant_comparison",
         "variant_group_id": group_id,
         "shared_cache_key": shared_cache_key,
+        "shared_cache": shared_cache_key is not None,
         "prompt": arguments["prompt"],
-        "base_backtest_config": base_config,
+        "base_backtest_config": _user_facing_backtest_config(base_config),
         "variants": queued_variants,
         "warnings": [
             "Variant results are comparable only after every queued child run completes.",
-            "Backtest Kit output is local preview evidence only, not TradingView, MQL5, or live-trading proof.",
+            "Local sandbox preview output is review-only evidence, not TradingView official validation, broker proof, or live-trading proof.",
         ],
     }
     artifact = _persist_json_artifact(
@@ -701,209 +900,266 @@ def _run_backtest_variant_lab_tool(arguments: dict[str, Any], context: ToolExecu
     return {
         "variant_group_id": group_id,
         "shared_cache_key": shared_cache_key,
+        "shared_cache": shared_cache_key is not None,
         "artifact_id": artifact.id if artifact else None,
         "variants": queued_variants,
     }
 
 
-def _create_pinets_preview_plan_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
-    strategy_spec = arguments["strategy_spec"]
-    config = _build_backtest_config(
-        arguments["prompt"],
-        strategy_spec=strategy_spec,
-        overrides=arguments.get("backtest_config"),
-    )
-    pine_code = arguments.get("pine_code") or generate_pine(strategy_spec)
-    plan = {
-        "kind": "backtest_pinets_preview",
-        "package": "@backtest-kit/pinets",
-        "package_version": "14.0.0",
-        "evidence_label": "PineTS local preview only",
-        "not_evidence": ["TradingView validation", "MQL5 proof", "live-trading evidence", "profitability claim"],
-        "prompt": arguments["prompt"],
-        "backtest_config": config,
-        "strategy_spec": strategy_spec,
-        "pine_source": pine_code,
-        "expected_runtime": {
-            "imports": ["Code", "getSignal", "run", "extract", "extractRows", "toMarkdown"],
-            "source": "Code.fromString(pine_source)",
-            "safe_default": "getSignal(source, { symbol, timeframe, limit })",
-            "required_signal_plots": ["Signal", "Close", "StopLoss", "TakeProfit", "EstimatedTime"],
-        },
-        "warnings": [
-            "PineTS preview runs Pine syntax locally and is not TradingView validation.",
-            "Use TradingView/manual proof separately before claiming TradingView parity.",
-            "No broker, paper, live execution, Telegram alerts, or Docker live mode is allowed.",
-        ],
+def _get_backtest_summary_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    requested_run_id = arguments["run_id"]
+    run_id = context.repository.resolve_backtest_report_run_id(context.auth, context.run.conversation_id, requested_run_id)
+    if run_id is None:
+        return {"status": "not_found", "run_id": requested_run_id}
+    summary = context.repository.get_backtest_summary(context.auth, run_id)
+    if summary is None:
+        return {"status": "not_found", "run_id": requested_run_id}
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "requested_run_id": requested_run_id,
+        "fallback_used": run_id != requested_run_id,
+        "summary": _user_facing_backtest_summary(summary),
     }
+
+
+def _query_backtest_trades_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    requested_run_id = arguments["run_id"]
+    run_id = context.repository.resolve_backtest_report_run_id(context.auth, context.run.conversation_id, requested_run_id)
+    if run_id is None:
+        return {"status": "not_found", "run_id": requested_run_id, "trades": []}
+    trades = context.repository.query_backtest_trades(
+        context.auth,
+        run_id,
+        bucket=arguments.get("bucket"),
+        limit=int(arguments.get("limit") or 20),
+    )
+    if trades is None:
+        return {"status": "not_found", "run_id": requested_run_id, "trades": []}
+    return {
+        "status": "ok",
+        "run_id": run_id,
+        "requested_run_id": requested_run_id,
+        "fallback_used": run_id != requested_run_id,
+        "trades": trades,
+    }
+
+
+def _build_robustness_report_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    requested_run_id = arguments["run_id"]
+    run_id = context.repository.resolve_backtest_report_run_id(context.auth, context.run.conversation_id, requested_run_id)
+    if run_id is None:
+        return {"status": "not_found", "run_id": requested_run_id}
+    summary = context.repository.get_backtest_summary(context.auth, run_id)
+    if summary is None:
+        return {"status": "not_found", "run_id": requested_run_id}
+    sample_trades = context.repository.query_backtest_trades(context.auth, run_id, bucket="sample", limit=20) or []
+    top_losers = context.repository.query_backtest_trades(context.auth, run_id, bucket="top_loser", limit=5) or []
+    top_winners = context.repository.query_backtest_trades(context.auth, run_id, bucket="top_winner", limit=5) or []
+    equity_summary = context.repository.get_backtest_equity_summary(context.auth, run_id)
+    report = _build_robustness_payload(
+        run_id=run_id,
+        requested_run_id=requested_run_id,
+        summary=_user_facing_backtest_summary(summary),
+        sample_trades=sample_trades,
+        top_losers=top_losers,
+        top_winners=top_winners,
+        equity_summary=_user_facing_backtest_summary(equity_summary) if equity_summary is not None else None,
+    )
     artifact = _persist_json_artifact(
         context,
-        kind="backtest_pinets_preview",
-        display_name="PineTS local preview plan",
-        relative_path=BACKTEST_PINETS_PREVIEW_PATH,
-        payload=plan,
-        source="llm_orchestrator.create_pinets_preview_plan",
+        kind=ROBUSTNESS_REPORT_ARTIFACT_KIND,
+        display_name="Robustness Report",
+        relative_path=f"backtest/robustness-report-{opaque_id('robust')}.json",
+        payload=report,
+        source="llm_tools.build_robustness_report",
     )
     return {
+        "status": "ok",
+        "run_id": run_id,
+        "requested_run_id": requested_run_id,
+        "fallback_used": run_id != requested_run_id,
         "artifact_id": artifact.id if artifact else None,
-        "evidence_label": plan["evidence_label"],
-        "backtest_config": config,
-        "warnings": plan["warnings"],
+        "robustness_report": report,
     }
 
 
-def _create_signals_market_context_plan_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
-    config = _normalize_backtest_config(arguments.get("backtest_config") or {})
-    symbol = str(arguments.get("symbol") or config["symbol"]).strip().upper()
-    sections = arguments.get("sections") or ["order_book", "1m_history", "15m_history", "30m_history", "1h_history", "indicators"]
-    plan = {
-        "kind": "backtest_signals_context",
-        "package": "@backtest-kit/signals",
-        "package_version": "14.0.0",
-        "prompt": arguments["prompt"],
-        "symbol": symbol,
-        "llm_context_shape": {
-            "primary_call": "commitHistorySetup(symbol, messages)",
-            "granular_calls": [
-                "commitBookDataReport",
-                "commitOneMinuteHistory",
-                "commitFifteenMinuteHistory",
-                "commitThirtyMinuteHistory",
-                "commitHourHistory",
-                "commitMicroTermMath",
-                "commitShortTermMath",
-                "commitSwingTermMath",
-                "commitLongTermMath",
-            ],
-            "requested_sections": sections,
-        },
-        "routing_policy": {
-            "model_routing_owner": "strategy-codebot",
-            "backtest_kit_ollama": "excluded_from_initial_runtime",
-            "market_context_only": True,
-        },
-        "warnings": [
-            "Signals output is LLM-ready market context, not trading advice or execution evidence.",
-            "Model routing remains inside strategy-codebot; @backtest-kit/ollama is intentionally not used.",
-        ],
-    }
-    artifact = _persist_json_artifact(
-        context,
-        kind="backtest_signals_context",
-        display_name="Backtest Kit signals market context plan",
-        relative_path=BACKTEST_SIGNALS_CONTEXT_PATH,
-        payload=plan,
-        source="llm_orchestrator.create_signals_market_context_plan",
-    )
+def _get_equity_curve_sample_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    requested_run_id = arguments["run_id"]
+    run_id = context.repository.resolve_backtest_report_run_id(context.auth, context.run.conversation_id, requested_run_id)
+    if run_id is None:
+        return {"status": "not_found", "run_id": requested_run_id}
+    summary = context.repository.get_backtest_equity_summary(context.auth, run_id)
+    if summary is None:
+        return {"status": "not_found", "run_id": requested_run_id}
     return {
-        "artifact_id": artifact.id if artifact else None,
-        "package": plan["package"],
-        "symbol": symbol,
-        "warnings": plan["warnings"],
+        "status": "ok",
+        "run_id": run_id,
+        "requested_run_id": requested_run_id,
+        "fallback_used": run_id != requested_run_id,
+        "equity_summary": summary,
     }
 
 
-def _create_graph_pipeline_plan_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
-    timeframes = arguments.get("timeframes") or ["4h", "15m"]
-    variants = arguments.get("variants") or []
-    base_config = (
-        _normalize_backtest_config(arguments["base_backtest_config"])
-        if arguments.get("base_backtest_config")
-        else _build_backtest_config(arguments["prompt"], strategy_spec=arguments["strategy_spec"])
+def _build_robustness_payload(
+    *,
+    run_id: str,
+    requested_run_id: str,
+    summary: dict[str, Any],
+    sample_trades: list[dict[str, Any]],
+    top_losers: list[dict[str, Any]],
+    top_winners: list[dict[str, Any]],
+    equity_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), dict) else {}
+    assumptions = summary.get("assumptions") if isinstance(summary.get("assumptions"), list) else []
+    warnings = summary.get("warnings") if isinstance(summary.get("warnings"), list) else []
+    trade_count = _first_number(metrics, "trade_count", "total_trades", "closed_trades")
+    win_rate = _first_number(metrics, "win_rate", "win_rate_pct", "win_rate_percent")
+    max_drawdown = _first_number(metrics, "max_drawdown_pct", "drawdown_pct", "max_drawdown_percent")
+    profit_factor = _first_number(metrics, "profit_factor")
+    net_profit_pct = _first_number(metrics, "net_profit_pct", "net_profit_percent", "return_pct")
+    fee_bps = _first_number(metrics, "fee_bps", "fees_bps")
+    slippage_bps = _first_number(metrics, "slippage_bps")
+    checks = _robustness_checks(
+        trade_count=trade_count,
+        win_rate=win_rate,
+        max_drawdown=max_drawdown,
+        profit_factor=profit_factor,
+        net_profit_pct=net_profit_pct,
+        assumptions=assumptions,
+        warnings=warnings,
+        equity_summary=equity_summary,
     )
-    nodes = [
-        {
-            "id": f"pine_{timeframe.replace('/', '_')}",
-            "type": "sourceNode",
-            "package": "@backtest-kit/pinets",
-            "timeframe": timeframe,
-            "purpose": "Extract Pine plots for this timeframe using run() + extract().",
-        }
-        for timeframe in timeframes
+    recommendation = _robustness_recommendation(checks)
+    return {
+        "kind": ROBUSTNESS_REPORT_ARTIFACT_KIND,
+        "schema_version": 1,
+        "run_id": run_id,
+        "requested_run_id": requested_run_id,
+        "boundary": BACKTEST_PREVIEW_BOUNDARY_COPY,
+        "summary": {
+            "symbol": summary.get("symbol"),
+            "signal_timeframe": summary.get("signal_timeframe"),
+            "candle_timeframe": summary.get("candle_timeframe"),
+            "evidence_label": summary.get("evidence_label"),
+            "reproducibility_hash": summary.get("reproducibility_hash"),
+        },
+        "metrics": {
+            "trade_count": trade_count,
+            "win_rate": win_rate,
+            "max_drawdown_pct": max_drawdown,
+            "profit_factor": profit_factor,
+            "net_profit_pct": net_profit_pct,
+        },
+        "assumption_review": {
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "assumptions": assumptions,
+            "warnings": warnings,
+        },
+        "checks": checks,
+        "trade_samples": {
+            "sample": sample_trades[:20],
+            "top_losers": top_losers[:5],
+            "top_winners": top_winners[:5],
+        },
+        "equity_review": {
+            "available": equity_summary is not None,
+            "sample_resolution": equity_summary.get("sample_resolution") if isinstance(equity_summary, dict) else None,
+            "drawdown_windows": equity_summary.get("drawdown_windows", [])[:5] if isinstance(equity_summary, dict) else [],
+            "monthly_returns": equity_summary.get("monthly_returns", [])[:12] if isinstance(equity_summary, dict) else [],
+        },
+        "recommendation": recommendation,
+    }
+
+
+def _robustness_checks(
+    *,
+    trade_count: float | None,
+    win_rate: float | None,
+    max_drawdown: float | None,
+    profit_factor: float | None,
+    net_profit_pct: float | None,
+    assumptions: list[Any],
+    warnings: list[Any],
+    equity_summary: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    checks = [
+        _robustness_check(
+            "sample_size",
+            "warn" if trade_count is None or trade_count < 100 else "pass",
+            "Trade sample is thin; require more data or OOS validation." if trade_count is None or trade_count < 100 else "Trade sample is large enough for initial review.",
+            observed=trade_count,
+        ),
+        _robustness_check(
+            "drawdown",
+            "fail" if max_drawdown is not None and max_drawdown >= 50 else "warn" if max_drawdown is None or max_drawdown >= 25 else "pass",
+            "Drawdown is extreme for a review candidate." if max_drawdown is not None and max_drawdown >= 50 else "Drawdown needs review." if max_drawdown is None or max_drawdown >= 25 else "Drawdown is below the warning threshold.",
+            observed=max_drawdown,
+        ),
+        _robustness_check(
+            "win_rate",
+            "warn" if win_rate is None or win_rate <= 0 or win_rate >= 100 else "pass",
+            "Win rate is missing or suspiciously extreme." if win_rate is None or win_rate <= 0 or win_rate >= 100 else "Win rate is not obviously degenerate.",
+            observed=win_rate,
+        ),
+        _robustness_check(
+            "profit_factor",
+            "fail" if profit_factor is not None and profit_factor < 1 else "warn" if profit_factor is None or profit_factor > 5 else "pass",
+            "Profit factor is below 1." if profit_factor is not None and profit_factor < 1 else "Profit factor is missing or unusually high." if profit_factor is None or profit_factor > 5 else "Profit factor is in a plausible range.",
+            observed=profit_factor,
+        ),
+        _robustness_check(
+            "net_profit",
+            "fail" if net_profit_pct is not None and net_profit_pct < 0 else "warn" if net_profit_pct is None else "pass",
+            "Net profit is negative." if net_profit_pct is not None and net_profit_pct < 0 else "Net profit is missing." if net_profit_pct is None else "Net profit is positive.",
+            observed=net_profit_pct,
+        ),
+        _robustness_check(
+            "fees_slippage",
+            "warn" if not assumptions else "pass",
+            "Fee/slippage assumptions are not explicit in the indexed summary." if not assumptions else "Assumptions are present; verify they match intended execution costs.",
+            observed=len(assumptions),
+        ),
+        _robustness_check(
+            "equity_trace",
+            "warn" if equity_summary is None else "pass",
+            "Equity summary is unavailable for drawdown/monthly-return review." if equity_summary is None else "Equity summary is available for review.",
+            observed=equity_summary is not None,
+        ),
     ]
-    plan = {
-        "kind": "backtest_graph_pipeline",
-        "package": "@backtest-kit/graph",
-        "package_version": "14.0.0",
-        "prompt": arguments["prompt"],
-        "strategy_spec": arguments["strategy_spec"],
-        "base_backtest_config": base_config,
-        "nodes": [
-            *nodes,
-            {
-                "id": "composed_signal",
-                "type": "outputNode",
-                "package": "@backtest-kit/graph",
-                "purpose": "Combine multi-timeframe outputs and variant gates before queueing backtest-preview runs.",
-                "depends_on": [node["id"] for node in nodes],
-            },
-        ],
-        "variant_composition": {
-            "variants": variants,
-            "queue_target": "run_backtest_variant_lab",
-            "shared_cache_key": _backtest_cache_key(base_config),
-        },
-        "warnings": [
-            "Graph output is a local composition plan until child backtest reports exist.",
-            "Do not claim strategy success from graph topology alone.",
-        ],
-    }
-    artifact = _persist_json_artifact(
-        context,
-        kind="backtest_graph_pipeline",
-        display_name="Backtest Kit graph pipeline plan",
-        relative_path=BACKTEST_GRAPH_PIPELINE_PATH,
-        payload=plan,
-        source="llm_orchestrator.create_graph_pipeline_plan",
-    )
-    return {
-        "artifact_id": artifact.id if artifact else None,
-        "package": plan["package"],
-        "node_count": len(plan["nodes"]),
-        "shared_cache_key": plan["variant_composition"]["shared_cache_key"],
-    }
+    if warnings:
+        checks.append(_robustness_check("source_warnings", "warn", "Backtest report contains warnings that require review.", observed=len(warnings)))
+    return checks
 
 
-def _create_sidekick_export_plan_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
-    project_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(arguments.get("project_name") or "backtest-kit-sidekick-export")).strip("-")
-    if not project_name:
-        project_name = "backtest-kit-sidekick-export"
-    plan = {
-        "kind": "backtest_sidekick_export",
-        "package": "@backtest-kit/sidekick",
-        "package_version": "14.0.0",
-        "prompt": arguments["prompt"],
-        "strategy_spec": arguments["strategy_spec"],
-        "project_name": project_name,
-        "export_command": f"npx -y @backtest-kit/sidekick@14.0.0 {project_name}",
-        "runtime_policy": {
-            "usage": "export/scaffold only",
-            "api_runtime": "blocked",
-            "worker_runtime": "blocked",
-            "live_trading": "blocked",
-            "broker_credentials": "blocked",
-        },
-        "warnings": [
-            "Sidekick does not run inside the API or worker runtime.",
-            "Sidekick is an export/scaffold feature only and must not run inside the API or worker runtime.",
-            "Review generated source manually before copying strategy-codebot artifacts into the scaffold.",
-        ],
-    }
-    artifact = _persist_json_artifact(
-        context,
-        kind="backtest_sidekick_export",
-        display_name="Backtest Kit Sidekick export plan",
-        relative_path=BACKTEST_SIDEKICK_EXPORT_PATH,
-        payload=plan,
-        source="llm_orchestrator.create_sidekick_export_plan",
-    )
-    return {
-        "artifact_id": artifact.id if artifact else None,
-        "package": plan["package"],
-        "project_name": project_name,
-        "export_command": plan["export_command"],
-        "warnings": plan["warnings"],
-    }
+def _robustness_check(check_id: str, status: str, message: str, *, observed: Any) -> dict[str, Any]:
+    return {"id": check_id, "status": status, "message": message, "observed": observed}
+
+
+def _robustness_recommendation(checks: list[dict[str, Any]]) -> str:
+    statuses = {check.get("status") for check in checks}
+    if "fail" in statuses:
+        return "reject_preview"
+    if "warn" in statuses:
+        return "needs_more_evidence"
+    return "candidate_for_review"
+
+
+def _first_number(values: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = values.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int | float):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip().rstrip("%"))
+            except ValueError:
+                continue
+    return None
 
 
 def _build_backtest_config(
@@ -933,6 +1189,10 @@ def _extract_backtest_prompt_config(prompt: str) -> dict[str, Any]:
     timeframe_match = re.search(r"\b(1m|3m|5m|15m|30m|1h|2h|4h|6h|8h|12h|1d|1w)\b", lowered)
     if timeframe_match:
         extracted["timeframe"] = timeframe_match.group(1)
+    for exchange in BACKTEST_OHLCV_EXCHANGES:
+        if re.search(rf"\b{re.escape(exchange)}\b", lowered):
+            extracted["exchange"] = exchange
+            break
     dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", prompt)
     if dates:
         extracted["start"] = dates[0]
@@ -946,9 +1206,13 @@ def _extract_backtest_prompt_config(prompt: str) -> dict[str, Any]:
 
 def _normalize_backtest_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = {**BACKTEST_DEFAULT_CONFIG, **config}
-    normalized["engine"] = "backtest-kit"
+    normalized["engine"] = str(normalized.get("engine") or backtest_default_engine()).strip().lower()
+    if normalized["engine"] == BACKTEST_ENGINE_PINEFORGE and os.getenv("BACKTEST_PINEFORGE_ENABLED") != "1":
+        raise ValidationError("backtest preview is disabled")
     normalized["symbol"] = str(normalized["symbol"]).strip().upper()
-    normalized["timeframe"] = str(normalized["timeframe"]).strip()
+    normalized["exchange"] = str(normalized.get("exchange") or BACKTEST_OHLCV_DEFAULT_EXCHANGE).strip().lower()
+    normalized["timeframe"] = str(normalized["timeframe"]).strip().lower()
+    normalized["candle_timeframe"] = str(normalized.get("candle_timeframe") or "1m").strip().lower()
     normalized["start"] = str(normalized["start"]).strip()
     normalized["end"] = str(normalized["end"]).strip()
     normalized["initial_capital"] = float(normalized["initial_capital"])
@@ -956,69 +1220,86 @@ def _normalize_backtest_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized["slippage_bps"] = float(normalized["slippage_bps"])
     normalized["data_source"] = "public-readonly-cache"
     validate(instance=normalized, schema=BACKTEST_CONFIG_SCHEMA)
+    if any(ord(character) < 32 for character in normalized["symbol"]):
+        raise ValidationError("symbol must be a printable value")
+    for key in ("initial_capital", "fee_bps", "slippage_bps"):
+        if not math.isfinite(normalized[key]):
+            raise ValidationError(f"{key} must be finite")
+    start = _parse_backtest_datetime(normalized["start"], "start")
+    end = _parse_backtest_datetime(normalized["end"], "end")
+    if end <= start:
+        raise ValidationError("end must be after start")
     return normalized
 
 
-def _build_backtest_strategy_logic(
-    strategy_spec: dict[str, Any],
-    backtest_config: dict[str, Any],
-    provided: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if provided:
-        validate(instance=provided, schema=BACKTEST_STRATEGY_LOGIC_SCHEMA)
-        return provided
-    initial_capital = float(backtest_config.get("initial_capital") or BACKTEST_DEFAULT_CONFIG["initial_capital"])
-    take_profit = _number_from_strategy_spec(strategy_spec, ["take_profit_pct", "takeProfitPct", "tp_pct", "take_profit"], 2.0)
-    stop_loss = _number_from_strategy_spec(strategy_spec, ["stop_loss_pct", "stopLossPct", "sl_pct", "stop_loss"], 1.0)
-    holding_minutes = int(_number_from_strategy_spec(strategy_spec, ["max_holding_minutes", "minute_estimated_time", "holding_minutes"], 1440))
-    cost = _number_from_strategy_spec(strategy_spec, ["cost", "trade_cost", "position_size"], initial_capital / 10)
-    logic = {
-        "logic_version": "backtest-strategy-logic.v1",
-        "position": "long",
-        "indicators": {
-            "fast_ema": {"kind": "ema", "period": 3, "source": "close"},
-            "slow_ema": {"kind": "ema", "period": 5, "source": "close"},
-            "rsi": {"kind": "rsi", "period": 14, "source": "close"},
-        },
-        "entry": {
-            "all": [
-                {"type": "crossover", "left": "fast_ema", "right": "slow_ema"},
-                {"type": "greater_than", "left": "rsi", "right": 45},
-            ]
-        },
-        "exit": {
-            "take_profit_pct": min(max(take_profit, 0.01), 100),
-            "stop_loss_pct": min(max(stop_loss, 0.01), 100),
-            "max_holding_minutes": max(1, holding_minutes),
-        },
-        "risk": {"cost": min(max(cost, 1), initial_capital)},
+def _user_facing_backtest_config(config: dict[str, Any]) -> dict[str, Any]:
+    hidden_keys = {"data_source", "engine"}
+    return {key: value for key, value in config.items() if key not in hidden_keys}
+
+
+def _user_facing_backtest_summary(value: Any) -> Any:
+    hidden_keys = {
+        "engine",
+        "execution_semantics",
+        "pineforge_runtime",
+        "runner",
+        "runtime_boundary",
     }
-    validate(instance=logic, schema=BACKTEST_STRATEGY_LOGIC_SCHEMA)
-    return logic
+    if isinstance(value, dict):
+        return {
+            key: _user_facing_backtest_summary(
+                "Local sandbox preview evidence" if key == "evidence_label" else item
+            )
+            for key, item in value.items()
+            if key not in hidden_keys
+        }
+    if isinstance(value, list):
+        return [_user_facing_backtest_summary(item) for item in value]
+    if isinstance(value, str):
+        return _user_facing_backtest_text(value)
+    return value
 
 
-def _number_from_strategy_spec(strategy_spec: dict[str, Any], keys: list[str], fallback: float) -> float:
-    for key in keys:
-        value = strategy_spec.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            match = re.search(r"-?\d+(?:\.\d+)?", value)
-            if match:
-                return float(match.group(0))
-    return fallback
+def _user_facing_backtest_text(value: str) -> str:
+    return (
+        value.replace("PineForge local Pine preview evidence only", "Local sandbox preview evidence only")
+        .replace("PineForge local Pine preview evidence", "Local sandbox preview evidence")
+        .replace("PineForge Preview", "Backtest Preview")
+        .replace("PineForge local Pine preview", "local sandbox preview")
+        .replace("PineForge output", "Local sandbox preview output")
+        .replace("PineForge compile/backtest", "local preview")
+        .replace("pineforge-engine", "local preview")
+        .replace("pineforge-runner", "local preview")
+        .replace("PineForge", "local preview")
+    )
+
+
+def _required_pineforge_pine(pine_code: Any, strategy_spec: dict[str, Any]) -> str:
+    if not isinstance(pine_code, str) or not pine_code.strip():
+        raise ValueError("Backtest preview requires PineScript v6 strategy source")
+    if strategy_spec.get("script_type") != "strategy":
+        raise ValueError("Backtest preview requires a Pine strategy, not an indicator")
+    return pine_code.strip()
+
+
+def _parse_backtest_datetime(value: str, field_name: str) -> float:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValidationError(f"{field_name} must be an ISO date or datetime") from exc
 
 
 def _queue_backtest_preview(
     context: ToolExecutionContext,
     *,
     strategy_spec: dict[str, Any],
-    strategy_logic: dict[str, Any] | None = None,
     backtest_config: dict[str, Any],
     metadata: dict[str, Any],
+    pine_code: str | None = None,
+    auto_chain: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = _normalize_backtest_config(backtest_config)
-    executable_logic = _build_backtest_strategy_logic(strategy_spec, config, strategy_logic)
+    pine_code = _required_pineforge_pine(pine_code, strategy_spec)
     run = context.repository.create_run(
         context.auth,
         context.run.conversation_id,
@@ -1035,11 +1316,12 @@ def _queue_backtest_preview(
         job_type=RUN_MODE_BACKTEST_PREVIEW,
         payload_json={
             "strategy_spec": strategy_spec,
-            "strategy_logic": executable_logic,
+            "pine_code": pine_code,
             "backtest_config": config,
-            "runtime": backtest_runtime_boundary(),
+            "runtime": backtest_runtime_boundary(config["engine"]),
             "limits": backtest_job_limits_for_tier(context.auth.user_tier),
             "chat_tool": {key: value for key, value in metadata.items() if value is not None},
+            "auto_chain": _auto_chain_payload(context, auto_chain),
         },
     )
     if job is None:
@@ -1055,11 +1337,11 @@ def _queue_backtest_preview(
         "job_id": job.id,
         "job_type": job.job_type,
         "mode": RUN_MODE_BACKTEST_PREVIEW,
-        "engine": config["engine"],
+        "exchange": config["exchange"],
         "symbol": config["symbol"],
         "timeframe": config["timeframe"],
-        "data_source": config["data_source"],
-        "execution_semantics": "semantic_strategy_logic",
+        "signal_timeframe": config["timeframe"],
+        "candle_timeframe": config["candle_timeframe"],
         **{key: value for key, value in metadata.items() if value is not None},
     }
     context.repository.append_run_event(context.auth, run.id, "backtest.queued", event_payload)
@@ -1069,14 +1351,26 @@ def _queue_backtest_preview(
         "backtest.queued",
         {"child_run_id": run.id, **event_payload},
     )
-    return {"run_id": run.id, "job_id": job.id, "backtest_config": config, "strategy_logic": executable_logic}
+    return {"run_id": run.id, "job_id": job.id, "backtest_config": config, "pine_code": pine_code}
+
+
+def _auto_chain_payload(context: ToolExecutionContext, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not payload or payload.get("summary_on_complete") is not True:
+        return None
+    return {
+        "summary_on_complete": True,
+        "source_run_id": context.run.id,
+        "conversation_id": context.run.conversation_id,
+    }
 
 
 def _backtest_cache_key(config: dict[str, Any]) -> str:
     key_payload = {
         "data_source": config["data_source"],
+        "exchange": config["exchange"],
         "symbol": config["symbol"],
         "timeframe": config["timeframe"],
+        "candle_timeframe": config["candle_timeframe"],
         "start": config["start"],
         "end": config["end"],
     }
@@ -1114,6 +1408,86 @@ def _persist_text_artifact(
             {"artifact_id": artifact.id, "kind": artifact.kind, "display_name": artifact.display_name},
         )
     return artifact
+
+
+def _persist_pineforge_validation_artifacts(
+    context: ToolExecutionContext,
+    *,
+    pine_code: str,
+    validation: dict[str, Any],
+    source: str,
+):
+    pine_artifact = _persist_text_artifact(
+        context,
+        kind="pine_file",
+        mime_type="text/plain",
+        display_name="strategy.pine",
+        relative_path=PINE_STRATEGY_PATH,
+        content=pine_code,
+        source=source,
+    )
+    validation_artifact = _persist_json_artifact(
+        context,
+        kind="validation_report",
+        display_name="validation.json",
+        relative_path=BACKTEST_PINEFORGE_VALIDATION_PATH,
+        payload=validation,
+        source=source,
+    )
+    return pine_artifact, validation_artifact
+
+
+def _raise_pine_validation_error(
+    *,
+    message: str,
+    pine_artifact_id: str | None,
+    validation_artifact_id: str | None,
+    validation: dict[str, Any],
+) -> None:
+    summary = _validation_failure_summary(validation)
+    raise ToolExecutionError(
+        code="pine_validation_failed",
+        message=message,
+        dimension="workflow",
+        retryable=False,
+        details={
+            "pine_code_artifact_id": pine_artifact_id,
+            "validation_artifact_id": validation_artifact_id,
+            **summary,
+        },
+    )
+
+
+def _validation_failure_summary(validation: dict[str, Any]) -> dict[str, Any]:
+    errors = validation.get("errors")
+    diagnostics = validation.get("diagnostics")
+    issue_count = 0
+    if isinstance(errors, list):
+        issue_count += len(errors)
+    if isinstance(diagnostics, list):
+        issue_count += len(diagnostics)
+    summary: dict[str, Any] = {
+        "validation_status": validation.get("status"),
+        "validation_issue_count": issue_count,
+    }
+    first_issue = _first_validation_issue(errors) or _first_validation_issue(diagnostics)
+    if first_issue:
+        summary["validation_first_issue"] = first_issue
+    return summary
+
+
+def _first_validation_issue(value: Any) -> str | None:
+    if not isinstance(value, list) or not value:
+        return None
+    first = value[0]
+    if isinstance(first, str):
+        return first[:240]
+    if isinstance(first, dict):
+        for key in ("message", "error", "reason"):
+            item = first.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()[:240]
+    return None
 
 
 def _persist_json_artifact(
@@ -1156,16 +1530,17 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "create_backtest_plan": _create_backtest_plan_tool,
     "run_backtest_preview": _run_backtest_preview_tool,
     "run_backtest_variant_lab": _run_backtest_variant_lab_tool,
-    "create_pinets_preview_plan": _create_pinets_preview_plan_tool,
-    "create_signals_market_context_plan": _create_signals_market_context_plan_tool,
-    "create_graph_pipeline_plan": _create_graph_pipeline_plan_tool,
-    "create_sidekick_export_plan": _create_sidekick_export_plan_tool,
+    "get_backtest_summary": _get_backtest_summary_tool,
+    "query_backtest_trades": _query_backtest_trades_tool,
+    "build_robustness_report": _build_robustness_report_tool,
+    "get_equity_curve_sample": _get_equity_curve_sample_tool,
 }
 
 
 def tool_catalog_consistency_errors() -> list[str]:
     definition_names = set(TOOL_DEFINITIONS)
     handler_names = set(TOOL_HANDLERS)
+    action_tool_names = action_registry_backend_tool_ids()
     errors: list[str] = []
     missing_handlers = sorted(definition_names - handler_names)
     if missing_handlers:
@@ -1173,6 +1548,12 @@ def tool_catalog_consistency_errors() -> list[str]:
     missing_definitions = sorted(handler_names - definition_names)
     if missing_definitions:
         errors.append(f"Tool handlers without definitions: {', '.join(missing_definitions)}")
+    missing_registry_definitions = sorted(action_tool_names - definition_names)
+    if missing_registry_definitions:
+        errors.append(f"Action registry backend tools without definitions: {', '.join(missing_registry_definitions)}")
+    missing_registry_handlers = sorted(action_tool_names - handler_names)
+    if missing_registry_handlers:
+        errors.append(f"Action registry backend tools without handlers: {', '.join(missing_registry_handlers)}")
     return errors
 
 
@@ -1186,6 +1567,15 @@ def execute_tool(tool_name: str, arguments: dict[str, Any], context: ToolExecuti
 def compact_tool_output(output: dict[str, Any]) -> dict[str, Any]:
     if "knowledge_context" in output and isinstance(output["knowledge_context"], dict):
         return {"knowledge_context_summary": _knowledge_context_summary(output["knowledge_context"])}
+    if "trades" in output and isinstance(output["trades"], list):
+        return {
+            "status": output.get("status"),
+            "run_id": output.get("run_id"),
+            "requested_run_id": output.get("requested_run_id"),
+            "fallback_used": output.get("fallback_used"),
+            "trades": output["trades"][:50],
+            "truncated": len(output["trades"]) > 50,
+        }
     encoded = json.dumps(output, ensure_ascii=False)
     if len(encoded) <= 4000:
         return output

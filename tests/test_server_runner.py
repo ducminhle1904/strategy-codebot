@@ -6,6 +6,12 @@ from fastapi.testclient import TestClient
 
 from strategy_codebot.schemas import write_json
 from strategy_codebot.server import create_app
+from strategy_codebot.server.artifact_kinds import PROPOSED_ORDER_INTENT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import INTERNAL_ARTIFACT_KINDS
+from strategy_codebot.server.artifact_kinds import REPORT_ARTIFACT_KINDS
+from strategy_codebot.server.artifact_kinds import RISK_GATE_REPORT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
+from strategy_codebot.server.artifact_kinds import USER_ARTIFACT_KINDS
 from strategy_codebot.server.database import create_sqlite_repository
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
 from strategy_codebot.server.run_modes import RUN_MODE_DRY_RUN
@@ -21,7 +27,8 @@ AUTH_A = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-a"}
 AUTH_B = {"X-User-Id": "user-b", "X-Workspace-Id": "workspace-a"}
 AUTH_OTHER_WORKSPACE = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-b"}
 BACKTEST_CONFIG = {
-    "engine": "backtest-kit",
+    "engine": "pineforge",
+    "exchange": "binance",
     "symbol": "BTCUSDT",
     "timeframe": "15m",
     "start": "2024-01-01T00:00:00Z",
@@ -31,6 +38,14 @@ BACKTEST_CONFIG = {
     "slippage_bps": 5,
     "data_source": "public-readonly-cache",
 }
+PINEFORGE_STRATEGY = """//@version=6
+strategy("POC EMA RSI", overlay=true)
+fast = ta.ema(close, 12)
+slow = ta.ema(close, 26)
+if ta.crossover(fast, slow)
+    strategy.entry("Long", strategy.long)
+strategy.exit("Long exit", "Long", stop=close * 0.98, limit=close * 1.04)
+"""
 BACKTEST_STRATEGY_LOGIC = {
     "logic_version": "backtest-strategy-logic.v1",
     "position": "long",
@@ -57,6 +72,39 @@ def test_run_create_defaults_web_search_to_auto() -> None:
     assert payload.mode == RUN_MODE_DRY_RUN
 
 
+def test_future_bot_artifact_kinds_are_user_visible_reports() -> None:
+    future_bot_artifact_kinds = {
+        PROPOSED_ORDER_INTENT_ARTIFACT_KIND,
+        RISK_GATE_REPORT_ARTIFACT_KIND,
+        ROBUSTNESS_REPORT_ARTIFACT_KIND,
+    }
+
+    assert future_bot_artifact_kinds <= USER_ARTIFACT_KINDS
+    assert future_bot_artifact_kinds <= REPORT_ARTIFACT_KINDS
+
+
+def test_backtest_support_artifacts_are_internal() -> None:
+    support_artifact_kinds = {
+        "backtest_equity_curve",
+        "backtest_ohlcv_metadata",
+        "backtest_plan",
+        "backtest_run_metadata",
+        "backtest_source_bundle",
+        "backtest_strategy_adapter_source",
+        "backtest_trades",
+        "candle_cache_manifest",
+        "market_data_cache_manifest",
+        "market_data_ohlcv_metadata",
+        "pineforge_compile_report",
+        "pineforge_runner_manifest",
+        "pineforge_validation_report",
+        "validation_report",
+    }
+
+    assert support_artifact_kinds <= INTERNAL_ARTIFACT_KINDS
+    assert support_artifact_kinds.isdisjoint(USER_ARTIFACT_KINDS)
+
+
 def test_run_mode_constants_match_capability_response(tmp_path: Path) -> None:
     client = TestClient(create_app(repository=create_sqlite_repository(), artifact_root=tmp_path))
 
@@ -75,7 +123,71 @@ def test_backtest_preview_requires_backtest_config() -> None:
         raise AssertionError("backtest-preview without config should fail validation")
 
 
-def test_backtest_preview_run_is_queued_with_job_and_event(tmp_path: Path) -> None:
+def test_backtest_config_rejects_unsupported_timeframe(monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    try:
+        RunCreate(
+            conversation_id="conv_1",
+            strategy_spec=valid_spec(),
+            pine_code=PINEFORGE_STRATEGY,
+            mode=RUN_MODE_BACKTEST_PREVIEW,
+            backtest_config={**BACKTEST_CONFIG, "timeframe": "4h"},
+        )
+    except ValueError as exc:
+        assert "timeframe" in str(exc)
+    else:
+        raise AssertionError("unsupported backtest timeframe should fail validation")
+
+
+def test_backtest_config_defaults_and_rejects_candle_timeframe(monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    payload = RunCreate(
+        conversation_id="conv_1",
+        strategy_spec=valid_spec(),
+        pine_code=PINEFORGE_STRATEGY,
+        mode=RUN_MODE_BACKTEST_PREVIEW,
+        backtest_config=BACKTEST_CONFIG,
+    )
+
+    assert payload.backtest_config is not None
+    assert payload.backtest_config.candle_timeframe == "1m"
+
+    try:
+        RunCreate(
+            conversation_id="conv_1",
+            strategy_spec=valid_spec(),
+            pine_code=PINEFORGE_STRATEGY,
+            mode=RUN_MODE_BACKTEST_PREVIEW,
+            backtest_config={**BACKTEST_CONFIG, "candle_timeframe": "5m"},
+        )
+    except ValueError as exc:
+        assert "candle_timeframe" in str(exc)
+    else:
+        raise AssertionError("unsupported backtest candle_timeframe should fail validation")
+
+
+def test_backtest_config_rejects_invalid_cost_and_date_range(monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    for override in (
+        {"fee_bps": 1001},
+        {"slippage_bps": 1001},
+        {"start": "2024-02-01T00:00:00Z", "end": "2024-01-01T00:00:00Z"},
+    ):
+        try:
+            RunCreate(
+                conversation_id="conv_1",
+                strategy_spec=valid_spec(),
+                pine_code=PINEFORGE_STRATEGY,
+                mode=RUN_MODE_BACKTEST_PREVIEW,
+                backtest_config={**BACKTEST_CONFIG, **override},
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"invalid backtest config should fail validation: {override}")
+
+
+def test_backtest_preview_run_is_queued_with_job_and_event(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
     repository = create_sqlite_repository()
     client = TestClient(create_app(repository=repository, artifact_root=tmp_path))
     conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
@@ -86,7 +198,7 @@ def test_backtest_preview_run_is_queued_with_job_and_event(tmp_path: Path) -> No
         json={
             "conversation_id": conversation["id"],
             "strategy_spec": valid_spec(),
-            "strategy_logic": BACKTEST_STRATEGY_LOGIC,
+            "pine_code": PINEFORGE_STRATEGY,
             "mode": "backtest-preview",
             "backtest_config": BACKTEST_CONFIG,
         },
@@ -103,12 +215,16 @@ def test_backtest_preview_run_is_queued_with_job_and_event(tmp_path: Path) -> No
     job = repository.claim_run_job(job_type="backtest-preview", worker_id="worker-test")
     assert job is not None
     assert job.payload_json["backtest_config"]["symbol"] == "BTCUSDT"
-    assert job.payload_json["strategy_logic"] == BACKTEST_STRATEGY_LOGIC
+    assert job.payload_json["backtest_config"]["timeframe"] == "15m"
+    assert job.payload_json["backtest_config"]["candle_timeframe"] == "1m"
+    assert "strategy_" + "logic" not in job.payload_json
+    assert job.payload_json["pine_code"].startswith("//@version=6")
     assert job.payload_json["limits"]["workspace_active_limit"] == 2
     assert job.payload_json["limits"]["max_variants"] == 6
 
 
-def test_cancel_backtest_preview_cancels_queued_job(tmp_path: Path) -> None:
+def test_cancel_backtest_preview_cancels_queued_job(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
     repository = create_sqlite_repository()
     client = TestClient(create_app(repository=repository, artifact_root=tmp_path))
     conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
@@ -118,6 +234,7 @@ def test_cancel_backtest_preview_cancels_queued_job(tmp_path: Path) -> None:
         json={
             "conversation_id": conversation["id"],
             "strategy_spec": valid_spec(),
+            "pine_code": PINEFORGE_STRATEGY,
             "mode": "backtest-preview",
             "backtest_config": BACKTEST_CONFIG,
         },
@@ -131,7 +248,8 @@ def test_cancel_backtest_preview_cancels_queued_job(tmp_path: Path) -> None:
     assert repository.claim_run_job(job_type="backtest-preview", worker_id="worker-test") is None
 
 
-def test_retry_backtest_preview_is_rejected_until_payload_replay_exists(tmp_path: Path) -> None:
+def test_retry_backtest_preview_is_rejected_until_payload_replay_exists(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
     repository = create_sqlite_repository()
     client = TestClient(create_app(repository=repository, artifact_root=tmp_path))
     conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
@@ -141,6 +259,7 @@ def test_retry_backtest_preview_is_rejected_until_payload_replay_exists(tmp_path
         json={
             "conversation_id": conversation["id"],
             "strategy_spec": valid_spec(),
+            "pine_code": PINEFORGE_STRATEGY,
             "mode": "backtest-preview",
             "backtest_config": BACKTEST_CONFIG,
         },

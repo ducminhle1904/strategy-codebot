@@ -12,42 +12,81 @@ export type StrategyStartPromptSuggestion = {
   onSelect: () => void;
 };
 
-export function StrategyPromptInputShell({
-  action,
-  children,
-  className,
-  startAction,
-}: {
-  action: ReactNode;
-  children: ReactNode;
-  className?: string;
-  startAction?: ReactNode;
-}) {
-  return (
-    <div
-      className={cn(
-        "w-full border",
-        strategyPromptInputShellClassName,
-        className
-      )}
-    >
-      {children}
-      <div className={cn("flex", strategyPromptActionRowClassName)}>
-        <div className="min-w-0">{startAction}</div>
-        <div className="flex shrink-0 items-center gap-2">{action}</div>
-      </div>
-    </div>
-  );
-}
-
-export const strategyPromptTextareaClassName =
+const strategyPromptTextareaClassName =
   "min-h-20 resize-none rounded-md border-0 !bg-muted/35 px-2 py-2 shadow-none focus-visible:ring-0 dark:!bg-muted/35";
 
-export const strategyPromptInputShellClassName =
+const strategyPromptInputShellClassName =
   "relative h-auto rounded-[8px] border-border !bg-card p-2 pb-12 shadow-sm dark:!bg-card";
 
-export const strategyPromptActionRowClassName =
-  "absolute left-3 right-4 bottom-3 flex items-center justify-between gap-2 p-0";
+const strategyPromptActionRowClassName =
+  "absolute inset-x-2 bottom-2 flex items-center justify-between gap-2 p-0";
+
+type StrategyComposerRenderState = {
+  submitDisabled: boolean;
+};
+
+export function StrategyComposer({
+  className,
+  disabled = false,
+  endAction,
+  onSubmit,
+  onValueChange,
+  placeholder,
+  requireText = false,
+  startAction,
+  value,
+}: {
+  className?: string;
+  disabled?: boolean;
+  endAction: (state: StrategyComposerRenderState) => ReactNode;
+  onSubmit: (text: string) => void | Promise<void>;
+  onValueChange: (value: string) => void;
+  placeholder: string;
+  requireText?: boolean;
+  startAction?: ReactNode;
+  value: string;
+}) {
+  const submitDisabled = disabled || (requireText && !value.trim());
+  const submit = async () => {
+    if (submitDisabled) {
+      return;
+    }
+    await onSubmit(value.trim());
+  };
+
+  return (
+    <form
+      className={cn("w-full", className)}
+      onSubmit={(event) => {
+        event.preventDefault();
+        void submit();
+      }}
+    >
+      <div className={cn("w-full border", strategyPromptInputShellClassName)}>
+        <Textarea
+          className={strategyPromptTextareaClassName}
+          data-strategy-composer-input
+          disabled={disabled}
+          onChange={(event) => onValueChange(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              void submit();
+            }
+          }}
+          placeholder={placeholder}
+          value={value}
+        />
+        <div className={cn("flex", strategyPromptActionRowClassName)}>
+          <div className="min-w-0">{startAction}</div>
+          <div className="flex shrink-0 items-center gap-2">
+            {endAction({ submitDisabled })}
+          </div>
+        </div>
+      </div>
+    </form>
+  );
+}
 
 export function StrategyStartPrompt({
   className,
@@ -73,16 +112,6 @@ export function StrategyStartPrompt({
   title: string;
 }) {
   const [value, setValue] = useState("");
-  const submitDisabled = disabled || (requireText && !value.trim());
-
-  const submit = async () => {
-    if (submitDisabled) {
-      return;
-    }
-    const text = value.trim();
-    await onSubmit(text);
-    setValue("");
-  };
 
   return (
     <section
@@ -108,42 +137,30 @@ export function StrategyStartPrompt({
         ))}
       </div>
 
-      <form
-        className="mt-5 w-full"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void submit();
+      <StrategyComposer
+        className="mt-5"
+        disabled={disabled}
+        endAction={({ submitDisabled }) => (
+          <Button
+            aria-label={submitLabel}
+            className="rounded-full"
+            disabled={submitDisabled}
+            size="icon-sm"
+            type="submit"
+          >
+            <ArrowUp className="size-4" />
+          </Button>
+        )}
+        onSubmit={async (text) => {
+          setValue("");
+          await onSubmit(text);
         }}
-      >
-        <StrategyPromptInputShell
-          action={
-            <Button
-              aria-label={submitLabel}
-              className="rounded-full"
-              disabled={submitDisabled}
-              size="icon-sm"
-              type="submit"
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          }
-          startAction={startAction}
-        >
-          <Textarea
-            className={strategyPromptTextareaClassName}
-            disabled={disabled}
-            onChange={(event) => setValue(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void submit();
-              }
-            }}
-            placeholder={placeholder}
-            value={value}
-          />
-        </StrategyPromptInputShell>
-      </form>
+        onValueChange={setValue}
+        placeholder={placeholder}
+        requireText={requireText}
+        startAction={startAction}
+        value={value}
+      />
       {status ? <div className="mt-4 w-full text-left">{status}</div> : null}
     </section>
   );

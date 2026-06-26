@@ -1,12 +1,20 @@
 from datetime import datetime
+import os
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
 from strategy_codebot.server.run_modes import RUN_MODE_DRY_RUN
+from strategy_codebot.server.run_modes import BACKTEST_ENGINE_PINEFORGE
+from strategy_codebot.server.run_modes import BACKTEST_ENGINES
+from strategy_codebot.server.run_modes import BACKTEST_OHLCV_DEFAULT_EXCHANGE
+from strategy_codebot.server.run_modes import BACKTEST_OHLCV_EXCHANGES
+from strategy_codebot.server.run_modes import backtest_default_engine
 from strategy_codebot.server.run_modes import RUN_MODES
 from strategy_codebot.server.run_modes import RUN_MODES_REQUIRING_BACKTEST_CONFIG
+from strategy_codebot.server.run_modes import BACKTEST_EXECUTABLE_TIMEFRAMES
+from strategy_codebot.server.run_modes import BACKTEST_MAX_COST_BPS
 
 
 class WorkspaceCapabilityResponse(BaseModel):
@@ -33,6 +41,13 @@ class ProviderStatusResponse(BaseModel):
     allowed_message_modes: list[str]
     allowed_run_modes: list[str]
     fallback_mode: str
+    model_routing_mode: str = "registry"
+    model_tier: str | None = None
+    selected_stage_defaults: dict[str, str] = Field(default_factory=dict)
+    available_gateways: list[str] = Field(default_factory=list)
+    route_ready: bool = False
+    fallback_enabled: bool = False
+    user_message: str | None = None
     status: str
     reason: str | None = None
 
@@ -56,6 +71,14 @@ def _normalize_conversation_title(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _parse_backtest_datetime(value: str, field_name: str) -> float:
+    normalized = value.strip()
+    try:
+        return datetime.fromisoformat(normalized.replace("Z", "+00:00")).timestamp()
+    except ValueError as exc:
+        raise ValueError(f"backtest_config.{field_name} must be an ISO date or datetime") from exc
 
 
 class ConversationCreate(BaseModel):
@@ -161,6 +184,8 @@ class ArtifactResponse(BaseModel):
     metadata_json: dict | None
     visibility: str | None = None
     category: str | None = None
+    presentation: dict[str, Any] = Field(default_factory=dict)
+    preview_summary: dict | None = None
     created_at: datetime
 
 
@@ -174,6 +199,70 @@ class ArtifactPreviewResponse(ArtifactResponse):
     truncated: bool
     line_count: int | None
     language: str | None
+
+
+class ArtifactListResponse(BaseModel):
+    items: list[ArtifactResponse]
+    next_cursor: str | None = None
+
+
+class KnowledgeCandidateCreate(BaseModel):
+    lesson: str = Field(min_length=1, max_length=4000)
+    evidence_ref: str = Field(min_length=1, max_length=1000)
+    candidate_type: str = Field(default="episodic", min_length=1, max_length=64)
+    confidence: str | None = Field(default=None, max_length=64)
+    trust_level: str | None = Field(default="agent_reviewed", max_length=64)
+    source_uri: str | None = Field(default=None, max_length=1000)
+    metadata: dict[str, Any] | None = None
+
+
+class KnowledgeCandidateResponse(BaseModel):
+    candidate_id: str
+    status: str
+    candidate_type: str | None = None
+    confidence: str | None = None
+    trust_level: str | None = None
+    evidence_ref: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    deduped: bool = False
+    promotion_decision: str | None = None
+    quality_score: float | None = None
+    gate_summary: list[str] | None = None
+    review_required_reason: str | None = None
+    result_status: str | None = None
+    store: str | None = None
+
+
+class KnowledgeCandidateListResponse(BaseModel):
+    status: str
+    store: str
+    candidates: list[KnowledgeCandidateResponse]
+
+
+class KnowledgeLearningRequest(BaseModel):
+    approval_mode: Literal["manual", "agent-auto", "guarded-auto"] = "guarded-auto"
+
+
+class KnowledgeAutoReviewRequest(BaseModel):
+    candidate_ids: list[str] | None = None
+
+
+class KnowledgeLearningResponse(BaseModel):
+    status: str
+    approval_mode: str
+    store: str
+    index_ref: str | None = None
+    extracted_count: int
+    candidate_count: int
+    proposed_count: int
+    promoted_count: int
+    skipped_count: int
+    rejected_count: int
+    candidates: list[KnowledgeCandidateResponse]
+    promoted: list[KnowledgeCandidateResponse]
+    skipped: list[KnowledgeCandidateResponse]
+    rejected: list[KnowledgeCandidateResponse]
 
 
 class RunResponse(BaseModel):
@@ -193,21 +282,75 @@ class RunResponse(BaseModel):
 
 
 class BacktestConfig(BaseModel):
-    engine: str = Field(default="backtest-kit", pattern="^backtest-kit$")
-    symbol: str = Field(min_length=1)
+    engine: str = Field(default_factory=backtest_default_engine)
+    exchange: str = Field(default=BACKTEST_OHLCV_DEFAULT_EXCHANGE)
+    symbol: str = Field(min_length=1, max_length=64)
     timeframe: str = Field(min_length=1)
+    candle_timeframe: str = Field(default="1m")
     start: str = Field(min_length=1)
     end: str = Field(min_length=1)
     initial_capital: float = Field(gt=0)
-    fee_bps: float = Field(default=0, ge=0)
-    slippage_bps: float = Field(default=0, ge=0)
+    fee_bps: float = Field(default=0, ge=0, le=BACKTEST_MAX_COST_BPS)
+    slippage_bps: float = Field(default=0, ge=0, le=BACKTEST_MAX_COST_BPS)
     data_source: str = Field(default="public-readonly-cache", pattern="^public-readonly-cache$")
+
+    @field_validator("engine")
+    @classmethod
+    def validate_engine(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in BACKTEST_ENGINES:
+            raise ValueError(f"engine must be one of: {', '.join(BACKTEST_ENGINES)}")
+        if normalized == BACKTEST_ENGINE_PINEFORGE and os.getenv("BACKTEST_PINEFORGE_ENABLED") != "1":
+            raise ValueError("backtest preview is disabled")
+        return normalized
+
+    @field_validator("exchange")
+    @classmethod
+    def validate_exchange(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in BACKTEST_OHLCV_EXCHANGES:
+            allowed = ", ".join(BACKTEST_OHLCV_EXCHANGES)
+            raise ValueError(f"exchange must be one of: {allowed}")
+        return normalized
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if not normalized or any(ord(character) < 32 for character in normalized):
+            raise ValueError("symbol must be a non-empty printable value")
+        return normalized
+
+    @field_validator("timeframe")
+    @classmethod
+    def validate_timeframe(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in BACKTEST_EXECUTABLE_TIMEFRAMES:
+            allowed = ", ".join(BACKTEST_EXECUTABLE_TIMEFRAMES)
+            raise ValueError(f"timeframe must be one of: {allowed}")
+        return normalized
+
+    @field_validator("candle_timeframe")
+    @classmethod
+    def validate_candle_timeframe(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized != "1m":
+            raise ValueError("candle_timeframe must be 1m")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_date_range(self) -> "BacktestConfig":
+        start = _parse_backtest_datetime(self.start, "start")
+        end = _parse_backtest_datetime(self.end, "end")
+        if end <= start:
+            raise ValueError("backtest_config.end must be after backtest_config.start")
+        return self
 
 
 class RunCreate(BaseModel):
     conversation_id: str = Field(min_length=1)
     strategy_spec: dict[str, Any]
-    strategy_logic: dict[str, Any] | None = None
+    pine_code: str | None = None
     mode: str = Field(default=RUN_MODE_DRY_RUN)
     web_search: str = Field(default="auto", pattern="^(off|auto|on)$")
     backtest_config: BacktestConfig | None = None
@@ -225,11 +368,32 @@ class RunCreate(BaseModel):
             raise ValueError("backtest_config is required when mode is backtest-preview")
         if self.mode != RUN_MODE_BACKTEST_PREVIEW and self.backtest_config is not None:
             raise ValueError("backtest_config is only supported when mode is backtest-preview")
+        if (
+            self.mode == RUN_MODE_BACKTEST_PREVIEW
+            and self.backtest_config is not None
+            and self.backtest_config.engine == BACKTEST_ENGINE_PINEFORGE
+            and not self.pine_code
+        ):
+            raise ValueError("Backtest preview requires PineScript v6 strategy source")
         return self
 
 
 class RunCreateResponse(RunResponse):
     artifacts: list[ArtifactResponse]
+
+
+class BacktestApprovalDecisionRequest(BaseModel):
+    decision: Literal["approved", "rejected"]
+
+
+class BacktestApprovalDecisionResponse(BaseModel):
+    approval_id: str
+    conversation_id: str
+    decision: Literal["approved", "rejected"]
+    status: Literal["queued", "rejected"]
+    run_id: str | None = None
+    job_id: str | None = None
+    backtest_config: dict[str, Any] | None = None
 
 
 class RunEventResponse(BaseModel):
@@ -301,7 +465,10 @@ class ConversationStateResponse(BaseModel):
     message_limit: int
     latest_run: RunResponse | None
     latest_run_artifacts: list[ArtifactResponse]
+    conversation_artifacts: list[ArtifactResponse] = Field(default_factory=list)
+    conversation_artifacts_next_cursor: str | None = None
     latest_run_events: list[RunEventResponse]
+    conversation_run_events: list[RunEventResponse] = Field(default_factory=list)
     feedback_targets: dict[str, Any]
     strategy_profile: StrategyProfileResponse | None = None
 

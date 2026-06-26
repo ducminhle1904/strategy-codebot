@@ -4,6 +4,7 @@ import {
   isProviderAuthFailure,
   isProviderTimeoutFailure,
   knowledgeSourcesFromPythonEvent,
+  marketSnapshotFromPayload,
   marketSnapshotFromPythonEvent,
   reasoningSummaryFromPythonEvent,
   responseIntentFromPythonEvent,
@@ -58,13 +59,24 @@ describe("chat stream helpers", () => {
             actions: [
               {
                 action: "send_prompt",
+                artifact_kind: "risk_gate_report",
                 category: "strategy",
                 enabled: true,
                 id: "use-market",
                 kind: "chat_action",
                 label: "Use for strategy",
+                next_state: "risk_gate",
+                presentation: {
+                  badge_key: "review_required",
+                  icon_key: "gauge",
+                  visibility_key: "default",
+                },
                 priority: 1,
                 prompt: "Use this context for a strategy.",
+                reason: "Strategy context is ready for deterministic review.",
+                required_inputs: ["stale_after"],
+                risk_level: "review_required",
+                tool_id: "run_risk_gate",
               },
             ],
             composer_blocks: [
@@ -86,16 +98,47 @@ describe("chat stream helpers", () => {
                 ],
               },
             ],
-            context: { intent: "strategy_building", missing_fields: ["risk"] },
+            context: {
+              artifact_kinds: ["pine_file"],
+              intent: "strategy_building",
+              missing_fields: ["risk"],
+              semantic_action_confidence: 0.82,
+              semantic_action_intent: "strategy_evidence_review",
+              semantic_action_source: "deterministic",
+              semantic_suggested_actions: ["review_risk"],
+            },
             version: 1,
           },
         },
         event: "chat.suggestions.updated",
       })
     ).toMatchObject({
-      actions: [{ id: "use-market", prompt: "Use this context for a strategy." }],
+      actions: [
+        {
+          artifact_kind: "risk_gate_report",
+          id: "use-market",
+          prompt: "Use this context for a strategy.",
+          reason: "Strategy context is ready for deterministic review.",
+          required_inputs: ["stale_after"],
+          risk_level: "review_required",
+          presentation: {
+            badge_key: "review_required",
+            icon_key: "gauge",
+            visibility_key: "default",
+          },
+          tool_id: "run_risk_gate",
+        },
+      ],
       composer_blocks: [{ slot: "risk", variants: [{ label: "Balanced" }] }],
-      context: { intent: "strategy_building", missing_fields: ["risk"] },
+      context: {
+        artifact_kinds: ["pine_file"],
+        intent: "strategy_building",
+        missing_fields: ["risk"],
+        semantic_action_confidence: 0.82,
+        semantic_action_intent: "strategy_evidence_review",
+        semantic_action_source: "deterministic",
+        semantic_suggested_actions: ["review_risk"],
+      },
     });
   });
 
@@ -112,6 +155,23 @@ describe("chat stream helpers", () => {
     expect(isProviderTimeoutFailure(event)).toBe(true);
     expect(runFailureMessage(event)).toContain("took too long");
     expect(textFromPythonEvent(event)).toContain("try again");
+  });
+
+  it("renders workflow run failures without provider prefix", () => {
+    const event: PythonSseEvent = {
+      data: {
+        payload: {
+          code: "pine_validation_failed",
+          dimension: "workflow",
+          message: "Backtest plan failed because local Pine validation failed.",
+        },
+      },
+      event: "run.failed",
+      id: "evt_pine_validation_failed",
+    };
+
+    expect(runFailureMessage(event)).toBe("Backtest plan failed because local Pine validation failed.");
+    expect(textFromPythonEvent(event)).toBe("Backtest plan failed because local Pine validation failed.");
   });
 
   it("does not duplicate run failure text when the server persisted an assistant message", () => {
@@ -228,6 +288,31 @@ describe("chat stream helpers", () => {
   });
 
   it("extracts response intent and market snapshot data events", () => {
+    const marketPayload = {
+      approximate: true,
+      change: 12.1,
+      change_percent: 0.71,
+      currency: "USD",
+      freshness: "source_backed",
+      label: "Market snapshot",
+      provider: "Twelve Data",
+      price: "$1,721.95",
+      price_points: [
+        { label: "A", value: 1 },
+        { label: "B", value: 2 },
+      ],
+      source_count: 1,
+      sources: [
+        {
+          id: "coindesk-eth",
+          title: "ETH price source",
+          type: "external",
+          url: "https://example.com/eth",
+        },
+      ],
+      symbol: "ETH",
+    };
+
     expect(
       responseIntentFromPythonEvent({
         data: { payload: { intent: "market_snapshot", safe: true } },
@@ -237,32 +322,7 @@ describe("chat stream helpers", () => {
 
     expect(
       marketSnapshotFromPythonEvent({
-        data: {
-          payload: {
-            approximate: true,
-            change: 12.1,
-            change_percent: 0.71,
-            currency: "USD",
-            freshness: "source_backed",
-            label: "Market snapshot",
-            provider: "Twelve Data",
-            price: "$1,721.95",
-            price_points: [
-              { label: "A", value: 1 },
-              { label: "B", value: 2 },
-            ],
-            source_count: 1,
-            sources: [
-              {
-                id: "coindesk-eth",
-                title: "ETH price source",
-                type: "external",
-                url: "https://example.com/eth",
-              },
-            ],
-            symbol: "ETH",
-          },
-        },
+        data: { payload: marketPayload },
         event: "chat.market_snapshot",
       })
     ).toMatchObject({
@@ -272,6 +332,13 @@ describe("chat stream helpers", () => {
       change_percent: 0.71,
       provider: "Twelve Data",
       price: "$1,721.95",
+      symbol: "ETH",
+    });
+    expect(marketSnapshotFromPayload(marketPayload)).toMatchObject({
+      price_points: [
+        { label: "A", value: 1 },
+        { label: "B", value: 2 },
+      ],
       symbol: "ETH",
     });
   });

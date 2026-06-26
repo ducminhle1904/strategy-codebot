@@ -7,7 +7,6 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
-import type { DynamicToolUIPart, ToolUIPart } from "ai";
 import {
   CheckCircleIcon,
   ChevronDownIcon,
@@ -22,6 +21,31 @@ import { isValidElement } from "react";
 import { CodeBlock } from "./code-block";
 
 export type ToolProps = ComponentProps<typeof Collapsible>;
+
+type ToolState =
+  | "approval-requested"
+  | "approval-responded"
+  | "input-available"
+  | "input-streaming"
+  | "output-available"
+  | "output-denied"
+  | "output-error";
+
+type ToolUIPart = {
+  errorText?: string;
+  input?: unknown;
+  output?: unknown;
+  state: ToolState;
+  type: `tool-${string}`;
+};
+
+type DynamicToolUIPart = {
+  errorText?: string;
+  input?: unknown;
+  output?: unknown;
+  state: ToolState;
+  type: "dynamic-tool";
+};
 
 export const Tool = ({ className, ...props }: ToolProps) => (
   <Collapsible

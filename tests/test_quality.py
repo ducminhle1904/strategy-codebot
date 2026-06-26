@@ -61,17 +61,40 @@ def test_quality_marks_basic_valid_strategy_as_weak_sophistication_warn_only() -
     assert report["strategy_sophistication"]["warn_only"] is True
     assert report["sophistication_grade"] == "weak"
     assert "market_premise" in report["missing_trader_assumptions"]
+    assert "risk_concentration" in report["missing_trader_assumptions"]
     assert report["improvement_hints"]
+
+
+def test_quality_requires_exposure_context_for_risk_concentration() -> None:
+    spec = _safe_strategy() | {
+        "entry_rules": [
+            "Premise: liquidity sweep edge in a range-to-trend regime during London session liquidity.",
+            "Enter after confirmed reclaim and retest rejection; avoid chasing failed reclaim fakeouts.",
+        ],
+        "exit_rules": ["Stop beyond swept wick invalidation and target prior structure high or 1.5R bounded fallback."],
+        "risk_rules": ["Risk 1% account equity per trade, include fees/slippage assumptions, and avoid overfit with backtest sample-size and out-of-sample validation."],
+        "constraints": ["Price action only with no indicators; use OHLC structure and confirmed candles."],
+        "stop_loss": "Stop beyond swept wick invalidation.",
+        "take_profit": "Structure target or 1.5R risk-reward fallback.",
+    }
+
+    report = assess_strategy_quality(
+        spec,
+        '//@version=6\nstrategy("x")\nstrategy.entry("L", strategy.long)\nstrategy.exit("X", "L")',
+    )
+
+    assert report["strategy_sophistication"]["checks"]["risk_concentration"] is False
+    assert "risk_concentration" in report["missing_trader_assumptions"]
 
 
 def test_quality_scores_trader_grade_price_action_higher() -> None:
     spec = _safe_strategy() | {
         "entry_rules": [
-            "Enter only during London or New York liquidity when the 1h market regime is range-to-trend and price sweeps prior structure low then reclaims above the level on a confirmed close.",
+            "Premise: liquidity sweep edge in a range-to-trend regime. Enter only during London or New York liquidity when the 1h market regime is range-to-trend and price sweeps prior structure low then reclaims above the level on a confirmed close.",
             "Avoid chasing a failed reclaim or false break; wait for retest rejection before entry.",
         ],
         "exit_rules": ["Exit with strategy.exit using stop beyond the swept wick invalidation and target prior structure high or 1.5R bounded fallback."],
-        "risk_rules": ["Risk 1% account equity per trade and avoid overfit by using few inputs with manual validation."],
+        "risk_rules": ["Risk 1% account equity per trade, cap exposure and portfolio heat, include fees/slippage assumptions, and avoid overfit by using few inputs with backtest sample-size and out-of-sample validation."],
         "constraints": ["Price action only with no indicators; use OHLC structure, sweep, reclaim, BOS/retest, and confirmed candles."],
         "stop_loss": "Stop beyond swept wick invalidation.",
         "take_profit": "Structure target or 1.5R risk-reward fallback.",
@@ -86,6 +109,9 @@ def test_quality_scores_trader_grade_price_action_higher() -> None:
     assert report["sophistication_grade"] == "strong"
     assert report["sophistication_score"] > 85
     assert "market_premise" not in report["missing_trader_assumptions"]
+    assert report["strategy_sophistication"]["checks"]["edge_plausibility"] is True
+    assert report["strategy_sophistication"]["checks"]["execution_realism"] is True
+    assert "edge-strategy-reviewer" in report["strategy_sophistication"]["rubric_sources"]
 
 
 def test_production_gate_soft_blocks_weak_sophistication() -> None:
@@ -102,11 +128,11 @@ def test_production_gate_soft_blocks_weak_sophistication() -> None:
 def test_production_gate_allows_strong_sophistication() -> None:
     spec = _safe_strategy() | {
         "entry_rules": [
-            "Enter during London liquidity when the regime is range-to-trend, price sweeps prior low, reclaims, and retests with confirmed rejection.",
+            "Premise: liquidity sweep edge in a range-to-trend regime. Enter during London liquidity when price sweeps prior low, reclaims, and retests with confirmed rejection.",
             "Avoid chasing failed reclaim fakeouts.",
         ],
         "exit_rules": ["Stop beyond swept wick invalidation and target prior structure high or 1.5R bounded fallback."],
-        "risk_rules": ["Risk 1% account equity and avoid overfit with few bounded inputs and manual validation."],
+        "risk_rules": ["Risk 1% account equity, cap exposure, include fees/slippage, and avoid overfit with few bounded inputs, backtest sample-size review, and out-of-sample validation."],
         "stop_loss": "Stop beyond swept wick invalidation.",
         "take_profit": "Structure target or 1.5R risk-reward fallback.",
     }

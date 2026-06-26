@@ -23,7 +23,7 @@ export const buildChatRequest = (input: ChatRequest) => {
   const parsed = ChatRequestSchema.parse(input);
 
   return {
-    endpoint: "/api/chat",
+    endpoint: "/api/copilotkit-chat",
     body: {
       ...parsed,
       stream: true,

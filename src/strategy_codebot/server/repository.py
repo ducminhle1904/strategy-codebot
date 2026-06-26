@@ -1,9 +1,12 @@
+import base64
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from threading import RLock
-from typing import Protocol
+from typing import Literal, Protocol
 
 from strategy_codebot.server.auth import AuthContext
+from strategy_codebot.server.artifact_kinds import INTERNAL_ARTIFACT_KINDS
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.models import utc_now
 from strategy_codebot.server.run_modes import BACKTEST_JOB_MAX_ATTEMPTS
@@ -12,6 +15,9 @@ from strategy_codebot.server.run_modes import backtest_active_limit_from_payload
 TERMINAL_RUN_STATUSES = {"completed", "failed", "blocked", "cancelled"}
 RunEventInput = tuple[str, dict | None]
 ArtifactInput = tuple[str, str | None, str, str, dict | None]
+CONVERSATION_ARTIFACT_STATE_LIMIT = 50
+CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT = 100
+ArtifactVisibilityFilter = Literal["user", "all"]
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,12 @@ class ArtifactRecord:
 
 
 @dataclass(frozen=True)
+class ArtifactPageRecord:
+    items: list[ArtifactRecord]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
 class RunProgressSnapshotRecord:
     run: AssistantRunRecord
     event_summary: RunEventSummaryRecord
@@ -146,7 +158,10 @@ class ConversationStateSnapshotRecord:
     message_limit: int
     latest_run: AssistantRunRecord | None
     latest_run_artifacts: list[ArtifactRecord]
+    conversation_artifacts: list[ArtifactRecord]
+    conversation_artifacts_next_cursor: str | None
     latest_run_events: list[RunEventRecord]
+    conversation_run_events: list[RunEventRecord]
     latest_strategy_spec: "StrategySpecRecord | None" = None
 
 
@@ -426,6 +441,45 @@ class ConversationRepository(Protocol):
     def list_artifacts(self, auth: AuthContext, run_id: str) -> list[ArtifactRecord] | None: ...
 
     def get_artifact(self, auth: AuthContext, artifact_id: str) -> ArtifactRecord | None: ...
+
+    def list_workspace_artifacts_page(
+        self,
+        auth: AuthContext,
+        *,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord: ...
+
+    def list_conversation_artifacts_page(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord | None: ...
+
+    def get_backtest_summary(self, auth: AuthContext, run_id: str) -> dict | None: ...
+
+    def get_backtest_summaries(self, auth: AuthContext, run_ids: list[str]) -> dict[str, dict]: ...
+
+    def resolve_backtest_report_run_id(self, auth: AuthContext, conversation_id: str, requested_run_id: str) -> str | None:
+        ...
+
+    def query_backtest_trades(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        bucket: str | None = None,
+        limit: int = 20,
+    ) -> list[dict] | None: ...
+
+    def get_backtest_equity_summary(self, auth: AuthContext, run_id: str) -> dict | None: ...
+
+    def get_backtest_equity_summaries(self, auth: AuthContext, run_ids: list[str]) -> dict[str, dict]: ...
 
     def create_validation_report(
         self,
@@ -733,7 +787,34 @@ class InMemoryConversationRepository:
                 if latest_run is not None
                 else []
             )
+            all_conversation_artifacts = sorted(
+                [
+                    artifact
+                    for artifact in self._artifacts.values()
+                    if artifact.conversation_id == conversation.id
+                    and artifact.owner_user_id == auth.user_id
+                    and artifact.workspace_id == auth.workspace_id
+                    and is_user_visible_artifact_kind(artifact.kind)
+                ],
+                key=lambda artifact: (artifact.created_at, artifact.id),
+                reverse=True,
+            )
+            conversation_artifacts_page = all_conversation_artifacts[: CONVERSATION_ARTIFACT_STATE_LIMIT + 1]
+            conversation_artifacts = conversation_artifacts_page[:CONVERSATION_ARTIFACT_STATE_LIMIT]
+            conversation_artifacts_next_cursor = (
+                encode_artifact_page_cursor(conversation_artifacts[-1])
+                if len(conversation_artifacts_page) > CONVERSATION_ARTIFACT_STATE_LIMIT and conversation_artifacts
+                else None
+            )
             events = list(self._run_events.get(latest_run.id, [])) if latest_run is not None else []
+            conversation_events = sorted(
+                [
+                    event
+                    for run in runs
+                    for event in self._run_events.get(run.id, [])
+                ],
+                key=lambda event: (event.created_at, event.run_id, event.sequence, event.id),
+            )
             latest_strategy_spec = (
                 next(
                     (
@@ -749,6 +830,9 @@ class InMemoryConversationRepository:
                 else None
             )
         bounded_events = events[-max(event_limit, 0) :] if event_limit > 0 else []
+        bounded_conversation_events = (
+            conversation_events[-max(event_limit * 4, event_limit, 0) :] if event_limit > 0 else []
+        )
         return ConversationStateSnapshotRecord(
             conversation=conversation,
             messages=messages,
@@ -757,7 +841,10 @@ class InMemoryConversationRepository:
             message_limit=bounded_message_limit,
             latest_run=latest_run,
             latest_run_artifacts=artifacts,
+            conversation_artifacts=conversation_artifacts,
+            conversation_artifacts_next_cursor=conversation_artifacts_next_cursor,
             latest_run_events=bounded_events,
+            conversation_run_events=bounded_conversation_events,
             latest_strategy_spec=latest_strategy_spec,
         )
 
@@ -1211,6 +1298,111 @@ class InMemoryConversationRepository:
             return None
         return artifact
 
+    def list_workspace_artifacts_page(
+        self,
+        auth: AuthContext,
+        *,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord:
+        return self._list_artifact_page(auth, limit=limit, cursor=cursor, visibility=visibility)
+
+    def list_conversation_artifacts_page(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        return self._list_artifact_page(
+            auth,
+            conversation_id=conversation.id,
+            limit=limit,
+            cursor=cursor,
+            visibility=visibility,
+        )
+
+    def _list_artifact_page(
+        self,
+        auth: AuthContext,
+        *,
+        conversation_id: str | None = None,
+        limit: int = CONVERSATION_ARTIFACT_STATE_LIMIT,
+        cursor: str | None = None,
+        visibility: ArtifactVisibilityFilter = "user",
+    ) -> ArtifactPageRecord:
+        bounded_limit = bounded_artifact_page_limit(limit)
+        cursor_value = decode_artifact_page_cursor(cursor)
+        with self._lock:
+            artifacts = [
+                artifact
+                for artifact in self._artifacts.values()
+                if (conversation_id is None or artifact.conversation_id == conversation_id)
+                and artifact.owner_user_id == auth.user_id
+                and artifact.workspace_id == auth.workspace_id
+                and (visibility == "all" or is_user_visible_artifact_kind(artifact.kind))
+                and (
+                    cursor_value is None
+                    or (artifact.created_at, artifact.id) < cursor_value
+                )
+            ]
+        page = sorted(artifacts, key=lambda artifact: (artifact.created_at, artifact.id), reverse=True)[
+            : bounded_limit + 1
+        ]
+        items = page[:bounded_limit]
+        next_cursor = encode_artifact_page_cursor(items[-1]) if len(page) > bounded_limit and items else None
+        return ArtifactPageRecord(items=items, next_cursor=next_cursor)
+
+    def get_backtest_summary(self, auth: AuthContext, run_id: str) -> dict | None:
+        return None if self.get_run(auth, run_id) is not None else None
+
+    def get_backtest_summaries(self, auth: AuthContext, run_ids: list[str]) -> dict[str, dict]:
+        summaries: dict[str, dict] = {}
+        for run_id in dict.fromkeys(run_ids):
+            summary = self.get_backtest_summary(auth, run_id)
+            if isinstance(summary, dict):
+                summaries[run_id] = summary
+        return summaries
+
+    def resolve_backtest_report_run_id(self, auth: AuthContext, conversation_id: str, requested_run_id: str) -> str | None:
+        requested_run = self.get_run(auth, requested_run_id)
+        if requested_run is not None and requested_run.conversation_id == conversation_id:
+            return requested_run.id
+        runs = self.list_runs(auth, conversation_id)
+        if runs is None:
+            return None
+        backtest_runs = [run for run in runs if run.mode == "backtest-preview" and run.status == "completed"]
+        if not backtest_runs:
+            return None
+        return max(backtest_runs, key=lambda run: (run.updated_at, run.created_at, run.id)).id
+
+    def query_backtest_trades(
+        self,
+        auth: AuthContext,
+        run_id: str,
+        *,
+        bucket: str | None = None,
+        limit: int = 20,
+    ) -> list[dict] | None:
+        return [] if self.get_run(auth, run_id) is not None else None
+
+    def get_backtest_equity_summary(self, auth: AuthContext, run_id: str) -> dict | None:
+        return None if self.get_run(auth, run_id) is not None else None
+
+    def get_backtest_equity_summaries(self, auth: AuthContext, run_ids: list[str]) -> dict[str, dict]:
+        summaries: dict[str, dict] = {}
+        for run_id in dict.fromkeys(run_ids):
+            summary = self.get_backtest_equity_summary(auth, run_id)
+            if isinstance(summary, dict):
+                summaries[run_id] = summary
+        return summaries
+
     def create_validation_report(
         self,
         auth: AuthContext,
@@ -1501,6 +1693,41 @@ class InMemoryConversationRepository:
 
 def _now() -> datetime:
     return utc_now()
+
+
+def encode_artifact_page_cursor(artifact: ArtifactRecord) -> str:
+    payload = {
+        "created_at": artifact.created_at.isoformat(),
+        "id": artifact.id,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_artifact_page_cursor(cursor: str | None) -> tuple[datetime, str] | None:
+    if cursor is None or not cursor.strip():
+        return None
+    padding = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode((cursor + padding).encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+        created_at = datetime.fromisoformat(str(payload["created_at"]))
+        artifact_id = str(payload["id"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid artifact cursor") from exc
+    if not artifact_id:
+        raise ValueError("invalid artifact cursor")
+    return created_at, artifact_id
+
+
+def bounded_artifact_page_limit(limit: int | None) -> int:
+    if limit is None:
+        return CONVERSATION_ARTIFACT_STATE_LIMIT
+    return min(CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT, max(1, int(limit)))
+
+
+def is_user_visible_artifact_kind(kind: str) -> bool:
+    return kind not in INTERNAL_ARTIFACT_KINDS
 
 
 def _is_authorized(auth: AuthContext, conversation: ConversationRecord) -> bool:

@@ -9,6 +9,7 @@ from .helpers import backtest_config
 from .helpers import client
 from .helpers import db_rows
 from .helpers import parse_sse
+from .helpers import pine_code
 from .helpers import valid_spec
 from .helpers import wait_for_run_events
 from .helpers import write_json
@@ -22,6 +23,7 @@ def _queue_backtest(api, headers: dict[str, str], conversation_id: str, config: 
             "conversation_id": conversation_id,
             "mode": "backtest-preview",
             "strategy_spec": valid_spec(),
+            "pine_code": pine_code(),
             "backtest_config": config,
         },
     )
@@ -70,6 +72,7 @@ def test_backtest_preview_completes_with_real_worker() -> None:
                 "conversation_id": conversation["id"],
                 "mode": "backtest-preview",
                 "strategy_spec": valid_spec(),
+                "pine_code": pine_code(),
                 "backtest_config": backtest_config(),
             },
         )
@@ -92,19 +95,19 @@ def test_backtest_preview_completes_with_real_worker() -> None:
         kinds = {artifact["kind"] for artifact in artifacts}
         assert {
             "backtest_plan",
+            "backtest_dashboard",
             "backtest_report",
             "backtest_trades",
             "backtest_equity_curve",
             "backtest_source_bundle",
-            "backtest_strategy_logic",
             "market_data_cache_manifest",
             "backtest_run_metadata",
         } <= kinds
 
         report_artifact = next(artifact for artifact in artifacts if artifact["kind"] == "backtest_report")
         report = api.get(f"/v1/artifacts/{report_artifact['id']}", headers=headers).json()["content"]
-        assert report["evidence_label"] == "Backtest Kit local preview evidence"
-        assert report["execution_semantics"] == "semantic_strategy_logic"
+        assert report["evidence_label"] == "Local sandbox preview evidence"
+        assert report["execution_semantics"] == "model_generated_pine_pineforge"
         assert "TradingView proof" in " ".join(report["warnings"])
         assert report["reproducibility_hash"]
         assert report["assumptions"]["data_source"] == "public-readonly-cache"
@@ -157,6 +160,7 @@ def test_cache_reuse_and_duplicate_terminal_guards() -> None:
                     "conversation_id": conversation["id"],
                     "mode": "backtest-preview",
                     "strategy_spec": valid_spec(),
+                    "pine_code": pine_code(),
                     "backtest_config": backtest_config(),
                 },
             ).json()
@@ -260,6 +264,7 @@ def test_api_restart_preserves_persisted_run_state() -> None:
                 "conversation_id": conversation["id"],
                 "mode": "backtest-preview",
                 "strategy_spec": valid_spec(),
+                "pine_code": pine_code(),
                 "backtest_config": backtest_config(),
             },
         ).json()

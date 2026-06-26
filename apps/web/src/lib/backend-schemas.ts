@@ -1,4 +1,11 @@
 import { z } from "zod";
+import {
+  BACKTEST_EXECUTABLE_TIMEFRAMES,
+  BACKTEST_MAX_COST_BPS,
+  BACKTEST_OHLCV_DEFAULT_EXCHANGE,
+  BACKTEST_OHLCV_EXCHANGES,
+  BACKTEST_RUN_EVENTS as GENERATED_BACKTEST_RUN_EVENTS,
+} from "./backtest-ohlcv-contract";
 
 export const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([
@@ -61,8 +68,39 @@ export const ProviderStatusResponseSchema = z.object({
   allowed_message_modes: z.array(MessageModeSchema),
   allowed_run_modes: z.array(RunModeSchema),
   fallback_mode: z.enum(["deterministic"]),
+  model_routing_mode: z.string().min(1).default("registry"),
+  model_tier: z.string().nullable().optional(),
+  selected_stage_defaults: z.record(z.string(), z.string()).default({}),
+  available_gateways: z.array(z.string()).default([]),
+  route_ready: z.boolean().optional(),
+  fallback_enabled: z.boolean().optional(),
+  user_message: z.string().nullable().optional(),
   status: z.string().min(1),
   reason: z.string().nullable().optional(),
+});
+
+export const ActionRegistryEntrySchema = z.object({
+  id: z.string().min(1),
+  tool_id: z.string().min(1),
+  label: z.string().min(1),
+  prompt: z.string().min(1),
+  category: z.string().min(1),
+  risk_level: z.string().min(1),
+  next_state: z.string().min(1),
+  artifact_kind: z.string().min(1).optional(),
+  available: z.boolean(),
+  disabled_reason: z.string().min(1).optional(),
+  presentation: z.object({
+    badge_key: z.string().min(1).optional(),
+    icon_key: z.string().min(1).optional(),
+    visibility_key: z.string().min(1).optional(),
+  }),
+  required_inputs: z.array(z.string().min(1)).optional(),
+});
+
+export const ActionRegistryResponseSchema = z.object({
+  version: z.number().int().positive(),
+  actions: z.array(ActionRegistryEntrySchema),
 });
 
 export const AccountUsageResponseSchema = z.object({
@@ -172,6 +210,15 @@ export const ArtifactSchema = z.object({
   metadata_json: JsonObjectSchema.nullable(),
   visibility: z.enum(["user", "internal"]).nullable().optional(),
   category: z.enum(["code", "report", "evidence", "trace", "other"]).nullable().optional(),
+  presentation: z.object({
+    dedupe_key: z.string().min(1),
+    is_primary: z.boolean(),
+    language_hint: z.string().min(1).nullable(),
+    user_kind: z.enum(["code", "dashboard", "report", "risk", "validation", "evidence", "raw"]),
+    viewer_kind: z.enum(["code", "backtest_dashboard", "backtest_plan", "backtest_report", "trades", "json"]),
+    visibility: z.enum(["user", "internal"]),
+  }),
+  preview_summary: JsonObjectSchema.nullable().default(null),
   created_at: IsoDateTimeSchema,
 });
 
@@ -185,6 +232,11 @@ export const ArtifactPreviewResponseSchema = ArtifactSchema.extend({
   truncated: z.boolean(),
   line_count: z.number().int().nonnegative().nullable(),
   language: z.string().nullable(),
+});
+
+export const ArtifactListResponseSchema = z.object({
+  items: z.array(ArtifactSchema),
+  next_cursor: z.string().min(1).nullable(),
 });
 
 export const ConversationSidebarItemSchema = z.object({
@@ -221,22 +273,42 @@ export const StrategySpecSchema = z
   .strict();
 
 export const BacktestConfigSchema = z.object({
-  engine: z.literal("backtest-kit").default("backtest-kit"),
-  symbol: z.string().min(1),
-  timeframe: z.string().min(1),
+  engine: z.literal("pineforge").default("pineforge"),
+  exchange: z.enum(BACKTEST_OHLCV_EXCHANGES).default(BACKTEST_OHLCV_DEFAULT_EXCHANGE),
+  symbol: z.string().trim().min(1).max(64),
+  timeframe: z.enum(BACKTEST_EXECUTABLE_TIMEFRAMES),
+  candle_timeframe: z.literal("1m").default("1m"),
   start: z.string().min(1),
   end: z.string().min(1),
-  initial_capital: z.number().positive(),
-  fee_bps: z.number().nonnegative().default(0),
-  slippage_bps: z.number().nonnegative().default(0),
+  initial_capital: z.number().finite().positive(),
+  fee_bps: z.number().finite().nonnegative().max(BACKTEST_MAX_COST_BPS).default(0),
+  slippage_bps: z.number().finite().nonnegative().max(BACKTEST_MAX_COST_BPS).default(0),
   data_source: z.literal("public-readonly-cache").default("public-readonly-cache"),
+}).refine((value) => {
+  const start = Date.parse(value.start);
+  const end = Date.parse(value.end);
+  return Number.isFinite(start) && Number.isFinite(end) && end > start;
+}, "end must be after start");
+
+export const BacktestApprovalDecisionRequestSchema = z.object({
+  decision: z.enum(["approved", "rejected"]),
+});
+
+export const BacktestApprovalDecisionResponseSchema = z.object({
+  approval_id: IdSchema,
+  conversation_id: IdSchema,
+  decision: z.enum(["approved", "rejected"]),
+  status: z.enum(["queued", "rejected"]),
+  run_id: IdSchema.nullable().optional(),
+  job_id: IdSchema.nullable().optional(),
+  backtest_config: JsonObjectSchema.nullable().optional(),
 });
 
 export const RunCreateSchema = z
   .object({
     conversation_id: IdSchema,
     strategy_spec: StrategySpecSchema,
-    strategy_logic: z.record(z.string(), z.unknown()).optional(),
+    pine_code: z.string().optional(),
     mode: RunModeSchema.default("dry-run"),
     web_search: WebSearchModeSchema.default("auto"),
     backtest_config: BacktestConfigSchema.optional(),
@@ -254,6 +326,17 @@ export const RunCreateSchema = z
         code: "custom",
         message: "backtest_config is only supported when mode is backtest-preview",
         path: ["backtest_config"],
+      });
+    }
+    if (
+      value.mode === "backtest-preview" &&
+      value.backtest_config?.engine === "pineforge" &&
+      (!value.pine_code || value.pine_code.trim().length === 0)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Local preview requires PineScript v6 strategy source",
+        path: ["pine_code"],
       });
     }
   });
@@ -326,9 +409,48 @@ export const FeedbackOptionsResponseSchema = z.object({
   categories: z.array(FeedbackOptionSchema),
 });
 
+export const BACKTEST_RUN_EVENTS = GENERATED_BACKTEST_RUN_EVENTS;
+
+export const BACKTEST_PROGRESS_EVENT_TYPES = [
+  BACKTEST_RUN_EVENTS.dataPlanning,
+  BACKTEST_RUN_EVENTS.dataCacheReusing,
+  BACKTEST_RUN_EVENTS.dataFetching,
+  BACKTEST_RUN_EVENTS.dataExporting,
+  BACKTEST_RUN_EVENTS.indexingStarted,
+] as const;
+
+export const BACKTEST_RUN_EVENT_TYPES = [
+  BACKTEST_RUN_EVENTS.queued,
+  BACKTEST_RUN_EVENTS.dataStarted,
+  ...BACKTEST_PROGRESS_EVENT_TYPES,
+  BACKTEST_RUN_EVENTS.dataCompleted,
+  BACKTEST_RUN_EVENTS.executionStarted,
+  BACKTEST_RUN_EVENTS.executionCompleted,
+  BACKTEST_RUN_EVENTS.reportCompleted,
+  BACKTEST_RUN_EVENTS.failed,
+] as const;
+
+export const CHAT_AUTO_CHAIN_EVENT_TYPES = [
+  "chat.auto_chain.started",
+  "chat.auto_chain.step.completed",
+  "chat.auto_chain.waiting_for_backtest",
+  "chat.auto_chain.summary.completed",
+  "chat.auto_chain.failed",
+] as const;
+
+export const BACKTEST_PREVIEW_APPROVAL_EVENT_TYPES = [
+  "backtest.preview.approval_required",
+  "backtest.preview.approved",
+  "backtest.preview.rejected",
+  "backtest.preview.queued",
+  "backtest.preview.failed",
+  "backtest.preview.heartbeat",
+] as const;
+
 export const KNOWN_RUN_EVENT_TYPES = [
   "message.delta",
   "provider.started",
+  "provider.route",
   "provider.waiting",
   "provider.retrying",
   "model.reasoning.delta",
@@ -338,19 +460,24 @@ export const KNOWN_RUN_EVENT_TYPES = [
   "validation.completed",
   "review.completed",
   "artifact.created",
+  "knowledge.candidate.created",
+  "knowledge.candidate.approved",
+  "knowledge.candidate.auto_reviewed",
+  "knowledge.candidate.auto_approved",
+  "knowledge.candidate.needs_review",
+  "knowledge.candidate.auto_rejected",
+  "knowledge.candidate.rejected",
+  "knowledge.learning.completed",
+  "knowledge.learning.failed",
   "policy.blocked",
   "observability.stage.completed",
   "progress.snapshot",
   "progress.update",
   "stage.started",
   "stage.completed",
-  "backtest.queued",
-  "backtest.data.started",
-  "backtest.data.completed",
-  "backtest.execution.started",
-  "backtest.execution.completed",
-  "backtest.report.completed",
-  "backtest.failed",
+  ...CHAT_AUTO_CHAIN_EVENT_TYPES,
+  ...BACKTEST_PREVIEW_APPROVAL_EVENT_TYPES,
+  ...BACKTEST_RUN_EVENT_TYPES,
   "run.completed",
   "run.failed",
   "run.cancelled",
@@ -432,7 +559,10 @@ export const ConversationStateResponseSchema = z.object({
   message_limit: z.number().int().nonnegative(),
   latest_run: RunSchema.nullable(),
   latest_run_artifacts: z.array(ArtifactSchema),
+  conversation_artifacts: z.array(ArtifactSchema).default([]),
+  conversation_artifacts_next_cursor: z.string().min(1).nullable().default(null),
   latest_run_events: z.array(RunEventSchema),
+  conversation_run_events: z.array(RunEventSchema).default([]),
   feedback_targets: FeedbackTargetSchema,
   strategy_profile: StrategyProfileSchema.nullable().optional(),
 });
@@ -496,6 +626,8 @@ export type Tier = z.infer<typeof TierSchema>;
 export type WorkspaceCapability = z.infer<typeof WorkspaceCapabilitySchema>;
 export type MeResponse = z.infer<typeof MeResponseSchema>;
 export type ProviderStatusResponse = z.infer<typeof ProviderStatusResponseSchema>;
+export type ActionRegistryEntry = z.infer<typeof ActionRegistryEntrySchema>;
+export type ActionRegistryResponse = z.infer<typeof ActionRegistryResponseSchema>;
 export type AccountUsageResponse = z.infer<typeof AccountUsageResponseSchema>;
 export type ConversationCreate = z.input<typeof ConversationCreateSchema>;
 export type ConversationUpdate = z.input<typeof ConversationUpdateSchema>;
@@ -524,8 +656,15 @@ export type ArtifactContentResponse = z.infer<
 export type ArtifactPreviewResponse = z.infer<
   typeof ArtifactPreviewResponseSchema
 >;
+export type ArtifactListResponse = z.infer<typeof ArtifactListResponseSchema>;
 export type RunMode = z.infer<typeof RunModeSchema>;
 export type BacktestConfig = z.infer<typeof BacktestConfigSchema>;
+export type BacktestApprovalDecisionRequest = z.infer<
+  typeof BacktestApprovalDecisionRequestSchema
+>;
+export type BacktestApprovalDecisionResponse = z.infer<
+  typeof BacktestApprovalDecisionResponseSchema
+>;
 export type StrategySpec = z.infer<typeof StrategySpecSchema>;
 export type StrategyProfile = z.infer<typeof StrategyProfileSchema>;
 export type RunCreate = z.input<typeof RunCreateSchema>;

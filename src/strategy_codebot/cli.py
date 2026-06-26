@@ -54,7 +54,7 @@ from strategy_codebot.harness_intelligence import (
     replay_recommendations,
 )
 from strategy_codebot.harness_types import STATUS_PASS
-from strategy_codebot.live import COST_PROFILE_QUALITY, DEFAULT_USER_TIER, PROMPT_PROFILE_DEFAULT, WEB_SEARCH_DEFAULT, WORKFLOW_MULTI_AGENT, LiveRunOptions, _completion_kwargs, _provider_error_subclass, _provider_route, validate_model_stage_overrides
+from strategy_codebot.live import COST_PROFILE_QUALITY, DEFAULT_USER_TIER, PROMPT_PROFILE_DEFAULT, WEB_SEARCH_DEFAULT, WORKFLOW_MULTI_AGENT, LiveRunOptions, _completion_kwargs, _provider_error_subclass, _provider_route, _proxy_metadata_from_response, _response_to_dict, _usage_from_response, validate_model_stage_overrides
 from strategy_codebot.lightweight_models import MODEL_CANDIDATE_MATRIX_REPORT_PATH, build_model_candidate_matrix
 from strategy_codebot.knowledge import audit_run, check_registry, create_proposal, create_snapshot, diff_snapshots
 from strategy_codebot.knowledge_base import (
@@ -383,6 +383,181 @@ def models_gateways_smoke_route(
     )
     if report["status"] == "fail":
         raise typer.Exit(1)
+
+
+@model_gateways_app.command("qwen-latency")
+def models_gateways_qwen_latency(
+    out: Optional[Path] = typer.Option(None, "--out", help="Optional JSON report output path."),
+    captured_payload: Optional[Path] = typer.Option(None, "--captured-payload", help="Optional JSON file with messages/response_format from a live stage payload."),
+    alias: str = typer.Option("paid_low.pine_code_generation", "--alias", help="LiteLLM alias to compare against direct OpenRouter."),
+    timeout_seconds: float = typer.Option(90.0, "--timeout-seconds", min=1.0, help="Provider call timeout for each benchmark row."),
+    openrouter_provider: Optional[str] = typer.Option(None, "--openrouter-provider", help="Optional OpenRouter provider preference for diagnostic mode only, for example Ionstream."),
+) -> None:
+    tiny_messages = [{"role": "user", "content": "Return JSON {\"ok\": true, \"note\": \"qwen latency diagnostic\"}."}]
+    tiny_response_format = _gateway_latency_response_format()
+    alias_model = alias if "/" in alias else f"litellm_proxy/{alias}"
+    rows = [
+        _gateway_latency_row(
+            path="direct_openrouter_tiny",
+            model="openrouter/qwen/qwen3-coder-next",
+            messages=tiny_messages,
+            response_format=tiny_response_format,
+            timeout_seconds=timeout_seconds,
+            openrouter_provider=openrouter_provider,
+        ),
+        _gateway_latency_row(
+            path="litellm_alias_tiny",
+            model=alias_model,
+            messages=tiny_messages,
+            response_format=tiny_response_format,
+            timeout_seconds=timeout_seconds,
+            openrouter_provider=openrouter_provider,
+        ),
+    ]
+    if captured_payload is None:
+        rows.append(
+            {
+                "path": "litellm_alias_captured_payload",
+                "status": "skipped",
+                "model": alias_model,
+                "skip_reason": "missing_captured_payload",
+            }
+        )
+    else:
+        payload = json.loads(captured_payload.read_text(encoding="utf-8"))
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            raise typer.BadParameter("captured payload must contain a messages array")
+        response_format = payload.get("response_format") if isinstance(payload.get("response_format"), dict) else tiny_response_format
+        rows.append(
+            _gateway_latency_row(
+                path="litellm_alias_captured_payload",
+                model=alias_model,
+                messages=messages,
+                response_format=response_format,
+                timeout_seconds=timeout_seconds,
+                openrouter_provider=openrouter_provider,
+            )
+        )
+
+    pass_count = sum(1 for row in rows if row.get("status") == "pass")
+    report = {
+        "status": "pass" if pass_count else "skipped",
+        "diagnostic": "qwen3_coder_next_latency_parity",
+        "alias": alias_model,
+        "openrouter_provider_preference": openrouter_provider,
+        "rows": rows,
+    }
+    if out:
+        write_json(out, report)
+    typer.echo(f"status={report['status']} rows={len(rows)} pass={pass_count} alias={alias_model}")
+
+
+def _gateway_latency_response_format() -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "strategy_codebot_qwen_latency",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {"ok": {"type": "boolean"}, "note": {"type": "string"}},
+                "required": ["ok", "note"],
+            },
+        },
+    }
+
+
+def _gateway_latency_row(
+    *,
+    path: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    response_format: dict[str, Any],
+    timeout_seconds: float,
+    openrouter_provider: Optional[str],
+) -> dict[str, Any]:
+    route = _provider_route(model)
+    missing = route.missing_envs()
+    prompt_chars = len(json.dumps(messages, ensure_ascii=False, sort_keys=True))
+    row: dict[str, Any] = {
+        "path": path,
+        "status": "skipped" if missing else "unknown",
+        "model": model,
+        "gateway": route.gateway,
+        "route_model": route.route_model,
+        "provider": route.provider,
+        "missing_credentials": missing,
+        "prompt_chars": prompt_chars,
+    }
+    if missing:
+        return row
+    import litellm
+
+    started = time()
+    try:
+        kwargs = _completion_kwargs(
+            model=model,
+            route=route,
+            messages=messages,
+            temperature=0,
+            request_timeout=timeout_seconds,
+            response_format=response_format,
+            metadata={"strategy_codebot.diagnostic": "qwen_latency", "strategy_codebot.route_model": route.route_model},
+        )
+        if openrouter_provider and route.provider == "openrouter":
+            kwargs["extra_body"] = {"provider": {"only": [openrouter_provider]}}
+        response = litellm.completion(**kwargs)
+        latency_ms = int((time() - started) * 1000)
+        raw_response = _response_to_dict(response)
+        usage = _usage_from_response(raw_response)
+        proxy_metadata = _proxy_metadata_from_response(raw_response)
+        output_chars = _gateway_response_output_chars(raw_response)
+        row.update(
+            {
+                "status": "pass",
+                "latency_ms": latency_ms,
+                "provider_call_ms": latency_ms,
+                "proxy_overhead_ms": _optional_number(proxy_metadata.get("litellm.overhead_duration_ms") or proxy_metadata.get("litellm.litellm_overhead_time_ms")),
+                "upstream_provider_ms": _optional_number(proxy_metadata.get("litellm.response_duration_ms") or proxy_metadata.get("litellm._response_ms")),
+                "response_chars": len(json.dumps(raw_response, ensure_ascii=False)),
+                "output_chars": output_chars,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "proxy_metadata": proxy_metadata,
+            }
+        )
+    except Exception as exc:
+        row.update(
+            {
+                "status": "fail",
+                "latency_ms": int((time() - started) * 1000),
+                "failure_class": "provider_error",
+                "provider_error_subclass": _provider_error_subclass(exc),
+                "error": str(exc)[:500],
+            }
+        )
+    return row
+
+
+def _gateway_response_output_chars(raw_response: dict[str, Any]) -> int:
+    try:
+        content = raw_response["choices"][0]["message"]["content"]
+    except Exception:
+        return 0
+    return len(content) if isinstance(content, str) else len(json.dumps(content, ensure_ascii=False))
+
+
+def _optional_number(value: Any) -> float | int | None:
+    if value in (None, "", {}, []):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
 
 
 def _gateway_routes_from_registry(registry: dict[str, Any]) -> list[dict[str, Any]]:

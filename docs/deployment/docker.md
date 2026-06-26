@@ -17,7 +17,7 @@ frontend UI, broker/exchange integration, order execution, or billing.
 ## Environment
 
 ```bash
-cp .env.example .env
+cp .env.docker.example .env
 ```
 
 Edit `.env` before running Compose. At minimum set `POSTGRES_PASSWORD`,
@@ -59,7 +59,7 @@ The Compose stack also starts an internal LiteLLM Proxy service at
 `http://litellm-proxy:4000/v1`; with `compose.dev.yml` it is exposed at
 `http://127.0.0.1:4000`. Strategy Codebot routes `litellm_proxy/...` models to
 that service using `LITELLM_PROXY_API_KEY`, which defaults to the same value as
-`LITELLM_MASTER_KEY` in `.env.example`. For production, create LiteLLM virtual
+`LITELLM_MASTER_KEY` in `.env.docker.example`. For production, create LiteLLM virtual
 keys with the master key and set `LITELLM_PROXY_API_KEY` to a scoped virtual key
 instead of sharing the master key with the app.
 
@@ -93,6 +93,21 @@ The proxy exposes `diagnostics.vercel_gemini_flash_lite` as an operator-only
 smoke alias for Vercel connectivity; keep production virtual keys scoped to the
 paid tier aliases rather than this diagnostic alias.
 
+Paid-tier live harness runs should execute inside the `api` container, or from a
+host shell that has explicitly sourced `LITELLM_PROXY_API_BASE` and
+`LITELLM_PROXY_API_KEY`. The live preflight fails fast with
+`configuration_error` when a `litellm_proxy/...` route is selected without those
+gateway env vars, so missing host env does not look like a provider connection
+failure. Routine latency checks should use the container path, for example:
+
+```bash
+docker compose exec -T api strategy-codebot harness latency-matrix \
+  --suite examples/evals/price-action-smoke.yaml \
+  --runs 3 \
+  --user-tier paid_low \
+  --knowledge-context auto
+```
+
 LiteLLM Proxy owns the paid-tier provider control plane: upstream fallback,
 provider cooldowns, virtual-key budgets, spend tracking, provider quirks, and
 model rollout behind stable aliases. Strategy Codebot owns the trading workflow:
@@ -112,7 +127,7 @@ strategy-codebot models litellm keys provision \
   --out /secure/path/litellm-paid-medium-key.json
 ```
 
-The budget values in `.env.example` are documentation defaults for provisioning
+The budget values in the LiteLLM provisioning docs are defaults for provisioning
 virtual keys; LiteLLM virtual-key budgets are the source of truth for provider
 spend enforcement. Strategy Codebot still keeps API/workspace rate limits for
 application protection.
@@ -173,9 +188,27 @@ uv run pytest tests/test_server_e2e.py -q
 Provider calls should remain explicit. Do not run real LLM/live-generation
 smokes without intentionally supplying provider credentials and accepting cost.
 
-## Backtest Kit Docker E2E
+## PineForge Native Runner
 
-Run the full real-service Backtest Kit E2E stack with:
+Production `compose.yml` builds `pineforge-runner` as a self-contained native
+image. The image builds `pineforge-engine` from `PINEFORGE_ENGINE_REF` (default
+`v0.10.10`), installs `pineforge-codegen` from `PINEFORGE_CODEGEN_VERSION`
+(default `0.7.5`), and exposes readiness fields for `engine_version`,
+`codegen_version`, and `native_ready`.
+
+Do not pass a host `PINEFORGE_NATIVE_COMMAND` in production. The worker talks to
+`http://pineforge-runner:8080`; the runner compiles/runs Pine locally inside its
+own container and writes bounded artifacts to the shared artifact volume.
+
+Backtest OHLCV remains public read-only data fetched by `backtest-worker`, not by
+PineForge. Production supports `BACKTEST_WORKER_ALLOWED_EXCHANGES`
+(default `binance,bybit,okx,kraken`) and `BACKTEST_WORKER_DEFAULT_EXCHANGE`
+(default `binance`). The run `backtest_config.exchange` selects the data venue
+for reproducibility; it is not a broker or live-execution setting.
+
+## PineForge Docker E2E
+
+Run the full real-service PineForge E2E stack with:
 
 ```bash
 scripts/e2e-docker.sh --build --workers 4
@@ -208,3 +241,30 @@ success it is torn down unless `--keep` is passed.
 The optional `public-data-smoke` target flips the worker to CCXT/public data for
 one narrow smoke. Keep it serial and explicit because public data providers can
 rate limit or fail independently of Strategy Codebot.
+
+## Production Live Backtest Smoke
+
+Use the production-only smoke when you intentionally want the full live path:
+real model generation, production `compose.yml`, CCXT public OHLCV, native
+`pineforge-runner`, and BTC 1Y with `1m` execution candles.
+
+```bash
+OPENROUTER_API_KEY=... \
+STRATEGY_CODEBOT_RUN_PROD_LIVE_SMOKE=1 \
+scripts/prod-live-backtest-smoke.sh --build --provider openrouter --symbol BTC/USDT --exchange binance --timeframe 1h --candle-timeframe 1m --days 365
+```
+
+For Vercel AI Gateway:
+
+```bash
+VERCEL_AI_GATEWAY_API_KEY=... \
+STRATEGY_CODEBOT_RUN_PROD_LIVE_SMOKE=1 \
+scripts/prod-live-backtest-smoke.sh --build --provider vercel-ai-gateway --symbol BTC/USDT --exchange binance --timeframe 1h --candle-timeframe 1m --days 365
+```
+
+The script refuses `STRATEGY_CODEBOT_LLM_MODE=fake`, sets the selected gateway
+through `STRATEGY_CODEBOT_LLM_PROVIDER`/`STRATEGY_CODEBOT_LLM_MODEL`, sets
+`BACKTEST_WORKER_MARKET_DATA_MODE=ccxt`, and writes evidence to
+`reports/prod-live-smoke/<timestamp>/`. For warm-cache performance confirmation,
+rerun the same range with `--reuse-range`; the pytest assertion expects range-v2
+cache reuse and a fast worker path.

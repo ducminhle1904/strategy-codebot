@@ -63,6 +63,8 @@ export type ChatSuggestionCategory =
   | "risk"
   | "strategy";
 
+export type ChatSuggestionRiskLevel = "blocked" | "read_only" | "review_required";
+
 export type ChatSuggestionVariant = {
   id: string;
   insert_template: string;
@@ -71,6 +73,7 @@ export type ChatSuggestionVariant = {
 
 export type ChatSuggestionItem = {
   action: ChatSuggestionAction;
+  artifact_kind?: string;
   category: ChatSuggestionCategory;
   disabled_reason?: string;
   emphasized?: boolean;
@@ -79,9 +82,19 @@ export type ChatSuggestionItem = {
   insert_template?: string;
   kind: ChatSuggestionKind;
   label: string;
+  next_state?: string;
+  presentation?: {
+    badge_key?: string;
+    icon_key?: string;
+    visibility_key?: string;
+  };
   priority: number;
   prompt?: string;
+  reason?: string;
+  required_inputs?: string[];
+  risk_level?: ChatSuggestionRiskLevel;
   slot?: "entry" | "exit" | "market" | "risk";
+  tool_id?: string;
   variants?: ChatSuggestionVariant[];
 };
 
@@ -90,9 +103,14 @@ export type ChatSuggestionsPayload = {
   composer_blocks: ChatSuggestionItem[];
   context?: {
     artifact_available?: boolean;
+    artifact_kinds?: string[];
     intent?: ResponseIntent;
     missing_fields?: string[];
     readiness?: string;
+    semantic_action_confidence?: number;
+    semantic_action_intent?: string;
+    semantic_action_source?: string;
+    semantic_suggested_actions?: string[];
   };
   version: 1;
 };
@@ -227,11 +245,14 @@ export function marketSnapshotFromPythonEvent(event: PythonSseEvent): MarketSnap
   if (event.event !== "chat.market_snapshot") {
     return null;
   }
-  const payload = event.data.payload;
-  if (!payload || typeof payload !== "object") {
+  return marketSnapshotFromPayload(event.data.payload);
+}
+
+export function marketSnapshotFromPayload(value: unknown): MarketSnapshot | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
   }
-  const record = payload as Record<string, unknown>;
+  const record = value as Record<string, unknown>;
   const symbol = sourceText(record.symbol);
   const label = sourceText(record.label);
   const sources = normalizeSources(record.sources);
@@ -330,6 +351,14 @@ export const textFromPythonEvent = (
     ) {
       return "";
     }
+    if (
+      payload &&
+      typeof payload === "object" &&
+      ((payload as Record<string, unknown>).dimension === "workflow" ||
+        (payload as Record<string, unknown>).code === "pine_validation_failed")
+    ) {
+      return runFailureMessage(event, language);
+    }
     return `\n\n${runFailureMessage(event, language)}`;
   }
 
@@ -377,9 +406,14 @@ function normalizeSuggestionContext(value: unknown): ChatSuggestionsPayload["con
     : [];
   return {
     artifact_available: record.artifact_available === true,
+    artifact_kinds: normalizeStringList(record.artifact_kinds),
     intent: normalizeResponseIntent(record.intent) ?? undefined,
     missing_fields: missingFields,
     readiness: sourceText(record.readiness),
+    semantic_action_confidence: sourceNumber(record.semantic_action_confidence) ?? undefined,
+    semantic_action_intent: sourceText(record.semantic_action_intent),
+    semantic_action_source: sourceText(record.semantic_action_source),
+    semantic_suggested_actions: normalizeStringList(record.semantic_suggested_actions),
   };
 }
 
@@ -412,13 +446,45 @@ function normalizeSuggestions(value: unknown): ChatSuggestionItem[] {
       insert_template: sourceText(record.insert_template),
       kind,
       label,
+      next_state: sourceText(record.next_state),
+      presentation: normalizeSuggestionPresentation(record.presentation),
       priority: typeof record.priority === "number" ? record.priority : 100,
       prompt: sourceText(record.prompt),
+      reason: sourceText(record.reason),
+      required_inputs: normalizeStringList(record.required_inputs),
+      risk_level: normalizeSuggestionRiskLevel(record.risk_level),
       ...(slot ? { slot } : {}),
+      artifact_kind: sourceText(record.artifact_kind),
+      tool_id: sourceText(record.tool_id),
       variants: normalizeSuggestionVariants(record.variants),
     });
   }
   return suggestions.sort((left, right) => left.priority - right.priority).slice(0, 8);
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    const text = sourceText(item);
+    return text ? [text] : [];
+  });
+}
+
+function normalizeSuggestionPresentation(value: unknown): ChatSuggestionItem["presentation"] | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const presentation = {
+    badge_key: sourceText(record.badge_key),
+    icon_key: sourceText(record.icon_key),
+    visibility_key: sourceText(record.visibility_key),
+  };
+  return presentation.badge_key || presentation.icon_key || presentation.visibility_key
+    ? presentation
+    : undefined;
 }
 
 function normalizeSuggestionVariants(value: unknown): ChatSuggestionVariant[] {
@@ -465,6 +531,12 @@ function normalizeSuggestionCategory(value: unknown): ChatSuggestionCategory | n
     value === "strategy"
     ? value
     : null;
+}
+
+function normalizeSuggestionRiskLevel(value: unknown): ChatSuggestionRiskLevel | undefined {
+  return value === "blocked" || value === "read_only" || value === "review_required"
+    ? value
+    : undefined;
 }
 
 function normalizeSuggestionSlot(value: unknown): ChatSuggestionItem["slot"] | null {
@@ -532,6 +604,13 @@ export const runFailureMessage = (
   const payload = event.data.payload;
   if (payload && typeof payload === "object") {
     const record = payload as Record<string, unknown>;
+    if (
+      (record.dimension === "workflow" || record.code === "pine_validation_failed") &&
+      typeof record.message === "string" &&
+      record.message.trim()
+    ) {
+      return record.message.trim();
+    }
     if (record.code === "provider_timeout" || record.error === "ProviderTimeoutError") {
       return isVi
         ? "AI provider phản hồi quá lâu. Bạn có thể thử lại sau khi provider ổn định hơn."

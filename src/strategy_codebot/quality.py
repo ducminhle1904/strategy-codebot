@@ -21,14 +21,23 @@ VAGUE_RULE_PATTERNS = (
     r"\btbd\b",
     r"\bto be determined\b",
 )
-TRADER_ASSUMPTION_CHECKS = (
-    ("market_premise", (r"\bregime\b", r"\btrend\b", r"\brange\b", r"\bvolatil", r"\bliquidity\b", r"\bsession\b", r"\bmarket structure\b")),
-    ("entry_trigger", (r"\bconfirmed\b", r"\breclaim\b", r"\bretest\b", r"\bbreak of structure\b", r"\bbos\b", r"\brejection\b", r"\bsweep\b", r"\bcross(?:es|ing)?\b")),
-    ("invalidation", (r"\binvalidat", r"\bstop\b", r"\bstop-loss\b", r"\bwick\b", r"\bswept\b", r"\blevel breaks\b")),
-    ("structure_target", (r"\btarget\b", r"\btake profit\b", r"\brisk[- ]?reward\b", r"\b\\d+(?:\\.\\d+)?r\b", r"\bstructure\b")),
-    ("false_break_handling", (r"\bfakeout\b", r"\bfalse break\b", r"\bfailed reclaim\b", r"\bavoid chasing\b", r"\breclaim\b", r"\bsweep\b")),
-    ("session_liquidity_timeframe", (r"\bsession\b", r"\blondon\b", r"\bnew york\b", r"\basia\b", r"\bweekend\b", r"\bliquidity\b", r"\btimeframe\b", r"\b\d+[mhdw]\b")),
+TRADER_ASSUMPTION_RUBRIC = (
+    ("market_premise", (r"\bregime\b", r"\btrend\b", r"\brange\b", r"\bvolatil", r"\bliquidity\b", r"\bsession\b", r"\bmarket structure\b"), "State the market regime or liquidity condition where the setup is expected to make sense.", True),
+    ("edge_plausibility", (r"\bedge\b", r"\bthesis\b", r"\bpremise\b", r"\bwhy\b", r"\binefficien", r"\bliquidity sweep\b", r"\bmean reversion\b", r"\bmomentum\b"), "State why the setup should have an edge in the named regime without claiming expected profit.", False),
+    ("entry_trigger", (r"\bconfirmed\b", r"\breclaim\b", r"\bretest\b", r"\bbreak of structure\b", r"\bbos\b", r"\brejection\b", r"\bsweep\b", r"\bcross(?:es|ing)?\b"), "Make the entry trigger observable and confirmed, not discretionary.", False),
+    ("invalidation", (r"\binvalidat", r"\bstop\b", r"\bstop-loss\b", r"\bwick\b", r"\bswept\b", r"\blevel breaks\b"), "Define the price action that proves the setup wrong before coding entries.", True),
+    ("structure_target", (r"\btarget\b", r"\btake profit\b", r"\brisk[- ]?reward\b", r"\b\\d+(?:\\.\\d+)?r\b", r"\bstructure\b"), "Tie exits to structure targets or a bounded reward/risk fallback.", True),
+    ("exit_calibration", (r"\bexit\b", r"\btake profit\b", r"\btarget\b", r"\brisk[- ]?reward\b", r"\b\\d+(?:\\.\\d+)?r\b", r"\bholding\b"), "Calibrate exits with structure, bounded reward/risk, or holding assumptions instead of open-ended exits.", False),
+    ("risk_concentration", (r"\b1\s*%\b", r"\b2\s*%\b", r"\bfixed risk\b", r"\bportfolio heat\b", r"\bexposure\b", r"\bcorrelation\b", r"\bleverage\b"), "State bounded per-trade risk and exposure or portfolio-heat assumptions.", True),
+    ("execution_realism", (r"\bslippage\b", r"\bspread\b", r"\bfee\b", r"\bfill\b", r"\bliquidity\b", r"\bsession\b", r"\bexecution\b"), "Account for spread, slippage, fees, liquidity, session, or fill assumptions that affect preview realism.", False),
+    ("sample_adequacy", (r"\bsample\b", r"\btrade count\b", r"\bout-of-sample\b", r"\bwalk-forward\b", r"\bbacktest\b", r"\bvalidation\b"), "State sample-size, backtest, out-of-sample, or validation assumptions before judging robustness.", False),
+    ("false_break_handling", (r"\bfakeout\b", r"\bfalse break\b", r"\bfailed reclaim\b", r"\bavoid chasing\b", r"\breclaim\b", r"\bsweep\b"), "Describe fakeout or failed-reclaim handling so the strategy does not chase every break.", False),
+    ("session_liquidity_timeframe", (r"\bsession\b", r"\blondon\b", r"\bnew york\b", r"\basia\b", r"\bweekend\b", r"\bliquidity\b", r"\btimeframe\b", r"\b\d+[mhdw]\b"), "Name timeframe, session, or liquidity assumptions that affect execution quality.", False),
 )
+TRADER_ASSUMPTION_CHECKS = tuple((name, patterns) for name, patterns, _hint, _critical in TRADER_ASSUMPTION_RUBRIC)
+TRADER_ASSUMPTION_HINTS = {name: hint for name, _patterns, hint, _critical in TRADER_ASSUMPTION_RUBRIC}
+BOUNDED_RISK_PATTERNS = (r"\b1\s*%\b", r"\b2\s*%\b", r"\bfixed risk\b", r"\bfixed fractional\b", r"\bfixed units\b", r"\bbounded\b")
+RISK_CONCENTRATION_PATTERNS = (r"\bportfolio heat\b", r"\bexposure\b", r"\bcorrelat", r"\bleverage\b")
 OVERFIT_TERMS = (
     "optimize",
     "curve fit",
@@ -40,7 +49,7 @@ OVERFIT_TERMS = (
     "manual validation",
 )
 PRICE_ACTION_FORBIDDEN_TERMS = ("ta.atr", "ta.sma", "ta.ema", "ta.wma", "ta.rma", "ta.rsi", "ta.macd", "ta.stoch")
-SOFT_GATE_CRITICAL_ASSUMPTIONS = {"market_premise", "invalidation", "structure_target"}
+SOFT_GATE_CRITICAL_ASSUMPTIONS = {name for name, _patterns, _hint, critical in TRADER_ASSUMPTION_RUBRIC if critical}
 
 
 def assess_strategy_quality(
@@ -179,7 +188,11 @@ def _assess_strategy_sophistication(strategy_spec: dict[str, Any], code: str) ->
         *(strategy_spec.get("constraints") or []),
         code,
     )
-    missing = [name for name, patterns in TRADER_ASSUMPTION_CHECKS if not _matches_any(text, patterns)]
+    missing = [
+        name
+        for name, patterns in TRADER_ASSUMPTION_CHECKS
+        if not (_risk_concentration_present(text) if name == "risk_concentration" else _matches_any(text, patterns))
+    ]
     hints = [_sophistication_hint(name) for name in missing]
     points = {
         name: name not in missing
@@ -211,6 +224,12 @@ def _assess_strategy_sophistication(strategy_spec: dict[str, Any], code: str) ->
         "score": score,
         "grade": grade,
         "warn_only": True,
+        "rubric_sources": [
+            "edge-strategy-reviewer",
+            "technical-analyst",
+            "position-sizer",
+            "backtest-expert",
+        ],
         "checks": points,
         "missing_trader_assumptions": missing,
         "improvement_hints": hints,
@@ -221,16 +240,12 @@ def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _risk_concentration_present(text: str) -> bool:
+    return _matches_any(text, BOUNDED_RISK_PATTERNS) and _matches_any(text, RISK_CONCENTRATION_PATTERNS)
+
+
 def _sophistication_hint(name: str) -> str:
-    hints = {
-        "market_premise": "State the market regime or liquidity condition where the setup is expected to make sense.",
-        "entry_trigger": "Make the entry trigger observable and confirmed, not discretionary.",
-        "invalidation": "Define the price action that proves the setup wrong before coding entries.",
-        "structure_target": "Tie exits to structure targets or a bounded reward/risk fallback.",
-        "false_break_handling": "Describe fakeout or failed-reclaim handling so the strategy does not chase every break.",
-        "session_liquidity_timeframe": "Name timeframe, session, or liquidity assumptions that affect execution quality.",
-    }
-    return hints.get(name, f"Add a concrete {name.replace('_', ' ')} assumption.")
+    return TRADER_ASSUMPTION_HINTS.get(name, f"Add a concrete {name.replace('_', ' ')} assumption.")
 
 
 def _pine_input_count(code: str) -> int:

@@ -2,6 +2,7 @@ import logging
 from typing import Any
 
 from strategy_codebot.server.redaction import redact_text
+from strategy_codebot.server.tool_errors import ToolExecutionError
 
 PROVIDER_ERROR_CODE = "provider_unavailable"
 PROVIDER_RETRY_AFTER_SECONDS = 30
@@ -35,7 +36,7 @@ def provider_run_failed_payload(exc: Exception) -> dict[str, str | bool]:
             "message": "The AI provider rejected the configured API key.",
             "retryable": False,
         }
-    if error_class == "RateLimitError":
+    if error_class == "RateLimitError" or _looks_rate_limited(exc):
         return {
             "code": "provider_rate_limited",
             "error": error_class,
@@ -50,6 +51,20 @@ def provider_run_failed_payload(exc: Exception) -> dict[str, str | bool]:
     }
 
 
+def run_failed_payload(exc: Exception) -> dict[str, Any]:
+    if isinstance(exc, ToolExecutionError):
+        return exc.payload()
+    return provider_run_failed_payload(exc)
+
+
+def _looks_rate_limited(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True
+    message = str(exc).lower()
+    return any(token in message for token in ("quota", "rate limit", "rate-limit", "429"))
+
+
 def log_provider_exception(exc: Exception, *, run_id: str | None = None, trace_id: str | None = None) -> None:
     _LOGGER.warning(
         "provider_error error_class=%s run_id=%s trace_id=%s message=%s",
@@ -58,3 +73,17 @@ def log_provider_exception(exc: Exception, *, run_id: str | None = None, trace_i
         trace_id,
         redact_text(str(exc)),
     )
+
+
+def log_run_exception(exc: Exception, *, run_id: str | None = None, trace_id: str | None = None) -> None:
+    if isinstance(exc, ToolExecutionError):
+        _LOGGER.warning(
+            "workflow_error error_class=%s code=%s run_id=%s trace_id=%s message=%s",
+            exc.__class__.__name__,
+            exc.code,
+            run_id,
+            trace_id,
+            redact_text(str(exc)),
+        )
+        return
+    log_provider_exception(exc, run_id=run_id, trace_id=trace_id)

@@ -1,4 +1,6 @@
 import re
+from datetime import UTC
+from datetime import datetime
 from pathlib import Path
 
 from alembic import command
@@ -15,6 +17,7 @@ from strategy_codebot.server.database import create_sqlite_repository
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.models import Artifact
 from strategy_codebot.server.models import AssistantRun
+from strategy_codebot.server.models import BacktestReport
 from strategy_codebot.server.models import Base
 from strategy_codebot.server.models import ConversationThread
 from strategy_codebot.server.models import User
@@ -22,6 +25,7 @@ from strategy_codebot.server.models import Workspace
 from strategy_codebot.server.schemas import ArtifactResponse
 from strategy_codebot.server.repository import InMemoryConversationRepository
 from strategy_codebot.server.run_modes import BACKTEST_JOB_MAX_ATTEMPTS
+from strategy_codebot.server.sql_repository import SQLAlchemyConversationRepository
 
 
 AUTH_A = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-a"}
@@ -40,6 +44,10 @@ REQUIRED_TABLES = {
     "run_events",
     "tool_calls",
     "artifacts",
+    "backtest_reports",
+    "backtest_trade_index",
+    "backtest_equity_summary",
+    "backtest_runner_stats",
     "strategy_specs",
     "validation_reports",
     "review_reports",
@@ -47,7 +55,14 @@ REQUIRED_TABLES = {
     "usage_ledger",
 }
 
-INITIAL_MIGRATION_TABLES = REQUIRED_TABLES - {"conversation_memories", "run_jobs"}
+INITIAL_MIGRATION_TABLES = REQUIRED_TABLES - {
+    "conversation_memories",
+    "run_jobs",
+    "backtest_reports",
+    "backtest_trade_index",
+    "backtest_equity_summary",
+    "backtest_runner_stats",
+}
 
 
 def test_sqlalchemy_metadata_includes_api_tables() -> None:
@@ -624,8 +639,45 @@ def test_sqlite_repository_conversation_state_snapshot_uses_latest_run_and_bound
     assert snapshot.latest_run.id == latest_run.id
     assert [event.sequence for event in snapshot.latest_run_events] == list(range(6, 36))
     assert [event.payload["index"] for event in snapshot.latest_run_events if event.payload] == list(range(5, 35))
+    assert [event.payload["index"] for event in snapshot.conversation_run_events if event.payload] == [
+        *range(35),
+        999,
+    ]
     assert full_replay is not None
     assert len(full_replay) == 35
+
+
+def test_sqlite_repository_resolves_latest_backtest_report_for_conversation() -> None:
+    engine = create_engine_for_url("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    session_factory = create_session_factory(engine)
+    repository = SQLAlchemyConversationRepository(session_factory)
+    auth = AuthContext("user-a", "workspace-a")
+    conversation = repository.create_conversation(auth, "Backtest reports")
+    older_run = repository.create_run(auth, conversation.id, status="completed", mode="backtest-preview")
+    newer_run = repository.create_run(auth, conversation.id, status="completed", mode="backtest-preview")
+    other_conversation = repository.create_conversation(auth, "Other backtest reports")
+    other_run = repository.create_run(auth, other_conversation.id, status="completed", mode="backtest-preview")
+    assert older_run is not None
+    assert newer_run is not None
+    assert other_run is not None
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                _backtest_report("report_old", older_run.id, created_at=datetime(2026, 1, 1, tzinfo=UTC)),
+                _backtest_report("report_new", newer_run.id, created_at=datetime(2026, 1, 2, tzinfo=UTC)),
+                _backtest_report("report_other", other_run.id, created_at=datetime(2026, 1, 3, tzinfo=UTC)),
+            ]
+        )
+        session.commit()
+
+    assert repository.resolve_backtest_report_run_id(auth, conversation.id, older_run.id) == older_run.id
+    assert repository.resolve_backtest_report_run_id(auth, conversation.id, "run_hallucinated") == newer_run.id
+    assert (
+        repository.resolve_backtest_report_run_id(AuthContext("user-b", "workspace-a"), conversation.id, "run_hallucinated")
+        is None
+    )
 
 
 def test_artifact_storage_key_is_internal_to_public_serializer() -> None:
@@ -641,6 +693,26 @@ def test_artifact_storage_key_is_internal_to_public_serializer() -> None:
     assert public["id"] == artifact.id
     assert public["display_name"] == "strategy.pine"
     assert "storage_key" not in public
+
+
+def _backtest_report(report_id: str, run_id: str, *, created_at: datetime) -> BacktestReport:
+    return BacktestReport(
+        id=report_id,
+        run_id=run_id,
+        owner_user_id="user-a",
+        workspace_id="workspace-a",
+        engine="pineforge",
+        evidence_label="Local preview evidence",
+        execution_semantics="model_generated_pine_pineforge",
+        symbol="BTC/USDT",
+        signal_timeframe="1h",
+        candle_timeframe="1m",
+        metrics_json={"trade_count": 1},
+        assumptions_json=[],
+        warnings_json=[],
+        reproducibility_hash=None,
+        created_at=created_at,
+    )
 
 
 def _insert_artifact(session: Session) -> Artifact:

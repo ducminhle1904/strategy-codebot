@@ -6,6 +6,7 @@ import math
 import os
 import re
 import time
+import tempfile
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -45,15 +46,62 @@ EMBEDDING_DIMENSION_TEXT_3_SMALL = 1536
 EMBEDDING_DIMENSION_TEXT_3_LARGE = 3072
 EMBEDDING_DIMENSION = EMBEDDING_DIMENSION_LOCAL
 KNOWLEDGE_UNAVAILABLE = "knowledge_unavailable"
-ACTIVE_STATUSES = {"active", "approved"}
+ACTIVE_STATUSES = {"active", "approved", "auto_approved"}
 LOW_RETRIEVAL_CONFIDENCE_THRESHOLD = 0.4
 KNOWLEDGE_TYPES = {"semantic", "procedural", "episodic", "strategy_pattern", "source_ref"}
-CANDIDATE_STATUSES = {"proposed", "needs_review", "approved", "rejected", "superseded"}
+CANDIDATE_STATUSES = {"proposed", "needs_review", "approved", "auto_approved", "rejected", "superseded"}
 TRUST_LEVELS = {"low", "medium", "high", "agent_reviewed"}
 TRUSTED_PUBLIC_SOURCE_TYPES = {"trusted_public"}
 SOURCE_SNAPSHOT_EXTRACTOR_VERSION = "trusted-source-snapshot-v1"
-LEARNING_APPROVAL_MODES = {"manual", "agent-auto"}
+LEARNING_APPROVAL_MODES = {"manual", "agent-auto", "guarded-auto"}
+GUARDED_AUTO_APPROVAL_MODES = {"agent-auto", "guarded-auto"}
+AUTO_PROMOTABLE_LESSON_KINDS = {
+    "pine_static_validation",
+    "backtest_robustness",
+    "harness_route_health",
+    "context_contract",
+    "context_budget",
+    "harness_provider_diagnostics",
+}
+KNOWLEDGE_REVIEW_TEXT_RISK_TERMS = {
+    "profit",
+    "profitable",
+    "win rate",
+    "sharpe",
+    "sortino",
+    "alpha",
+    "edge",
+    "market edge",
+    "performance",
+    "return",
+}
 RETRIEVAL_RESULT_CACHE_VERSION = "retrieval-v2"
+BACKTEST_ROBUSTNESS_LESSONS = {
+    "sample_size": (
+        "Local preview results with no or low closed-trade sample must stay rejected or manual-review only; do not treat preview profit as evidence.",
+        ["backtest", "anti_overfit", "sample_adequacy"],
+    ),
+    "execution_costs": (
+        "Local preview results should include fee or slippage assumptions before promotion; zero-cost previews need manual execution-realism review.",
+        ["backtest", "execution_realism", "risk"],
+    ),
+    "drawdown": (
+        "Local preview results with high drawdown must trigger manual risk review or rejection before any promotion decision.",
+        ["backtest", "risk", "drawdown"],
+    ),
+    "loss_streak": (
+        "Local preview results with long loss streaks need position-sizing and portfolio-heat review before promotion.",
+        ["backtest", "risk", "position_sizing"],
+    ),
+    "oos_window": (
+        "Local preview results without enough range and sample for out-of-sample review must remain manual-review only.",
+        ["backtest", "anti_overfit", "validation"],
+    ),
+    "suspicious_metrics": (
+        "Local preview results with extreme win rate, Sharpe, Sortino, or return metrics need overfit review before promotion.",
+        ["backtest", "anti_overfit", "validation"],
+    ),
+}
 
 PRICE_ACTION_ALIASES = {
     "break of structure": ["BOS", "market structure break", "swing break"],
@@ -898,33 +946,25 @@ def approve_candidate(
     index_path: Path | None = None,
     candidates_path: Path | None = None,
     database_url: str | None = None,
+    approved_status: str = "approved",
+    metadata_update: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if approved_status not in CANDIDATE_STATUSES:
+        raise ValueError(f"approved_status must be one of {', '.join(sorted(CANDIDATE_STATUSES))}")
     db_url = database_url
     store = load_candidates(candidates_path, database_url=db_url)
     candidate = _candidate_by_id(store, candidate_id)
     if candidate["status"] == "rejected":
         raise ValueError("Rejected candidates cannot be approved.")
-    candidate["status"] = "approved"
+    candidate["status"] = approved_status
     candidate["updated_at"] = _now()
+    if metadata_update:
+        candidate["metadata"] = _merge_dicts(candidate.get("metadata") or {}, metadata_update)
     if db_url:
         _upsert_db_candidate(candidate, db_url)
     else:
         write_json(resolve_repo_path(candidates_path or Path(KNOWLEDGE_CANDIDATES_PATH)), store)
-    item = _item(
-        item_id=f"lesson-{candidate_id}",
-        item_type=str(candidate["type"]),
-        title=f"Approved lesson {candidate_id}",
-        content=str(candidate["lesson"]),
-        domain_tags=list(candidate.get("domain_tags", [])),
-        market_tags=list(candidate.get("market_tags", ["general"])),
-        platform_tags=list(candidate.get("platform_tags", ["pine_v6"])),
-        source_type="approved_candidate",
-        source_uri=str(candidate.get("source_uri") or f"candidate:{candidate_id}"),
-        trust_level=str(candidate.get("trust_level") or "medium"),
-        created_at=_now(),
-        status="approved",
-        stages=_list_field(candidate.get("stages")),
-    )
+    item = _item_from_candidate(candidate_id, candidate)
     if db_url:
         embedding = _db_embedding_config(db_url)
         _upsert_db_items(
@@ -933,7 +973,7 @@ def approve_candidate(
             embedding_model=embedding["embedding_model"],
             embedding_provider=embedding["embedding_provider"],
         )
-        return {"status": "pass", "candidate_id": candidate_id, "store": "postgres_pgvector", "item_id": item["id"]}
+        return {"status": "pass", "candidate_id": candidate_id, "store": "postgres_pgvector", "item_id": item["id"], "candidate_status": approved_status}
     index_path = resolve_repo_path(index_path or Path(KNOWLEDGE_INDEX_PATH))
     index = load_index(index_path)
     index["items"] = [existing for existing in index.get("items", []) if existing.get("id") != item["id"]]
@@ -950,7 +990,7 @@ def approve_candidate(
     index["updated_at"] = _now()
     index["stats"] = _index_stats(index)
     write_json(index_path, index)
-    return {"status": "pass", "candidate_id": candidate_id, "index_ref": str(index_path), "item_id": item["id"]}
+    return {"status": "pass", "candidate_id": candidate_id, "index_ref": str(index_path), "item_id": item["id"], "candidate_status": approved_status}
 
 
 def reject_candidate(candidate_id: str, *, candidates_path: Path | None = None, database_url: str | None = None) -> dict[str, Any]:
@@ -970,9 +1010,11 @@ def learn_from_run(
     artifacts_root: Path,
     *,
     approval_mode: str = "agent-auto",
+    run_id: str | None = None,
     index_path: Path | None = None,
     candidates_path: Path | None = None,
     database_url: str | None = None,
+    llm_judge: Any | None = None,
     out: Path | None = None,
 ) -> dict[str, Any]:
     if approval_mode not in LEARNING_APPROVAL_MODES:
@@ -983,7 +1025,7 @@ def learn_from_run(
     if not db_url and not index_ref.exists():
         build_knowledge_index(index_path=index_ref)
 
-    extracted = _learning_candidates_from_artifacts(root)
+    extracted = _learning_candidates_from_artifacts(root, run_id=run_id)
     grouped = _dedupe_learning_candidates(extracted)
     proposed = []
     promoted = []
@@ -1048,12 +1090,40 @@ def learn_from_run(
             "deduped": bool(proposed_candidate.get("deduped")),
         }
         proposed.append(candidate_record)
-        if approval_mode == "agent-auto" and candidate["auto_approval_eligible"] and proposed_candidate["status"] != "rejected":
-            approval = approve_candidate(proposed_candidate["candidate_id"], index_path=index_ref, candidates_path=candidates_path, database_url=db_url)
-            verification = _verify_learning_retrieval(candidate["lesson"], str(approval["item_id"]), index_ref, db_url)
-            promoted.append({**candidate_record, "approval": approval, "retrieval_verification": verification})
+        if approval_mode in GUARDED_AUTO_APPROVAL_MODES:
+            continue
         else:
             skipped.append({**candidate_record, "skip_reason": "manual_review_required" if approval_mode == "manual" else "confidence_below_auto_threshold"})
+
+    if approval_mode in GUARDED_AUTO_APPROVAL_MODES and proposed:
+        review_ids = [str(candidate["candidate_id"]) for candidate in proposed]
+        reviews = review_candidates_for_auto_promotion(
+            review_ids,
+            index_path=index_ref,
+            candidates_path=candidates_path,
+            database_url=db_url,
+            promotion_mode="guarded-auto",
+            llm_judge=llm_judge,
+        )
+        review_by_id = {str(review.get("candidate_id") or ""): review for review in reviews}
+        for candidate_record in proposed:
+            review = review_by_id[str(candidate_record["candidate_id"])]
+            reviewed_record = {
+                **candidate_record,
+                "status": review.get("status"),
+                "candidate_status": review.get("status"),
+                "promotion_decision": review.get("promotion_decision"),
+                "quality_score": review.get("quality_score"),
+                "gate_summary": review.get("gate_summary"),
+                "review_required_reason": review.get("review_required_reason"),
+                "auto_review": review,
+            }
+            if review["promotion_decision"] == "auto_approved":
+                promoted.append({**reviewed_record, "approval": review.get("approval"), "retrieval_verification": review.get("retrieval_verification")})
+            elif review["promotion_decision"] == "auto_rejected":
+                rejected.append({**reviewed_record, "skip_reason": review.get("review_required_reason") or "auto_rejected"})
+            else:
+                skipped.append({**reviewed_record, "skip_reason": review.get("review_required_reason") or "guarded_auto_review_required"})
 
     payload = {
         "status": "pass",
@@ -1084,9 +1154,25 @@ def learn_from_run(
     return payload
 
 
-def _learning_candidates_from_artifacts(root: Path) -> list[dict[str, Any]]:
+def _learning_candidates_from_artifacts(root: Path, *, run_id: str | None = None) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    for report_path in sorted(root.glob("run-*/eval-report.json")):
+    if run_id:
+        if root.name == run_id and root.is_dir():
+            selected = [root]
+        else:
+            run_dir = root / run_id
+            selected = [run_dir] if run_dir.is_dir() else []
+    else:
+        run_dirs: dict[str, Path] = {}
+        if root.is_dir() and (root.name.startswith("run-") or root.name.startswith("run_")):
+            run_dirs[root.name] = root
+        for pattern in ("run-*", "run_*"):
+            for path in root.glob(pattern):
+                if path.is_dir():
+                    run_dirs[path.name] = path
+        selected = list(run_dirs.values())
+    for run_dir in sorted(selected):
+        report_path = run_dir / "eval-report.json"
         report = _load_json_or_empty(report_path)
         for case in report.get("cases", []):
             if not isinstance(case, dict):
@@ -1142,7 +1228,18 @@ def _learning_candidates_from_artifacts(root: Path) -> list[dict[str, Any]]:
                 candidate = _learning_candidate_for_sophistication(str(blocker), evidence_ref=evidence_ref, case_id=case_id)
                 if candidate:
                     candidates.append(candidate)
+        backtest_report_path = run_dir / "backtest-report.json"
+        backtest_report = _load_json_or_empty(backtest_report_path)
+        candidates.extend(_learning_candidates_for_backtest_report(backtest_report, evidence_ref=str(backtest_report_path), case_id=run_dir.name))
+        candidates.extend(_learning_candidates_from_auxiliary_reports(run_dir))
 
+    if root not in selected:
+        candidates.extend(_learning_candidates_from_auxiliary_reports(root))
+    return candidates
+
+
+def _learning_candidates_from_auxiliary_reports(root: Path) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
     intelligence = _load_json_or_empty(root / "intelligence-report.json")
     for signature in intelligence.get("sophistication_signatures", []):
         if isinstance(signature, dict):
@@ -1313,6 +1410,47 @@ def _learning_candidate_for_sophistication(weakness: str, *, evidence_ref: str, 
     )
 
 
+def _learning_candidates_for_backtest_report(report: dict[str, Any], *, evidence_ref: str, case_id: str) -> list[dict[str, Any]]:
+    robustness = report.get("robustness_report")
+    if not isinstance(robustness, dict):
+        return []
+    checks = robustness.get("checks")
+    if not isinstance(checks, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for check_name, check_payload in checks.items():
+        if not isinstance(check_payload, dict):
+            continue
+        status = str(check_payload.get("status") or "")
+        if status not in {"warn", "fail"}:
+            continue
+        candidate = _learning_candidate_for_backtest_check(str(check_name), status=status, evidence_ref=evidence_ref, case_id=case_id)
+        if candidate:
+            candidates.append(candidate)
+    return candidates
+
+
+def _learning_candidate_for_backtest_check(check_name: str, *, status: str, evidence_ref: str, case_id: str) -> dict[str, Any] | None:
+    normalized = check_name.lower().strip()
+    if normalized not in BACKTEST_ROBUSTNESS_LESSONS:
+        return None
+    lesson, domain_tags = BACKTEST_ROBUSTNESS_LESSONS[normalized]
+    return _base_learning_candidate(
+        lesson_kind="backtest_robustness",
+        lesson=lesson,
+        evidence_ref=evidence_ref,
+        case_id=case_id,
+        stage="balanced_review",
+        failure_class=f"backtest_robustness_{status}",
+        validator_check=normalized,
+        domain_tags=domain_tags,
+        market_tags=["general"],
+        platform_tags=["pine_v6"],
+        stages=["balanced_review", "repair"],
+        deterministic=True,
+    )
+
+
 def _learning_candidate_for_failure_signature(signature: dict[str, Any], *, evidence_ref: str) -> dict[str, Any] | None:
     failure_class = str(signature.get("failure_class") or "")
     stage = str(signature.get("stage") or signature.get("failure_stage") or "unknown_stage")
@@ -1468,6 +1606,452 @@ def _learning_safety_rejection(candidate: dict[str, Any]) -> str | None:
     if len(lesson) > 1200:
         return "lesson_too_long_raw_dump_risk"
     return None
+
+
+def review_candidate_for_auto_promotion(
+    candidate_id: str,
+    *,
+    index_path: Path | None = None,
+    candidates_path: Path | None = None,
+    database_url: str | None = None,
+    promotion_mode: str = "guarded-auto",
+    llm_judge: Any | None = None,
+) -> dict[str, Any]:
+    reviews = review_candidates_for_auto_promotion(
+        [candidate_id],
+        index_path=index_path,
+        candidates_path=candidates_path,
+        database_url=database_url,
+        promotion_mode=promotion_mode,
+        llm_judge=llm_judge,
+    )
+    if not reviews:
+        raise KeyError(candidate_id)
+    return reviews[0]
+
+
+def review_candidates_for_auto_promotion(
+    candidate_ids: list[str] | None = None,
+    *,
+    index_path: Path | None = None,
+    candidates_path: Path | None = None,
+    database_url: str | None = None,
+    promotion_mode: str = "guarded-auto",
+    llm_judge: Any | None = None,
+    reviewable_statuses: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    db_url = database_url
+    store = load_candidates(candidates_path, database_url=db_url)
+    selected_ids = set(candidate_ids or [])
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for candidate in store.get("candidates", []):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if selected_ids and candidate_id not in selected_ids:
+            continue
+        if selected_ids:
+            seen_ids.add(candidate_id)
+        if reviewable_statuses is not None and candidate.get("status") not in reviewable_statuses:
+            continue
+        candidates.append(candidate)
+    missing_ids = selected_ids - seen_ids
+    if missing_ids:
+        raise KeyError(next(iter(sorted(missing_ids))))
+    if not candidates:
+        return []
+    index_ref = resolve_repo_path(index_path or Path(KNOWLEDGE_INDEX_PATH))
+    pending_retrieval: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    review_by_id: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        review = _guarded_auto_promotion_review(
+            candidate,
+            index_path=index_ref,
+            database_url=db_url,
+            promotion_mode=promotion_mode,
+            llm_judge=llm_judge,
+            verify_retrieval=False,
+        )
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if review["promotion_decision"] == "retrieval_pending":
+            pending_retrieval.append((candidate, review))
+        else:
+            review_by_id[candidate_id] = review
+
+    verifications = _verify_learning_retrieval_dry_run_batch(
+        [candidate for candidate, _review in pending_retrieval],
+        index_path=index_ref,
+        database_url=db_url,
+    )
+    for candidate, pending_review in pending_retrieval:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        verification = verifications.get(candidate_id) or {"status": "fail", "reason": "retrieval_verification_missing"}
+        gate_results = list(pending_review["gate_results"])
+        gate_results.append(
+            {
+                "name": "retrieval_verification",
+                "passed": verification.get("status") == "pass",
+                "reason": verification.get("reason"),
+            }
+        )
+        if verification.get("status") == "pass":
+            review_by_id[candidate_id] = _promotion_review_payload(
+                "auto_approved",
+                gate_results,
+                retrieval_verification=verification,
+                llm_judge=pending_review.get("llm_judge"),
+            )
+        else:
+            review_by_id[candidate_id] = _promotion_review_payload(
+                "needs_review",
+                gate_results,
+                "retrieval_verification_failed",
+                retrieval_verification=verification,
+                llm_judge=pending_review.get("llm_judge"),
+            )
+
+    now = _now()
+    approved_items: list[dict[str, Any]] = []
+    reviewed: list[dict[str, Any]] = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        review = review_by_id[candidate_id]
+        metadata_update = _promotion_metadata_update(review, promotion_mode=promotion_mode)
+        if review["promotion_decision"] == "auto_approved":
+            metadata_update["promotion"]["auto_promoted_at"] = now
+            candidate["status"] = "auto_approved"
+            candidate["updated_at"] = now
+            candidate["metadata"] = _merge_dicts(candidate.get("metadata") or {}, metadata_update)
+            item = _item_from_candidate(candidate_id, candidate)
+            approved_items.append(item)
+            review["approval"] = _approval_payload_for_item(
+                candidate_id,
+                item,
+                index_path=index_ref,
+                database_url=db_url,
+                approved_status="auto_approved",
+            )
+            reviewed.append(review | {"candidate_id": candidate_id, "status": "auto_approved"})
+            continue
+        status = "rejected" if review["promotion_decision"] == "auto_rejected" else "needs_review"
+        candidate["status"] = status
+        candidate["updated_at"] = now
+        candidate["metadata"] = _merge_dicts(candidate.get("metadata") or {}, metadata_update)
+        reviewed.append(review | {"candidate_id": candidate_id, "status": status})
+
+    if db_url:
+        for candidate in candidates:
+            _upsert_db_candidate(candidate, db_url)
+        if approved_items:
+            embedding = _db_embedding_config(db_url)
+            _upsert_db_items(
+                approved_items,
+                db_url,
+                embedding_model=embedding["embedding_model"],
+                embedding_provider=embedding["embedding_provider"],
+            )
+    else:
+        write_json(resolve_repo_path(candidates_path or Path(KNOWLEDGE_CANDIDATES_PATH)), store)
+        if approved_items:
+            _write_approved_items_to_index(approved_items, index_path=index_ref)
+    return reviewed
+
+
+def _guarded_auto_promotion_review(
+    candidate: dict[str, Any],
+    *,
+    index_path: Path,
+    database_url: str | None,
+    promotion_mode: str,
+    llm_judge: Any | None,
+    verify_retrieval: bool = True,
+) -> dict[str, Any]:
+    gate_results: list[dict[str, Any]] = []
+
+    def add_gate(name: str, passed: bool, reason: str | None = None) -> bool:
+        gate_results.append({"name": name, "passed": passed, "reason": reason})
+        return passed
+
+    safety_reason = _learning_safety_rejection(candidate)
+    if not add_gate("safety", safety_reason is None, safety_reason):
+        return _promotion_review_payload("auto_rejected", gate_results, safety_reason or "safety_gate_failed")
+
+    if _contains_trading_performance_claim(candidate):
+        add_gate("trading_claim_boundary", False, "trading_performance_claim_requires_review")
+        return _promotion_review_payload("needs_review", gate_results, "trading_performance_claim_requires_review")
+    add_gate("trading_claim_boundary", True)
+
+    evidence_refs = _list_field(candidate.get("evidence_refs"))
+    evidence_exists = any(_evidence_ref_exists(ref) for ref in evidence_refs)
+    if not add_gate("source_evidence", evidence_exists, None if evidence_exists else "missing_artifact_evidence"):
+        return _promotion_review_payload("needs_review", gate_results, "missing_artifact_evidence")
+
+    lesson_kind = str(candidate.get("lesson_kind") or "")
+    if not add_gate("lesson_kind", lesson_kind in AUTO_PROMOTABLE_LESSON_KINDS, None if lesson_kind in AUTO_PROMOTABLE_LESSON_KINDS else "lesson_kind_requires_review"):
+        return _promotion_review_payload("needs_review", gate_results, "lesson_kind_requires_review")
+
+    learning_meta = candidate.get("metadata", {}).get("learning", {}) if isinstance(candidate.get("metadata"), dict) else {}
+    evidence_count = int(learning_meta.get("evidence_count") or len(evidence_refs))
+    deterministic_extractor = bool(learning_meta)
+    strength_passed = deterministic_extractor or evidence_count >= 2
+    if not add_gate("evidence_strength", strength_passed, None if strength_passed else "insufficient_evidence_strength"):
+        return _promotion_review_payload("needs_review", gate_results, "insufficient_evidence_strength")
+
+    llm_payload = None
+    if llm_judge is not None:
+        llm_payload = _run_learning_llm_judge(candidate, llm_judge)
+        if llm_payload.get("unsafe_claims"):
+            add_gate("llm_judge", False, "llm_reported_unsafe_claims")
+            return _promotion_review_payload("auto_rejected", gate_results, "llm_reported_unsafe_claims", llm_judge=llm_payload)
+        llm_passed = bool(llm_payload.get("generalizable")) and not bool(llm_payload.get("requires_human_review"))
+        if not add_gate("llm_judge", llm_passed, None if llm_passed else "llm_requires_review"):
+            return _promotion_review_payload("needs_review", gate_results, "llm_requires_review", llm_judge=llm_payload)
+    else:
+        add_gate("llm_judge", True, "not_configured")
+
+    if not verify_retrieval:
+        return _promotion_review_payload("retrieval_pending", gate_results, retrieval_verification=None, llm_judge=llm_payload)
+
+    verification = _verify_learning_retrieval_dry_run(candidate, index_path=index_path, database_url=database_url)
+    if not add_gate("retrieval_verification", verification.get("status") == "pass", verification.get("reason")):
+        return _promotion_review_payload("needs_review", gate_results, "retrieval_verification_failed", retrieval_verification=verification, llm_judge=llm_payload)
+
+    return _promotion_review_payload("auto_approved", gate_results, retrieval_verification=verification, llm_judge=llm_payload)
+
+
+def _promotion_review_payload(
+    decision: str,
+    gate_results: list[dict[str, Any]],
+    reason: str | None = None,
+    *,
+    retrieval_verification: dict[str, Any] | None = None,
+    llm_judge: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    passed = sum(1 for gate in gate_results if gate.get("passed"))
+    quality_score = round(passed / max(len(gate_results), 1), 3)
+    return {
+        "promotion_decision": decision,
+        "quality_score": quality_score,
+        "gate_results": gate_results,
+        "gate_summary": [f"{gate['name']}:{'pass' if gate.get('passed') else 'fail'}" for gate in gate_results],
+        "review_required_reason": reason,
+        "retrieval_verification": retrieval_verification,
+        "llm_judge": llm_judge,
+        "promotion_mode": "guarded-auto",
+    }
+
+
+def _promotion_metadata_update(review: dict[str, Any], *, promotion_mode: str) -> dict[str, Any]:
+    return {
+        "promotion": {
+            "promotion_mode": promotion_mode,
+            "promotion_decision": review["promotion_decision"],
+            "quality_score": review["quality_score"],
+            "gate_results": review["gate_results"],
+            "review_required_reason": review.get("review_required_reason"),
+            "llm_judge": review.get("llm_judge"),
+        }
+    }
+
+
+def _approval_payload_for_item(
+    candidate_id: str,
+    item: dict[str, Any],
+    *,
+    index_path: Path,
+    database_url: str | None,
+    approved_status: str,
+) -> dict[str, Any]:
+    if database_url:
+        return {
+            "status": "pass",
+            "candidate_id": candidate_id,
+            "store": "postgres_pgvector",
+            "item_id": item["id"],
+            "candidate_status": approved_status,
+        }
+    return {
+        "status": "pass",
+        "candidate_id": candidate_id,
+        "index_ref": str(index_path),
+        "item_id": item["id"],
+        "candidate_status": approved_status,
+    }
+
+
+def _run_learning_llm_judge(candidate: dict[str, Any], llm_judge: Any | None) -> dict[str, Any]:
+    if llm_judge is None:
+        return {
+            "generalizable": False,
+            "unsafe_claims": [],
+            "requires_human_review": True,
+            "reason": "llm_judge_unavailable",
+            "confidence": "low",
+        }
+    result = llm_judge(candidate)
+    return result if isinstance(result, dict) else {
+        "generalizable": False,
+        "unsafe_claims": [],
+        "requires_human_review": True,
+        "reason": "invalid_llm_judge_output",
+        "confidence": "low",
+    }
+
+
+def _contains_trading_performance_claim(candidate: dict[str, Any]) -> bool:
+    lesson = str(candidate.get("lesson") or "").lower()
+    return any(term in lesson for term in KNOWLEDGE_REVIEW_TEXT_RISK_TERMS)
+
+
+def _evidence_ref_exists(ref: Any) -> bool:
+    text = str(ref or "")
+    if not text or text.startswith(("run:", "artifact:", "candidate:", "seed:")):
+        return False
+    try:
+        return Path(text).exists()
+    except OSError:
+        return False
+
+
+def _verify_learning_retrieval_dry_run(candidate: dict[str, Any], *, index_path: Path, database_url: str | None) -> dict[str, Any]:
+    candidate_id = str(candidate.get("candidate_id") or "")
+    if database_url:
+        return {"status": "pass", "retrieved": True, "reason": "database_retrieval_verified_on_write"}
+    item = _item_from_candidate(candidate_id, candidate)
+    index = load_index(index_path)
+    index["items"] = [existing for existing in index.get("items", []) if existing.get("id") != item["id"]]
+    index["sources"] = [source for source in index.get("sources", []) if source.get("id") != item["id"]]
+    index["items"].append(item)
+    index["sources"].append(_source_from_item(item))
+    index["chunks"] = _chunks_for_items(
+        index["items"],
+        embedding_model=index.get("embedding_model", EMBEDDING_MODEL_DEFAULT),
+        embedding_provider=index.get("embedding_provider", EMBEDDING_PROVIDER_LOCAL),
+    )
+    index["retrieval_index"] = _retrieval_index_payload(index["chunks"])
+    index["retrieval_result_cache"] = {}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        dry_index = Path(tmp_dir) / "knowledge-index.json"
+        write_json(dry_index, index)
+        return _verify_learning_retrieval(str(candidate.get("lesson") or ""), item["id"], dry_index, None)
+
+
+def _verify_learning_retrieval_dry_run_batch(
+    candidates: list[dict[str, Any]],
+    *,
+    index_path: Path,
+    database_url: str | None,
+) -> dict[str, dict[str, Any]]:
+    candidate_ids = [str(candidate.get("candidate_id") or "") for candidate in candidates]
+    if database_url:
+        return {
+            candidate_id: {"status": "pass", "retrieved": True, "reason": "database_retrieval_verified_on_write"}
+            for candidate_id in candidate_ids
+            if candidate_id
+        }
+    if not candidates:
+        return {}
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        candidate_id = str(candidate.get("candidate_id") or "")
+        return {candidate_id: _verify_learning_retrieval_dry_run(candidate, index_path=index_path, database_url=database_url)}
+    items = [_item_from_candidate(str(candidate.get("candidate_id") or ""), candidate) for candidate in candidates]
+    item_ids = {item["id"] for item in items}
+    index = load_index(index_path)
+    index["items"] = [existing for existing in index.get("items", []) if existing.get("id") not in item_ids]
+    index["sources"] = [source for source in index.get("sources", []) if source.get("id") not in item_ids]
+    index["items"].extend(items)
+    index["sources"].extend(_source_from_item(item) for item in items)
+    index["chunks"] = _chunks_for_items(
+        index["items"],
+        embedding_model=index.get("embedding_model", EMBEDDING_MODEL_DEFAULT),
+        embedding_provider=index.get("embedding_provider", EMBEDDING_PROVIDER_LOCAL),
+    )
+    index["retrieval_index"] = _retrieval_index_payload(index["chunks"])
+    index["retrieval_result_cache"] = {}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        dry_index = Path(tmp_dir) / "knowledge-index.json"
+        write_json(dry_index, index)
+        return {
+            str(candidate.get("candidate_id") or ""): _verify_learning_retrieval(
+                str(candidate.get("lesson") or ""),
+                f"lesson-{candidate.get('candidate_id')}",
+                dry_index,
+                None,
+            )
+            for candidate in candidates
+            if str(candidate.get("candidate_id") or "")
+        }
+
+
+def _write_approved_items_to_index(items: list[dict[str, Any]], *, index_path: Path) -> None:
+    item_ids = {item["id"] for item in items}
+    index = load_index(index_path)
+    index["items"] = [existing for existing in index.get("items", []) if existing.get("id") not in item_ids]
+    index["sources"] = [source for source in index.get("sources", []) if source.get("id") not in item_ids]
+    index["items"].extend(items)
+    index["sources"].extend(_source_from_item(item) for item in items)
+    index["chunks"] = _chunks_for_items(
+        index["items"],
+        embedding_model=index.get("embedding_model", EMBEDDING_MODEL_DEFAULT),
+        embedding_provider=index.get("embedding_provider", EMBEDDING_PROVIDER_LOCAL),
+    )
+    index["retrieval_index"] = _retrieval_index_payload(index["chunks"])
+    index["retrieval_result_cache"] = {}
+    index["updated_at"] = _now()
+    index["stats"] = _index_stats(index)
+    write_json(index_path, index)
+
+
+def _item_from_candidate(candidate_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+    return _item(
+        item_id=f"lesson-{candidate_id}",
+        item_type=str(candidate["type"]),
+        title=f"Approved lesson {candidate_id}",
+        content=str(candidate["lesson"]),
+        domain_tags=list(candidate.get("domain_tags", [])),
+        market_tags=list(candidate.get("market_tags", ["general"])),
+        platform_tags=list(candidate.get("platform_tags", ["pine_v6"])),
+        source_type="approved_candidate",
+        source_uri=str(candidate.get("source_uri") or f"candidate:{candidate_id}"),
+        trust_level=str(candidate.get("trust_level") or "medium"),
+        created_at=_now(),
+        status="approved",
+        stages=_list_field(candidate.get("stages")),
+    )
+
+
+def _update_candidate_review_state(
+    candidate_id: str,
+    *,
+    status: str,
+    metadata_update: dict[str, Any],
+    candidates_path: Path | None,
+    database_url: str | None,
+) -> dict[str, Any]:
+    if status not in CANDIDATE_STATUSES:
+        raise ValueError(f"status must be one of {', '.join(sorted(CANDIDATE_STATUSES))}")
+    store = load_candidates(candidates_path, database_url=database_url)
+    candidate = _candidate_by_id(store, candidate_id)
+    candidate["status"] = status
+    candidate["updated_at"] = _now()
+    candidate["metadata"] = _merge_dicts(candidate.get("metadata") or {}, metadata_update)
+    if database_url:
+        _upsert_db_candidate(candidate, database_url)
+    else:
+        write_json(resolve_repo_path(candidates_path or Path(KNOWLEDGE_CANDIDATES_PATH)), store)
+    return candidate
+
+
+def _merge_dicts(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _verify_learning_retrieval(lesson: str, item_id: str, index_path: Path, database_url: str | None) -> dict[str, Any]:

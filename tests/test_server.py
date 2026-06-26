@@ -108,8 +108,65 @@ def test_provider_status_does_not_expose_secrets() -> None:
     payload = response.json()
     assert payload["tier"] == "paid_low"
     assert "allowed_run_modes" in payload
+    assert "model_routing_mode" in payload
+    assert "route_ready" in payload
+    assert "user_message" in payload
     assert "api_key" not in str(payload).lower()
     assert "secret" not in str(payload).lower()
+
+
+def test_provider_status_defaults_to_registry_routing(monkeypatch) -> None:
+    monkeypatch.delenv("STRATEGY_CODEBOT_LLM_ROUTING", raising=False)
+    client = TestClient(create_app())
+
+    response = client.get("/v1/provider/status", headers=AUTH_A)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["model_routing_mode"] == "registry"
+
+
+def test_action_registry_exposes_backend_action_metadata() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/v1/action-registry", headers=AUTH_A)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    tool_ids = {action["tool_id"] for action in payload["actions"]}
+    assert "build_robustness_report" in tool_ids
+    assert "query_backtest_trades" in tool_ids
+    robustness = next(action for action in payload["actions"] if action["tool_id"] == "build_robustness_report")
+    assert robustness["artifact_kind"] == "robustness_report"
+    assert all(action.get("presentation", {}).get("icon_key") for action in payload["actions"])
+    assert all(action.get("presentation", {}).get("badge_key") for action in payload["actions"])
+    assert all(action.get("presentation", {}).get("visibility_key") for action in payload["actions"])
+
+
+def test_provider_status_returns_user_safe_registry_routing_fields(monkeypatch) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_LLM_ROUTING", "registry")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    client = TestClient(create_app())
+
+    response = client.get("/v1/provider/status", headers=AUTH_A)
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["model_routing_mode"] == "registry"
+    assert payload["model_tier"] == "paid_low"
+    assert payload["selected_stage_defaults"]["strategy_reasoning"] in {
+        "Managed model route",
+        "OpenRouter route",
+        "Vercel AI Gateway route",
+        "OpenAI route",
+        "Configured model route",
+    }
+    assert "openrouter" in payload["available_gateways"]
+    assert isinstance(payload["fallback_enabled"], bool)
+    serialized = str(payload)
+    assert "OPENROUTER_API_KEY" not in serialized
+    assert "test-openrouter-key" not in serialized
+    assert "paid_low.strategy_reasoning" not in serialized
 
 
 def test_free_tier_can_use_backend_routed_agent_message_mode() -> None:

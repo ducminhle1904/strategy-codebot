@@ -32,6 +32,7 @@ stage_timeouts:
   strategy_coding: 60
   pine_code_generation: 90
   balanced_review: 60
+  knowledge_learning_review: 60
   repair: 90
 route_policy:
   cooldown_seconds: 600
@@ -59,6 +60,35 @@ web_search:
       supports_web_search: false
       web_search_mode: candidate_unverified
 model_tiers:
+  dev:
+    billing: developer
+    max_repair_loops: 1
+    allow_tier_escalation: false
+    routes_by_stage:
+      strategy_reasoning:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      strategy_coding:
+        - openrouter/qwen/qwen3-coder:free
+        - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+        - openrouter/poolside/laguna-m.1:free
+      pine_code_generation:
+        - openrouter/qwen/qwen3-coder:free
+        - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+        - openrouter/poolside/laguna-m.1:free
+      balanced_review:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      knowledge_learning_review:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      repair:
+        - openrouter/qwen/qwen3-coder:free
+        - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
+        - openrouter/poolside/laguna-m.1:free
   free:
     billing: free
     max_repair_loops: 1
@@ -80,6 +110,10 @@ model_tiers:
         - openrouter/meta-llama/llama-3.3-70b-instruct:free
         - openrouter/nex-agi/nex-n2-pro:free
         - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
+      knowledge_learning_review:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       repair:
         - openrouter/qwen/qwen3-coder:free
         - openrouter/qwen/qwen3-next-80b-a3b-instruct:free
@@ -87,6 +121,9 @@ model_tiers:
   paid_low:
     billing: paid
     max_repair_loops: 2
+    max_llm_repair_loops: 1
+    max_post_repair_reviews: 1
+    allow_deterministic_repair_after_budget: true
     allow_tier_escalation: false
     routes_by_stage:
       strategy_reasoning:
@@ -100,11 +137,16 @@ model_tiers:
         - litellm_proxy/paid_low.strategy_coding_qwen
         - litellm_proxy/paid_medium.strategy_coding
       pine_code_generation:
-        - litellm_proxy/paid_low.pine_code_generation
         - litellm_proxy/paid_low.pine_code_generation_qwen
         - litellm_proxy/paid_low.pine_code_generation_vercel
         - litellm_proxy/paid_medium.pine_code_generation
+        - litellm_proxy/paid_low.pine_code_generation
       balanced_review:
+        - litellm_proxy/paid_low.balanced_review
+        - litellm_proxy/paid_low.balanced_review_vercel
+        - litellm_proxy/paid_low.balanced_review_minimax
+        - litellm_proxy/paid_medium.balanced_review
+      knowledge_learning_review:
         - litellm_proxy/paid_low.balanced_review
         - litellm_proxy/paid_low.balanced_review_vercel
         - litellm_proxy/paid_low.balanced_review_minimax
@@ -127,6 +169,8 @@ model_tiers:
         - litellm_proxy/paid_medium.pine_code_generation
       balanced_review:
         - litellm_proxy/paid_medium.balanced_review
+      knowledge_learning_review:
+        - litellm_proxy/paid_medium.balanced_review
       repair:
         - litellm_proxy/paid_medium.repair
   paid_high:
@@ -141,6 +185,8 @@ model_tiers:
       pine_code_generation:
         - litellm_proxy/paid_high.pine_code_generation
       balanced_review:
+        - litellm_proxy/paid_high.balanced_review
+      knowledge_learning_review:
         - litellm_proxy/paid_high.balanced_review
       repair:
         - litellm_proxy/paid_high.repair

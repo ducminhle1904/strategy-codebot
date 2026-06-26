@@ -2,11 +2,15 @@
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { UIMessage } from "ai";
 import { ArrowDownIcon, DownloadIcon } from "lucide-react";
 import type { ComponentProps } from "react";
 import { useCallback } from "react";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
+
+type UIMessage = {
+  role: string;
+  parts: Array<{ type: string; text?: string }>;
+};
 
 export type ConversationProps = ComponentProps<typeof StickToBottom>;
 
@@ -26,10 +30,12 @@ export type ConversationContentProps = ComponentProps<
 
 export const ConversationContent = ({
   className,
+  scrollClassName,
   ...props
 }: ConversationContentProps) => (
   <StickToBottom.Content
     className={cn("flex flex-col gap-8 p-4", className)}
+    scrollClassName={cn("no-scrollbar", scrollClassName)}
     {...props}
   />
 );

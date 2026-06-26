@@ -187,6 +187,15 @@ class Artifact(TenantMixin, Base):
     __tablename__ = "artifacts"
     __table_args__ = (
         Index("ix_artifacts_workspace_owner", "workspace_id", "owner_user_id"),
+        Index("ix_artifacts_workspace_owner_created_id", "workspace_id", "owner_user_id", "created_at", "id"),
+        Index(
+            "ix_artifacts_conversation_workspace_owner_created_id",
+            "conversation_id",
+            "workspace_id",
+            "owner_user_id",
+            "created_at",
+            "id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
@@ -197,6 +206,79 @@ class Artifact(TenantMixin, Base):
     display_name: Mapped[str] = mapped_column(String(255), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
     metadata_json: Mapped[dict | None] = mapped_column(JSON)
+
+
+class BacktestReport(TenantMixin, Base):
+    __tablename__ = "backtest_reports"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_backtest_reports_run"),
+        Index("ix_backtest_reports_workspace_owner", "workspace_id", "owner_user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("assistant_runs.id"), nullable=False, index=True)
+    engine: Mapped[str] = mapped_column(String(40), nullable=False)
+    evidence_label: Mapped[str] = mapped_column(String(160), nullable=False)
+    execution_semantics: Mapped[str] = mapped_column(String(80), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    signal_timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    candle_timeframe: Mapped[str] = mapped_column(String(16), nullable=False)
+    metrics_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    assumptions_json: Mapped[list | None] = mapped_column(JSON)
+    warnings_json: Mapped[list | None] = mapped_column(JSON)
+    reproducibility_hash: Mapped[str | None] = mapped_column(String(160), index=True)
+
+
+class BacktestTradeIndex(TenantMixin, Base):
+    __tablename__ = "backtest_trade_index"
+    __table_args__ = (
+        UniqueConstraint("run_id", "trade_rank", name="uq_backtest_trade_index_run_rank"),
+        Index("ix_backtest_trade_index_workspace_owner", "workspace_id", "owner_user_id"),
+        Index("ix_backtest_trade_index_run_bucket", "run_id", "bucket"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("assistant_runs.id"), nullable=False, index=True)
+    trade_rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    bucket: Mapped[str] = mapped_column(String(40), nullable=False)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pnl_cost: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    pnl_percentage: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+
+class BacktestEquitySummary(TenantMixin, Base):
+    __tablename__ = "backtest_equity_summary"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_backtest_equity_summary_run"),
+        Index("ix_backtest_equity_summary_workspace_owner", "workspace_id", "owner_user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("assistant_runs.id"), nullable=False, index=True)
+    sample_resolution: Mapped[str] = mapped_column(String(40), nullable=False)
+    points_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    drawdown_windows_json: Mapped[list | None] = mapped_column(JSON)
+    monthly_returns_json: Mapped[list | None] = mapped_column(JSON)
+
+
+class BacktestRunnerStats(TenantMixin, Base):
+    __tablename__ = "backtest_runner_stats"
+    __table_args__ = (
+        UniqueConstraint("run_id", name="uq_backtest_runner_stats_run"),
+        Index("ix_backtest_runner_stats_workspace_owner", "workspace_id", "owner_user_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("assistant_runs.id"), nullable=False, index=True)
+    runner: Mapped[str] = mapped_column(String(80), nullable=False)
+    runner_version: Mapped[str | None] = mapped_column(String(120))
+    bars_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    compile_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    run_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    artifact_manifest_json: Mapped[dict | None] = mapped_column(JSON)
 
 
 class StrategySpec(TenantMixin, Base):
