@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from strategy_codebot.nautilus_runtime import RUNTIME_EVENTS
+from strategy_codebot.server.bot_proposal_status import BotProposalStatus
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
 from strategy_codebot.server.run_modes import RUN_MODE_DRY_RUN
 from strategy_codebot.server.run_modes import BACKTEST_ENGINE_PINEFORGE
@@ -64,6 +66,158 @@ class AccountUsageResponse(BaseModel):
     output_tokens: int
     total_tokens: int
     estimated_cost_usd: float | None = None
+
+
+class NautilusRuntimeStartRequest(BaseModel):
+    broker_connection_id: str = Field(min_length=1, max_length=120)
+    account_id: str = Field(min_length=1, max_length=120)
+    mode: Literal["paper", "live"] = "paper"
+    risk_policy_id: str = Field(min_length=1, max_length=120)
+    strategy_id: str = Field(min_length=1, max_length=160)
+    manifest: dict[str, Any] = Field(default_factory=dict)
+    data_subscriptions: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+
+    @field_validator("broker_connection_id", "account_id", "risk_policy_id", "strategy_id")
+    @classmethod
+    def normalize_runtime_identity(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("runtime identity fields cannot be blank")
+        return normalized
+
+
+class NautilusRuntimeHeartbeatRequest(BaseModel):
+    status: Literal["ok"] = "ok"
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+
+class NautilusRuntimeEventCreate(BaseModel):
+    type: str = Field(min_length=1, max_length=80)
+    payload: dict[str, Any] | None = None
+
+    @field_validator("type")
+    @classmethod
+    def validate_runtime_event_type(cls, value: str) -> str:
+        if value not in RUNTIME_EVENTS:
+            raise ValueError(f"unsupported Nautilus runtime event: {value}")
+        return value
+
+
+class NautilusRuntimeKillSwitchRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class BotProposalCreateRequest(BaseModel):
+    strategy_artifact_id: str | None = Field(default=None, min_length=1, max_length=120)
+    run_id: str | None = Field(default=None, min_length=1, max_length=120)
+    broker_connection_id: str | None = Field(default=None, max_length=120)
+    account_id: str | None = Field(default=None, max_length=120)
+    risk_policy_id: str | None = Field(default=None, max_length=120)
+    strategy_id: str | None = Field(default=None, max_length=160)
+    strategy_name: str | None = Field(default=None, max_length=240)
+    manifest: dict[str, Any] = Field(default_factory=dict)
+    data_subscriptions: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    readiness_checks: list[str] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_source(self) -> "BotProposalCreateRequest":
+        if not self.strategy_artifact_id and not self.run_id and not self.strategy_id and not self.manifest:
+            raise ValueError("strategy_artifact_id, run_id, strategy_id, or manifest is required")
+        return self
+
+    @field_validator("broker_connection_id", "account_id", "risk_policy_id", "strategy_id", "strategy_name")
+    @classmethod
+    def normalize_optional_string(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class BotProposalConfirmStartRequest(BaseModel):
+    broker_connection_id: str | None = Field(default=None, max_length=120)
+    account_id: str | None = Field(default=None, max_length=120)
+    risk_policy_id: str | None = Field(default=None, max_length=120)
+
+    @field_validator("broker_connection_id", "account_id", "risk_policy_id")
+    @classmethod
+    def normalize_optional_identity(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class BotProposalResponse(BaseModel):
+    id: str
+    status: BotProposalStatus
+    source_conversation_id: str | None = None
+    source_run_id: str | None = None
+    source_artifact_ids: list[str] = Field(default_factory=list)
+    strategy_id: str
+    strategy_name: str
+    manifest: dict[str, Any] = Field(default_factory=dict)
+    data_subscriptions: list[dict[str, Any]] = Field(default_factory=list)
+    broker_connection_id: str | None = None
+    account_id: str | None = None
+    risk_policy_id: str | None = None
+    readiness_checks: list[str] = Field(default_factory=list)
+    missing_inputs: list[str] = Field(default_factory=list)
+    runtime_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class NautilusRuntimeEventResponse(BaseModel):
+    event_id: str
+    runtime_id: str
+    sequence: int
+    type: str
+    payload: dict | None
+    created_at: datetime
+
+
+class NautilusRuntimeResponse(BaseModel):
+    id: str
+    runtime_key: str
+    broker_connection_id: str
+    account_id: str
+    mode: Literal["paper", "live"]
+    risk_policy_id: str
+    state: Literal["requested", "provisioning", "warming_up", "running", "degraded", "stopping", "stopped", "failed"]
+    strategy_ids: list[str]
+    manifest: dict[str, Any]
+    data_subscriptions: list[dict[str, Any]]
+    last_heartbeat_at: datetime | None = None
+    heartbeat_count: int = 0
+    heartbeat_metrics: dict[str, Any] | None = None
+    last_heartbeat_event_at: datetime | None = None
+    kill_switch_active: bool
+    desired_state: Literal["requested", "running", "stopping", "stopped"] = "running"
+    worker_id: str | None = None
+    lease_until: datetime | None = None
+    generation: int = 0
+    started_at: datetime | None = None
+    stopped_at: datetime | None = None
+    last_error: dict[str, Any] | None = None
+    stream_cursor: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class BotProposalConfirmStartResponse(BaseModel):
+    proposal: BotProposalResponse
+    runtime: NautilusRuntimeResponse
+
+
+class NautilusRuntimeEventIngestResponse(BaseModel):
+    event_appended: bool
+    event: NautilusRuntimeEventResponse | None = None
+    runtime: NautilusRuntimeResponse | None = None
+
+
+class NautilusRuntimeListResponse(BaseModel):
+    items: list[NautilusRuntimeResponse]
 
 
 def _normalize_conversation_title(value: str | None) -> str | None:

@@ -33,6 +33,7 @@ function strategyMessage(role: "assistant" | "user", text: string) {
     sources: [],
     suggestions: null,
     text,
+    workflow: null,
   };
 }
 
@@ -286,6 +287,7 @@ describe("chat UI helpers", () => {
           robustness: [],
           warnings: [],
         },
+        inlineTables: [],
         reasoningSummaries: [{ id: "reasoning-1", text: "Reading market context" }],
         responseIntent: "market_snapshot",
         sources: [
@@ -297,6 +299,7 @@ describe("chat UI helpers", () => {
           },
         ],
         suggestions: null,
+        workflow: null,
       })
     ).toMatchObject({
       backtestReport: {
@@ -472,6 +475,29 @@ describe("chat UI helpers", () => {
     });
   });
 
+  it("reads workflow state from CopilotKit custom events", () => {
+    const patch = metadataPatchFromAgUiCustomEvent({
+      name: "strategy.workflow",
+      value: {
+        workflow_id: "strategy_bot_simulation",
+        current_step: "collect_strategy_inputs",
+        completed_steps: [],
+        required_fields: ["market", "symbol", "timeframe", "style", "risk_preference"],
+        missing_fields: ["symbol", "timeframe"],
+        artifact_refs: {},
+        evidence_status: "insufficient_evidence",
+        start_allowed: false,
+      },
+    });
+
+    expect(patch?.workflow).toMatchObject({
+      workflow_id: "strategy_bot_simulation",
+      current_step: "collect_strategy_inputs",
+      missing_fields: ["symbol", "timeframe"],
+      start_allowed: false,
+    });
+  });
+
   it("maps inline table custom events into strategy metadata", () => {
     const patch = metadataPatchFromAgUiCustomEvent({
       name: "strategy.inlineTable",
@@ -489,7 +515,7 @@ describe("chat UI helpers", () => {
       },
     });
 
-    expect(patch?.inlineTables[0]).toMatchObject({
+    expect(patch?.inlineTables?.[0]).toMatchObject({
       kind: "backtest_trades",
       run_id: "run_backtest",
       rows: [{ trade_rank: 1, pnl_cost: -12.5 }],

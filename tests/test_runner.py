@@ -74,6 +74,27 @@ def test_combined_target_creates_mql5_runner_design(tmp_path: Path) -> None:
     assert "MetaTrader 5" in (out_dir / "mql5" / "runner-design.md").read_text()
 
 
+def test_nautilus_target_creates_runtime_artifacts_without_live_execution(tmp_path: Path) -> None:
+    out_dir = tmp_path / "nautilus-run"
+
+    result = run_strategy(
+        spec_path=Path("examples/specs/ma-crossover-nautilus.json"),
+        prompt=None,
+        mode="dry-run",
+        out_dir=out_dir,
+        record_harness=False,
+    )
+
+    manifest = load_json(out_dir / "nautilus" / "runtime-manifest.json")
+    report = load_json(out_dir / "validation-report.json")
+    assert result["status"] == "pass"
+    assert report["platform"] == "nautilus_py"
+    assert (out_dir / "nautilus" / "strategy.py").exists()
+    assert (out_dir / "nautilus" / "parity-report.json").exists()
+    assert manifest["live_enabled"] is False
+    assert manifest["safety"]["live_broker_execution"] == "blocked_until_explicit_decision"
+
+
 def test_invalid_mode_does_not_create_output_directory(tmp_path: Path) -> None:
     out_dir = tmp_path / "bad-mode"
 

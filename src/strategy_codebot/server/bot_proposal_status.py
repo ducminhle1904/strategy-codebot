@@ -1,0 +1,17 @@
+from typing import Literal
+
+BOT_PROPOSAL_STATUS_DRAFT = "draft"
+BOT_PROPOSAL_STATUS_MISSING_INPUTS = "missing_inputs"
+BOT_PROPOSAL_STATUS_READY = "ready"
+BOT_PROPOSAL_STATUS_STARTED = "started"
+BOT_PROPOSAL_STATUS_REJECTED = "rejected"
+
+BOT_PROPOSAL_STATUSES = (
+    BOT_PROPOSAL_STATUS_DRAFT,
+    BOT_PROPOSAL_STATUS_MISSING_INPUTS,
+    BOT_PROPOSAL_STATUS_READY,
+    BOT_PROPOSAL_STATUS_STARTED,
+    BOT_PROPOSAL_STATUS_REJECTED,
+)
+
+BotProposalStatus = Literal["draft", "missing_inputs", "ready", "started", "rejected"]

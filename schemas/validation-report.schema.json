@@ -8,7 +8,7 @@
   "properties": {
     "platform": {
       "type": "string",
-      "enum": ["pine_v6", "mql5", "both"]
+      "enum": ["pine_v6", "mql5", "nautilus_py", "both"]
     },
     "status": {
       "type": "string",

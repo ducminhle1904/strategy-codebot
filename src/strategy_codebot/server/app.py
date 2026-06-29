@@ -13,6 +13,8 @@ from starlette.responses import JSONResponse
 from starlette.responses import StreamingResponse
 
 from strategy_codebot import __version__
+from strategy_codebot.nautilus_runtime import RuntimeKey
+from strategy_codebot.nautilus_runtime import runtime_state_after_event
 from strategy_codebot.pine import validate_pineforge_pine
 from strategy_codebot.schemas import validate_payload as validate_schema_payload
 from strategy_codebot.server.action_registry import ACTION_REGISTRY
@@ -65,14 +67,22 @@ from strategy_codebot.server.provider_errors import provider_error_payload
 from strategy_codebot.server.readiness import build_readiness_payload
 from strategy_codebot.server.redaction import redact_text
 from strategy_codebot.server.redaction import redact_value
+from strategy_codebot.server.bot_proposals import BotProposalArtifactUnreadableError
+from strategy_codebot.server.bot_proposals import BotProposalDraftInput
+from strategy_codebot.server.bot_proposals import BotProposalSourceNotFoundError
+from strategy_codebot.server.bot_proposals import bot_required_missing
+from strategy_codebot.server.bot_proposals import build_bot_proposal_create_input
 from strategy_codebot.server.repository import ArtifactRecord
 from strategy_codebot.server.repository import AssistantRunRecord
+from strategy_codebot.server.repository import BotProposalRecord
 from strategy_codebot.server.repository import ConversationSidebarRecord
 from strategy_codebot.server.repository import ConversationRepository
 from strategy_codebot.server.repository import CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT
 from strategy_codebot.server.repository import CONVERSATION_ARTIFACT_STATE_LIMIT
 from strategy_codebot.server.repository import InMemoryConversationRepository
 from strategy_codebot.server.repository import MessageRecord
+from strategy_codebot.server.repository import NautilusRuntimeEventRecord
+from strategy_codebot.server.repository import NautilusRuntimeRecord
 from strategy_codebot.server.repository import RunEventRecord
 from strategy_codebot.server.repository import TERMINAL_RUN_STATUSES
 from strategy_codebot.server.run_modes import RUN_MODE_AGENT
@@ -89,6 +99,10 @@ from strategy_codebot.server.schemas import ArtifactPreviewResponse
 from strategy_codebot.server.schemas import BacktestApprovalDecisionRequest
 from strategy_codebot.server.schemas import BacktestApprovalDecisionResponse
 from strategy_codebot.server.schemas import AccountUsageResponse
+from strategy_codebot.server.schemas import BotProposalConfirmStartRequest
+from strategy_codebot.server.schemas import BotProposalConfirmStartResponse
+from strategy_codebot.server.schemas import BotProposalCreateRequest
+from strategy_codebot.server.schemas import BotProposalResponse
 from strategy_codebot.server.schemas import ConversationCreate
 from strategy_codebot.server.schemas import ConversationListResponse
 from strategy_codebot.server.schemas import ConversationResponse
@@ -110,6 +124,14 @@ from strategy_codebot.server.schemas import MessageCreate
 from strategy_codebot.server.schemas import MessageListResponse
 from strategy_codebot.server.schemas import MessageResponse
 from strategy_codebot.server.schemas import MeResponse
+from strategy_codebot.server.schemas import NautilusRuntimeEventCreate
+from strategy_codebot.server.schemas import NautilusRuntimeEventIngestResponse
+from strategy_codebot.server.schemas import NautilusRuntimeEventResponse
+from strategy_codebot.server.schemas import NautilusRuntimeHeartbeatRequest
+from strategy_codebot.server.schemas import NautilusRuntimeKillSwitchRequest
+from strategy_codebot.server.schemas import NautilusRuntimeListResponse
+from strategy_codebot.server.schemas import NautilusRuntimeResponse
+from strategy_codebot.server.schemas import NautilusRuntimeStartRequest
 from strategy_codebot.server.schemas import ProviderStatusResponse
 from strategy_codebot.server.schemas import RunCreate
 from strategy_codebot.server.schemas import RunCreateResponse
@@ -405,6 +427,399 @@ def create_app(
                 for entry in ACTION_REGISTRY
             ],
         }
+
+    @api.post(
+        "/v1/bots/proposals",
+        response_model=BotProposalResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_bot_proposal(
+        payload: BotProposalCreateRequest,
+        request: Request,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> BotProposalResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="bots.proposal.create")
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+
+        try:
+            draft = build_bot_proposal_create_input(
+                auth=auth,
+                repository=conversation_repository,
+                artifact_store=artifact_store,
+                draft=BotProposalDraftInput(
+                    strategy_artifact_id=payload.strategy_artifact_id,
+                    run_id=payload.run_id,
+                    strategy_id=payload.strategy_id,
+                    strategy_name=payload.strategy_name,
+                    manifest=payload.manifest,
+                    data_subscriptions=payload.data_subscriptions,
+                    broker_connection_id=payload.broker_connection_id,
+                    account_id=payload.account_id,
+                    risk_policy_id=payload.risk_policy_id,
+                    readiness_checks=payload.readiness_checks,
+                ),
+            )
+        except BotProposalSourceNotFoundError as exc:
+            detail = "Strategy artifact not found" if exc.source == "strategy_artifact" else "Strategy run not found"
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail) from exc
+        except BotProposalArtifactUnreadableError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Could not read strategy artifact") from exc
+        proposal = conversation_repository.create_bot_proposal(
+            auth,
+            draft.create_input,
+        )
+        return _bot_proposal_response(proposal)
+
+    @api.get("/v1/bots/proposals/{proposal_id}", response_model=BotProposalResponse)
+    def get_bot_proposal(
+        proposal_id: str,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> BotProposalResponse:
+        proposal = conversation_repository.get_bot_proposal(auth, proposal_id)
+        if proposal is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot proposal not found")
+        return _bot_proposal_response(proposal)
+
+    @api.post("/v1/bots/proposals/{proposal_id}/confirm-start", response_model=BotProposalConfirmStartResponse)
+    def confirm_start_bot_proposal(
+        proposal_id: str,
+        payload: BotProposalConfirmStartRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> BotProposalConfirmStartResponse | JSONResponse:
+        proposal = conversation_repository.get_bot_proposal(auth, proposal_id)
+        if proposal is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Bot proposal not found")
+        broker_connection_id = payload.broker_connection_id or proposal.broker_connection_id
+        account_id = payload.account_id or proposal.account_id
+        risk_policy_id = payload.risk_policy_id or proposal.risk_policy_id
+        missing = bot_required_missing(
+            broker_connection_id=broker_connection_id,
+            account_id=account_id,
+            risk_policy_id=risk_policy_id,
+            strategy_id=proposal.strategy_id,
+            data_subscriptions=proposal.data_subscriptions_json,
+        )
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"message": "Bot proposal is missing required inputs", "missing_inputs": missing},
+            )
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="bots.proposal.confirm_start")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={
+                    "proposal_id": proposal_id,
+                    "broker_connection_id": broker_connection_id,
+                    "account_id": account_id,
+                    "risk_policy_id": risk_policy_id,
+                },
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        if proposal.status == "started" and proposal.runtime_id:
+            existing_runtime = conversation_repository.get_nautilus_runtime(auth, proposal.runtime_id)
+            if existing_runtime is not None:
+                response = BotProposalConfirmStartResponse(
+                    proposal=_bot_proposal_response(proposal),
+                    runtime=_nautilus_runtime_response(existing_runtime),
+                )
+                return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+        runtime_key = RuntimeKey(
+            user_id=auth.user_id,
+            broker_connection_id=broker_connection_id or "",
+            account_id=account_id or "",
+            mode="paper",
+            risk_policy_id=risk_policy_id or "",
+        ).stable_id()
+        runtime = conversation_repository.upsert_nautilus_runtime(
+            auth,
+            runtime_key=runtime_key,
+            broker_connection_id=broker_connection_id or "",
+            account_id=account_id or "",
+            mode="paper",
+            risk_policy_id=risk_policy_id or "",
+            strategy_id=proposal.strategy_id,
+            manifest_json={**proposal.manifest_json, "bot_proposal_id": proposal.id},
+            data_subscriptions_json=proposal.data_subscriptions_json,
+        )
+        conversation_repository.append_nautilus_runtime_event(
+            auth,
+            runtime.id,
+            "strategy_loaded",
+            {"strategy_id": proposal.strategy_id, "bot_proposal_id": proposal.id, "state": runtime.state},
+            idempotency_key=f"bot-proposal-start:{proposal.id}",
+        )
+        updated_proposal = conversation_repository.mark_bot_proposal_started(auth, proposal.id, runtime_id=runtime.id)
+        response = BotProposalConfirmStartResponse(
+            proposal=_bot_proposal_response(updated_proposal or proposal),
+            runtime=_nautilus_runtime_response(runtime),
+        )
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post(
+        "/v1/nautilus/runtimes",
+        response_model=NautilusRuntimeResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def start_nautilus_runtime(
+        payload: NautilusRuntimeStartRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeResponse | JSONResponse:
+        if payload.mode == "live":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Live Nautilus broker execution is disabled until an explicit future approval gate enables it.",
+            )
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="nautilus.runtime.start")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body=payload.model_dump(mode="json"),
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_201_CREATED)
+        runtime_key = RuntimeKey(
+            user_id=auth.user_id,
+            broker_connection_id=payload.broker_connection_id,
+            account_id=payload.account_id,
+            mode=payload.mode,
+            risk_policy_id=payload.risk_policy_id,
+        ).stable_id()
+        runtime = conversation_repository.upsert_nautilus_runtime(
+            auth,
+            runtime_key=runtime_key,
+            broker_connection_id=payload.broker_connection_id,
+            account_id=payload.account_id,
+            mode=payload.mode,
+            risk_policy_id=payload.risk_policy_id,
+            strategy_id=payload.strategy_id,
+            manifest_json=payload.manifest,
+            data_subscriptions_json=payload.data_subscriptions,
+        )
+        conversation_repository.append_nautilus_runtime_event(
+            auth,
+            runtime.id,
+            "strategy_loaded",
+            {"strategy_id": payload.strategy_id, "state": runtime.state},
+            idempotency_key=f"start:{idempotency_key}" if idempotency_key else None,
+        )
+        response = _nautilus_runtime_response(runtime)
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_201_CREATED)
+
+    @api.get("/v1/nautilus/runtimes", response_model=NautilusRuntimeListResponse)
+    def list_nautilus_runtimes(
+        mode: Literal["paper", "live"] | None = Query(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeListResponse:
+        rows = conversation_repository.list_nautilus_runtimes(auth, mode=mode, limit=limit)
+        return NautilusRuntimeListResponse(items=[_nautilus_runtime_response(runtime) for runtime in rows])
+
+    @api.get("/v1/nautilus/runtimes/{runtime_id}", response_model=NautilusRuntimeResponse)
+    def get_nautilus_runtime(
+        runtime_id: str,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeResponse:
+        runtime = conversation_repository.get_nautilus_runtime(auth, runtime_id)
+        if runtime is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+        return _nautilus_runtime_response(runtime)
+
+    @api.post("/v1/nautilus/runtimes/{runtime_id}/heartbeat", response_model=NautilusRuntimeResponse)
+    def heartbeat_nautilus_runtime(
+        runtime_id: str,
+        payload: NautilusRuntimeHeartbeatRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="nautilus.runtime.heartbeat")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body=payload.model_dump(mode="json"),
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        heartbeat = conversation_repository.record_nautilus_runtime_heartbeat(
+            auth,
+            runtime_id,
+            payload={"status": payload.status, "metrics": payload.metrics},
+            idempotency_key=idempotency_key,
+        )
+        if heartbeat is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+        response = _nautilus_runtime_response(heartbeat.runtime)
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post("/v1/nautilus/runtimes/{runtime_id}/events", response_model=NautilusRuntimeEventIngestResponse)
+    def append_nautilus_runtime_event(
+        runtime_id: str,
+        payload: NautilusRuntimeEventCreate,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeEventIngestResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="nautilus.runtime.event")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body=payload.model_dump(mode="json"),
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        if payload.type == "heartbeat":
+            heartbeat = conversation_repository.record_nautilus_runtime_heartbeat(
+                auth,
+                runtime_id,
+                payload=payload.payload,
+                idempotency_key=idempotency_key,
+            )
+            if heartbeat is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+            response = NautilusRuntimeEventIngestResponse(
+                event_appended=heartbeat.event_appended,
+                event=_nautilus_runtime_event_response(heartbeat.event) if heartbeat.event is not None else None,
+                runtime=_nautilus_runtime_response(heartbeat.runtime),
+            )
+            return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+        event = conversation_repository.append_nautilus_runtime_event(
+            auth,
+            runtime_id,
+            payload.type,
+            payload.payload,
+            idempotency_key=idempotency_key,
+        )
+        if event is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+        runtime = conversation_repository.get_nautilus_runtime(auth, runtime_id)
+        if runtime is not None:
+            next_state = runtime_state_after_event(
+                runtime.state,
+                payload.type,
+                kill_switch_active=runtime.kill_switch_active,
+            )
+            if next_state != runtime.state:
+                runtime = conversation_repository.set_nautilus_runtime_state(auth, runtime_id, state=next_state)
+        response = NautilusRuntimeEventIngestResponse(
+            event_appended=True,
+            event=_nautilus_runtime_event_response(event),
+            runtime=_nautilus_runtime_response(runtime) if runtime is not None else None,
+        )
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.get("/v1/nautilus/runtimes/{runtime_id}/events", response_model=list[NautilusRuntimeEventResponse])
+    def list_nautilus_runtime_events(
+        runtime_id: str,
+        limit: int = Query(default=100, ge=1, le=500),
+        after_sequence: int | None = Query(default=None, ge=0),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> list[NautilusRuntimeEventResponse]:
+        events = conversation_repository.list_nautilus_runtime_events(
+            auth,
+            runtime_id,
+            limit=limit,
+            after_sequence=after_sequence,
+        )
+        if events is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+        return [_nautilus_runtime_event_response(event) for event in events]
+
+    @api.post("/v1/nautilus/runtimes/{runtime_id}/stop", response_model=NautilusRuntimeResponse)
+    def stop_nautilus_runtime(
+        runtime_id: str,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="nautilus.runtime.stop")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={},
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        runtime = conversation_repository.set_nautilus_runtime_state(auth, runtime_id, state="stopping")
+        if runtime is not None:
+            runtime = conversation_repository.set_nautilus_runtime_desired_state(auth, runtime_id, desired_state="stopping")
+        if runtime is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+        conversation_repository.append_nautilus_runtime_event(
+            auth,
+            runtime.id,
+            "stop_requested",
+            {"reason": "operator_requested"},
+            idempotency_key=idempotency_key,
+        )
+        response = _nautilus_runtime_response(runtime)
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
+
+    @api.post("/v1/nautilus/runtimes/{runtime_id}/kill-switch", response_model=NautilusRuntimeResponse)
+    def kill_switch_nautilus_runtime(
+        runtime_id: str,
+        payload: NautilusRuntimeKillSwitchRequest,
+        request: Request,
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> NautilusRuntimeResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="nautilus.runtime.kill_switch")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body=payload.model_dump(mode="json"),
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        runtime = conversation_repository.activate_nautilus_runtime_kill_switch(auth, runtime_id)
+        if runtime is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Runtime not found")
+        conversation_repository.append_nautilus_runtime_event(
+            auth,
+            runtime.id,
+            "risk_block",
+            {"reason": payload.reason, "action": "kill_switch"},
+            idempotency_key=idempotency_key,
+        )
+        response = _nautilus_runtime_response(runtime)
+        return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
 
     @api.get("/v1/knowledge/candidates", response_model=KnowledgeCandidateListResponse)
     def list_knowledge_candidates(
@@ -2019,6 +2434,69 @@ def _run_event_response(event: RunEventRecord) -> RunEventResponse:
         run_id=event.run_id,
         request_id=event.request_id,
         trace_id=event.trace_id,
+        sequence=event.sequence,
+        type=event.type,
+        payload=redact_value(event.payload),
+        created_at=event.created_at,
+    )
+
+
+def _nautilus_runtime_response(runtime: NautilusRuntimeRecord) -> NautilusRuntimeResponse:
+    return NautilusRuntimeResponse(
+        id=runtime.id,
+        runtime_key=runtime.runtime_key,
+        broker_connection_id=runtime.broker_connection_id,
+        account_id=runtime.account_id,
+        mode=runtime.mode,
+        risk_policy_id=runtime.risk_policy_id,
+        state=runtime.state,
+        strategy_ids=runtime.strategy_ids,
+        manifest=redact_value(runtime.manifest_json),
+        data_subscriptions=redact_value(runtime.data_subscriptions_json),
+        last_heartbeat_at=runtime.last_heartbeat_at,
+        heartbeat_count=runtime.heartbeat_count,
+        heartbeat_metrics=redact_value(runtime.heartbeat_metrics_json),
+        last_heartbeat_event_at=runtime.last_heartbeat_event_at,
+        kill_switch_active=runtime.kill_switch_active,
+        desired_state=runtime.desired_state,
+        worker_id=runtime.worker_id,
+        lease_until=runtime.lease_until,
+        generation=runtime.generation,
+        started_at=runtime.started_at,
+        stopped_at=runtime.stopped_at,
+        last_error=redact_value(runtime.last_error_json),
+        stream_cursor=redact_value(runtime.stream_cursor_json),
+        created_at=runtime.created_at,
+        updated_at=runtime.updated_at,
+    )
+
+
+def _bot_proposal_response(proposal: BotProposalRecord) -> BotProposalResponse:
+    return BotProposalResponse(
+        id=proposal.id,
+        status=proposal.status,
+        source_conversation_id=proposal.source_conversation_id,
+        source_run_id=proposal.source_run_id,
+        source_artifact_ids=list(proposal.source_artifact_ids),
+        strategy_id=proposal.strategy_id,
+        strategy_name=proposal.strategy_name,
+        manifest=redact_value(proposal.manifest_json),
+        data_subscriptions=redact_value(proposal.data_subscriptions_json),
+        broker_connection_id=proposal.broker_connection_id,
+        account_id=proposal.account_id,
+        risk_policy_id=proposal.risk_policy_id,
+        readiness_checks=list(proposal.readiness_checks_json),
+        missing_inputs=list(proposal.missing_inputs_json),
+        runtime_id=proposal.runtime_id,
+        created_at=proposal.created_at,
+        updated_at=proposal.updated_at,
+    )
+
+
+def _nautilus_runtime_event_response(event: NautilusRuntimeEventRecord) -> NautilusRuntimeEventResponse:
+    return NautilusRuntimeEventResponse(
+        event_id=event.id,
+        runtime_id=event.runtime_id,
         sequence=event.sequence,
         type=event.type,
         payload=redact_value(event.payload),

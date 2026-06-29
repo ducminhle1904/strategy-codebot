@@ -2302,6 +2302,8 @@ def _upsert_db_items(
         _execute_schema(connection, embedding_dimension(embedding_model, embedding_provider))
         _upsert_db_sources([_source_from_item(item) for item in items], conn=connection)
         chunks = _chunks_for_items(items, embedding_model=embedding_model, embedding_provider=embedding_provider)
+        item_ids = [item["id"] for item in items]
+        chunk_ids = [chunk["chunk_id"] for chunk in chunks]
         for item in items:
             connection.execute(
                 """
@@ -2343,6 +2345,16 @@ def _upsert_db_items(
                     item.get("updated_at", _now()),
                 ),
             )
+        if chunk_ids:
+            connection.execute(
+                """
+                DELETE FROM knowledge_chunks
+                WHERE item_id = ANY(%s) AND NOT (chunk_id = ANY(%s))
+                """,
+                (item_ids, chunk_ids),
+            )
+        else:
+            connection.execute("DELETE FROM knowledge_chunks WHERE item_id = ANY(%s)", (item_ids,))
         for chunk in chunks:
             metadata = {key: value for key, value in chunk.items() if key not in {"embedding", "text"}}
             connection.execute(
@@ -2446,6 +2458,8 @@ def _load_db_index(database_url: str) -> dict[str, Any]:
 def _search_db_knowledge(query: str, database_url: str, *, stage: str | None, options: RetrievalOptions, started: float) -> dict[str, Any]:
     expanded_terms = expand_query_terms(query)
     query_text = " ".join([query, *expanded_terms])
+    intent = classify_prompt(query)
+    required_source_ids = _required_source_ids(query, intent)
     stage_params: tuple[Any, ...] = ()
     stage_filter = ""
     if stage:
@@ -2512,14 +2526,30 @@ def _search_db_knowledge(query: str, database_url: str, *, stage: str | None, op
             ),
             (query_embedding, list(ACTIVE_STATUSES), *stage_params, query_embedding, options.vector_limit),
         ).fetchall()
+        required_rows = []
+        if required_source_ids:
+            required_rows = conn.execute(
+                _chunk_select_sql(
+                    f"""
+                    WHERE c.status = ANY(%s)
+                      AND c.source_id = ANY(%s)
+                      {stage_filter}
+                    ORDER BY c.source_id, c.chunk_index, c.chunk_id
+                    """
+                ),
+                (list(ACTIVE_STATUSES), required_source_ids, *stage_params),
+            ).fetchall()
         db_search_latency_ms = int((time.perf_counter() - db_started) * 1000)
     lexical_ranked = [_row_to_chunk(row) for row in lexical_rows]
     vector_ranked = [_row_to_chunk(row) for row in vector_rows]
+    required_ranked = [_row_to_chunk(row) for row in required_rows]
     merged = _rrf_merge(lexical_ranked, vector_ranked)
-    intent = classify_prompt(query)
-    required_source_ids = _required_source_ids(query, intent)
     rerank_started = time.perf_counter()
-    reranked_full = _ensure_required_chunks(_rerank(merged, intent, expanded_terms, query=query), [*lexical_ranked, *vector_ranked], required_source_ids)
+    reranked_full = _ensure_required_chunks(
+        _rerank(merged, intent, expanded_terms, query=query),
+        [*lexical_ranked, *vector_ranked, *required_ranked],
+        required_source_ids,
+    )
     reranked = _ensure_approved_candidate_chunks(reranked_full, options.limit)
     rerank_latency_ms = int((time.perf_counter() - rerank_started) * 1000)
     retrieved = [_retrieved_chunk(chunk, options.max_chars_per_chunk) for chunk in reranked]
@@ -2540,7 +2570,7 @@ def _search_db_knowledge(query: str, database_url: str, *, stage: str | None, op
         "retrieval_latency_ms": latency_ms,
         "embedding_latency_ms": embedding_latency_ms,
         "db_search_latency_ms": db_search_latency_ms,
-        "hybrid_candidate_count": len({chunk["chunk_id"] for chunk in lexical_ranked + vector_ranked}),
+        "hybrid_candidate_count": len({chunk["chunk_id"] for chunk in lexical_ranked + vector_ranked + required_ranked}),
         "rerank_latency_ms": rerank_latency_ms,
         "cache_hit": cache_hit,
         "cache_layer": "query_embedding",
@@ -3202,21 +3232,46 @@ def _required_source_ids(query: str, intent: dict[str, Any]) -> list[str]:
     required = []
     if "risk" in intent.get("tags", []) and any(term in lowered for term in ("guarantee", "guaranteed", "profit", "no-loss", "cannot lose", "live-ready", "live ready", "certified")):
         required.append("internal-risk-policy")
+    if any(term in lowered for term in ("bot", "bots", "paper bot", "paper runtime", "kill switch")):
+        required.append("internal-bots-chat-workflow")
+    if any(term in lowered for term in ("backtest preview", "local preview", "run backtest", "equity curve", "query_backtest_trades")):
+        required.append("internal-backtest-preview-workflow")
+    if any(term in lowered for term in ("variant lab", "robustness report", "run_backtest_variant_lab", "build_robustness_report")):
+        required.append("internal-variant-robustness-workflow")
+    if any(term in lowered for term in ("proposed order intent", "order intent", "risk gate", "run_risk_gate")):
+        required.append("internal-risk-gate-order-intent-workflow")
+    if any(
+        term in lowered
+        for term in (
+            "artifact exposure",
+            "internal artifact",
+            "user-facing artifact",
+            "raw json",
+            "compile report",
+            "trades json",
+            "knowledge proposal",
+            "repair validation",
+            "static validation blocker",
+            "market research",
+        )
+    ):
+        required.append("internal-model-workflow-boundaries")
     return required
 
 
 def _ensure_required_chunks(reranked: list[dict[str, Any]], chunks: list[dict[str, Any]], required_source_ids: list[str]) -> list[dict[str, Any]]:
     if not required_source_ids:
         return reranked
-    present = {str(chunk.get("source_id")) for chunk in reranked}
     output = list(reranked)
-    for source_id in required_source_ids:
-        if source_id in present:
-            continue
-        candidates = [chunk for chunk in chunks if chunk.get("source_id") == source_id]
-        if not candidates:
-            continue
-        best = sorted(candidates, key=lambda chunk: (chunk.get("chunk_index", 0), chunk.get("chunk_id", "")))[0]
+    for source_id in reversed(required_source_ids):
+        existing_index = next((index for index, chunk in enumerate(output) if chunk.get("source_id") == source_id), None)
+        if existing_index is None:
+            candidates = [chunk for chunk in chunks if chunk.get("source_id") == source_id]
+            if not candidates:
+                continue
+            best = sorted(candidates, key=lambda chunk: (chunk.get("chunk_index", 0), chunk.get("chunk_id", "")))[0]
+        else:
+            best = output.pop(existing_index)
         output.insert(0, {**best, "score": 1.0, "lexical_score": best.get("lexical_score", 0.0), "vector_score": best.get("vector_score", 0.0), "rerank_features": {"required_source": 1.0}})
     return output
 

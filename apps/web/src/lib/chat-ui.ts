@@ -18,11 +18,14 @@ import type {
   PythonSseEvent,
   ResponseIntent,
   SafeReasoningSummary,
+  WorkflowState,
 } from "@/lib/chat-stream";
 import {
   marketSnapshotFromPythonEvent,
+  normalizeWorkflowState,
   normalizeSuggestionsPayload,
   responseIntentFromPythonEvent,
+  strategyWorkflowFromPythonEvent,
   suggestionsFromPythonEvent,
 } from "@/lib/chat-stream";
 import {
@@ -49,7 +52,13 @@ export type ChatMessageSource = {
   url?: string;
 };
 
-export type { ChatSuggestionItem, ChatSuggestionsPayload, MarketSnapshot, ResponseIntent };
+export type {
+  ChatSuggestionItem,
+  ChatSuggestionsPayload,
+  MarketSnapshot,
+  ResponseIntent,
+  WorkflowState,
+};
 
 export type StrategyChatReasoning = {
   id: string;
@@ -67,6 +76,7 @@ export type StrategyChatMessage = {
   inlineTables: ChatInlineTable[];
   marketSnapshot: MarketSnapshot | null;
   suggestions: ChatSuggestionsPayload | null;
+  workflow: WorkflowState | null;
   responseIntent: ResponseIntent | null;
   raw: AgUiMessage | null;
 };
@@ -80,6 +90,7 @@ export type StrategyChatMessageMetadata = Pick<
   | "responseIntent"
   | "sources"
   | "suggestions"
+  | "workflow"
 >;
 
 export function backendMessagesToStrategyMessages(messages: BackendMessage[]): StrategyChatMessage[] {
@@ -100,6 +111,7 @@ export function backendMessagesToStrategyMessages(messages: BackendMessage[]): S
         sources: [],
         suggestions: null,
         text: message.content,
+        workflow: null,
       } satisfies StrategyChatMessage,
     ];
   });
@@ -124,6 +136,7 @@ export function copilotAgentMessageToStrategyMessage(
     sources: metadata?.sources ?? [],
     suggestions: metadata?.suggestions ?? null,
     text: agUiMessageText(message),
+    workflow: metadata?.workflow ?? null,
   };
 }
 
@@ -149,6 +162,7 @@ export function emptyStrategyChatMessageMetadata(): StrategyChatMessageMetadata 
     responseIntent: null,
     sources: [],
     suggestions: null,
+    workflow: null,
   };
 }
 
@@ -180,12 +194,12 @@ export function runEventMetadataByAnchorMessage({
 }) {
   const grouped = new Map<string, StrategyChatMessageMetadata>();
   for (const event of events) {
-    const anchorId = runEventAnchorMessageId({ event, backendMessages });
-    if (!anchorId) {
-      continue;
-    }
     const patch = metadataPatchFromRunEvent(event);
     if (!patch) {
+      continue;
+    }
+    const anchorId = runEventAnchorMessageId({ event, backendMessages });
+    if (!anchorId) {
       continue;
     }
     grouped.set(
@@ -248,6 +262,10 @@ function metadataPatchFromRunEvent(
   if (suggestions) {
     return { suggestions };
   }
+  const workflow = strategyWorkflowFromPythonEvent(pythonEvent);
+  if (workflow) {
+    return { workflow };
+  }
   return null;
 }
 
@@ -297,6 +315,7 @@ export function mergeStrategyChatMessageMetadata(
     sources:
       next.sources !== undefined ? mergeSources(base.sources, next.sources) : base.sources,
     suggestions: next.suggestions !== undefined ? next.suggestions : base.suggestions,
+    workflow: next.workflow !== undefined ? next.workflow : base.workflow,
   };
 }
 
@@ -324,6 +343,10 @@ export function metadataPatchFromAgUiCustomEvent(event: {
   if (name === "strategy.suggestions") {
     const suggestions = normalizeSuggestionsPayload(value);
     return suggestions ? { suggestions } : null;
+  }
+  if (name === "strategy.workflow") {
+    const workflow = normalizeWorkflowState(value);
+    return workflow ? { workflow } : null;
   }
   if (name === "strategy.sources" && value && typeof value === "object") {
     const sources = (value as Record<string, unknown>).sources;

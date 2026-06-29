@@ -62,11 +62,16 @@ import {
   StrategyComposer,
   StrategyStartPrompt,
 } from "@/components/strategy/start-prompt";
+import { paperBotSubscriptionLabel } from "@/components/strategy/paper-bots-page-helpers";
 import {
   ArtifactPreviewContent,
   artifactPreviewContent,
 } from "@/components/strategy/artifact-preview-content";
-import { BacktestPreviewHitlCard } from "@/components/strategy/agent-tools/tool-cards";
+import {
+  BacktestPreviewHitlCard,
+  PaperBotProposalCard,
+} from "@/components/strategy/agent-tools/tool-cards";
+import { WorkflowRail } from "@/components/strategy/workflow-panel";
 import { StatusPill } from "@/components/strategy/status-pill";
 import { BacktestReportCard } from "@/components/strategy/backtest-report-card";
 import { BacktestResultInlineCard } from "@/components/strategy/backtest-result-inline-card";
@@ -179,6 +184,8 @@ import type {
   StrategyProfile,
   StrategySpec,
   WebSearchMode,
+  BotProposal as BackendBotProposal,
+  BotProposalCreateRequest,
 } from "@/lib/backend-schemas";
 import { useStrategyUiStore } from "@/lib/ui-store";
 import {
@@ -189,7 +196,10 @@ import { cn } from "@/lib/utils";
 import {
   errorMessageFromUnknown,
   marketSnapshotFromPayload,
+  normalizeWorkflowState,
   runFailureMessage,
+  type PaperBotProposal,
+  type WorkflowState,
 } from "@/lib/chat-stream";
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -1403,6 +1413,7 @@ export function StrategyWorkspace({
         onOpenAccountDialog={openAccountDialog}
         onOpenSettingsTab={openSettingsTab}
         onOpenArtifacts={() => router.push("/artifacts")}
+        onOpenPaperBots={() => router.push("/paper-bots")}
         onRename={openRenameDialog}
         onSelect={handleSelectConversation}
         onToggleCollapsed={() => setSidebarCollapsed((collapsed) => !collapsed)}
@@ -1625,6 +1636,7 @@ export function ConversationSidebar({
   onOpenAccountDialog,
   onOpenSettingsTab,
   onOpenArtifacts,
+  onOpenPaperBots,
   onRename,
   onSelect,
   onToggleCollapsed,
@@ -1634,7 +1646,7 @@ export function ConversationSidebar({
   theme,
 }: {
   accountUsage?: AccountUsageResponse;
-  activeView?: "chat" | "artifacts";
+  activeView?: "chat" | "artifacts" | "paper-bots";
   collapsed: boolean;
   conversations: ConversationSidebarItem[];
   isCreating: boolean;
@@ -1648,6 +1660,7 @@ export function ConversationSidebar({
   onOpenAccountDialog: (dialog: AccountDialog) => void;
   onOpenSettingsTab: (tab: SettingsTab) => void;
   onOpenArtifacts: () => void;
+  onOpenPaperBots: () => void;
   onRename: (conversation: ChatConversation) => void;
   onSelect: (conversationId: string) => void;
   onToggleCollapsed: () => void;
@@ -1658,6 +1671,7 @@ export function ConversationSidebar({
 }) {
   const t = getUiCopy(language);
   const artifactsLabel = t.artifacts;
+  const paperBotsLabel = t.paperBots;
   return (
     <aside
       className={cn(
@@ -1705,8 +1719,14 @@ export function ConversationSidebar({
               onClick={onOpenArtifacts}
             />
             <SidebarRailButton
-              disabled={!selectedConversationId}
+              active={activeView === "paper-bots"}
               icon={<Bot className="size-4" />}
+              label={paperBotsLabel}
+              onClick={onOpenPaperBots}
+            />
+            <SidebarRailButton
+              disabled={!selectedConversationId}
+              icon={<MessageSquarePlus className="size-4" />}
               label={activeConversationLabel(conversations, selectedConversationId, t)}
               onClick={() => {
                 if (selectedConversationId) {
@@ -1762,6 +1782,20 @@ export function ConversationSidebar({
             >
               <FileStack className="size-4" />
               {artifactsLabel}
+            </button>
+            <button
+              className={cn(
+                "flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                activeView === "paper-bots"
+                  ? "bg-sidebar-accent text-sidebar-accent-foreground"
+                  : "text-sidebar-foreground"
+              )}
+              onClick={onOpenPaperBots}
+              title={paperBotsLabel}
+              type="button"
+            >
+              <Bot className="size-4" />
+              {paperBotsLabel}
             </button>
             <button
               className="flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium text-sidebar-foreground transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
@@ -2979,6 +3013,7 @@ function ChatColumn({
       marketSnapshot: null,
       suggestions: null,
       responseIntent: null,
+      workflow: null,
       raw: null,
     } satisfies StrategyChatMessage;
   }, [pendingUserText, renderableMessages]);
@@ -2993,6 +3028,10 @@ function ChatColumn({
   const latestRunIntent = useMemo(() => responseIntentFromRunEvents(runEvents), [runEvents]);
   const latestMarketSnapshot = useMemo(
     () => marketSnapshotFromRunEvents(runEvents),
+    [runEvents]
+  );
+  const latestRunWorkflow = useMemo(
+    () => strategyWorkflowFromRunEvents(runEvents),
     [runEvents]
   );
   const preferredDrawerArtifactKind = useMemo(
@@ -3023,6 +3062,7 @@ function ChatColumn({
       marketSnapshot: null,
       suggestions: null,
       responseIntent: null,
+      workflow: null,
       raw: null,
     } satisfies StrategyChatMessage;
   }, [isChatWorking, isStartingChat, turnAssistantMessage]);
@@ -3059,6 +3099,29 @@ function ChatColumn({
       }),
     [backendMessages, conversationRunEvents]
   );
+  const activeWorkflow = useMemo(() => {
+    const assistantMessage = turnAssistantMessage ?? pendingAssistantMessage;
+    if (!assistantMessage) {
+      return isChatWorking || isStartingChat ? latestRunWorkflow : null;
+    }
+    const anchoredWorkflow =
+      persistedRunMetadata.get(assistantMessage.id)?.workflow ?? assistantMessage.workflow ?? null;
+    if (anchoredWorkflow) {
+      return anchoredWorkflow;
+    }
+    const isStreamingAssistant =
+      assistantMessage.id === "pending-assistant-message" || isChatWorking || isStartingChat;
+    return (
+      isStreamingAssistant ? latestRunWorkflow : null
+    );
+  }, [
+    isChatWorking,
+    isStartingChat,
+    latestRunWorkflow,
+    pendingAssistantMessage,
+    persistedRunMetadata,
+    turnAssistantMessage,
+  ]);
   const staticSuggestions = useMemo(() => getChatSuggestions(language), [language]);
   const fallbackSuggestionPayload = useMemo(
     () =>
@@ -3080,7 +3143,7 @@ function ChatColumn({
   return (
     <section
       className={cn(
-        "together-technical-canvas grid h-full min-h-0 grid-rows-[auto_1fr_auto] overflow-hidden border-r border-border md:grid-rows-[1fr_auto]",
+        "together-technical-canvas relative grid h-full min-h-0 grid-rows-[auto_1fr_auto] overflow-hidden border-r border-border md:grid-rows-[1fr_auto]",
         isEmptyChat && "md:grid-rows-[1fr]"
       )}
     >
@@ -3092,8 +3155,10 @@ function ChatColumn({
         onSelect={onSelectConversation}
         selectedConversationId={selectedConversationId}
       />
+      {activeWorkflow ? <WorkflowRail workflow={activeWorkflow} /> : null}
       <Conversation className="min-h-0 overflow-hidden">
         <ConversationContent className="mx-auto w-full max-w-3xl px-4 py-8">
+          <div className="min-w-0 space-y-4">
           {isLoadingConversation ? (
             <ConversationLoadingState language={language} />
           ) : isEmptyChat ? (
@@ -3119,6 +3184,7 @@ function ChatColumn({
                       responseIntent: message.responseIntent,
                       sources: message.sources,
                       suggestions: message.suggestions,
+                      workflow: message.workflow,
                     },
                     persistedMetadata
                   )
@@ -3133,6 +3199,7 @@ function ChatColumn({
                     responseIntent: mergedMetadata.responseIntent,
                     sources: mergedMetadata.sources,
                     suggestions: mergedMetadata.suggestions,
+                    workflow: mergedMetadata.workflow,
                   }
                 : message;
               const anchoredArtifacts = artifactGroups.get(message.id) ?? [];
@@ -3200,6 +3267,7 @@ function ChatColumn({
             />
           ) : null}
           <BacktestRunStatusPanel status={backtestLiveStatus} />
+          </div>
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
@@ -4057,23 +4125,84 @@ function SuggestionRail({
   onViewArtifactWorkspace: () => void;
   suggestions: ChatSuggestionItem[];
 }) {
+  const client = useBrowserBackendClient();
+  const router = useRouter();
+  const queryClient = useQueryClient();
   const [pendingSuggestionId, setPendingSuggestionId] = useState<string | null>(null);
+  const [preparedBotProposals, setPreparedBotProposals] = useState<Record<string, BackendBotProposal>>({});
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const visibleSuggestions = suggestions
     .filter((suggestion) => suggestion.kind !== "composer_block")
     .sort((left, right) => left.priority - right.priority)
     .slice(0, 3);
+  const visiblePaperBotKeys = visibleSuggestions.flatMap((suggestion) => {
+    const proposal = paperBotProposalFromSuggestion(suggestion);
+    return proposal ? [paperBotSuggestionKey(suggestion, proposal)] : [];
+  });
+  const visiblePaperBotCacheKey = visiblePaperBotKeys.join("\n");
+
+  useEffect(() => {
+    const visiblePaperBotKeySet = new Set(
+      visiblePaperBotCacheKey ? visiblePaperBotCacheKey.split("\n") : []
+    );
+    setPreparedBotProposals((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([key]) => visiblePaperBotKeySet.has(key))
+      );
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+  }, [visiblePaperBotCacheKey]);
 
   if (visibleSuggestions.length === 0) {
     return null;
   }
 
   const runSuggestion = async (suggestion: ChatSuggestionItem) => {
-    if (disabled || pendingSuggestionId || isSuggestionUnavailable(suggestion, actionRegistry)) {
+    const paperBotProposal = paperBotProposalFromSuggestion(suggestion);
+    const suggestionKey = paperBotProposal
+      ? paperBotSuggestionKey(suggestion, paperBotProposal)
+      : suggestion.id;
+    if (disabled || pendingSuggestionId) {
       return;
     }
-    setPendingSuggestionId(suggestion.id);
+    setPendingSuggestionId(suggestionKey);
     setActionFeedback(null);
+    if (paperBotProposal) {
+      try {
+        let prepared = preparedBotProposals[suggestionKey] ?? null;
+        if (!prepared) {
+          prepared = paperBotProposal.proposal_id
+            ? await client.getBotProposal(paperBotProposal.proposal_id)
+            : await client.createBotProposal(botProposalPayload(paperBotProposal));
+          setPreparedBotProposals((current) => ({ ...current, [suggestionKey]: prepared }));
+          setActionFeedback(
+            prepared.missing_inputs.length > 0
+              ? `Bot setup needs: ${prepared.missing_inputs.map(readableKey).join(", ")}.`
+              : "Bot setup ready for review. No broker execution."
+          );
+          return;
+        }
+        if (prepared.missing_inputs.length > 0) {
+          setActionFeedback(`Bot setup needs: ${prepared.missing_inputs.map(readableKey).join(", ")}.`);
+          return;
+        }
+        const result = await client.confirmStartBotProposal(prepared.id);
+        await queryClient.invalidateQueries({ queryKey: ["paper-bot-runtimes"] });
+        setPreparedBotProposals((current) => ({ ...current, [suggestionKey]: result.proposal }));
+        setActionFeedback("Simulation started. No broker execution.");
+        router.push(`/paper-bots?runtime=${encodeURIComponent(result.runtime.id)}`);
+      } catch (error) {
+        setActionFeedback(errorMessageFromUnknown(error));
+      } finally {
+        setPendingSuggestionId(null);
+      }
+      return;
+    }
+    if (isSuggestionUnavailable(suggestion, actionRegistry)) {
+      setActionFeedback(suggestion.disabled_reason ?? "This action needs more context first.");
+      setPendingSuggestionId(null);
+      return;
+    }
     if (suggestion.action === "open_artifact") {
       try {
         onViewArtifactWorkspace();
@@ -4122,8 +4251,22 @@ function SuggestionRail({
   return (
     <div className="space-y-2 pt-1">
       <div className="flex flex-wrap gap-2">
-        {visibleSuggestions.map((suggestion) => (
-          isActionAwareSuggestion(suggestion) ? (
+        {visibleSuggestions.map((suggestion) => {
+          const paperBotProposal = paperBotProposalFromSuggestion(suggestion);
+          const suggestionKey = paperBotProposal
+            ? paperBotSuggestionKey(suggestion, paperBotProposal)
+            : suggestion.id;
+          return paperBotProposal ? (
+            <PaperBotSuggestionCard
+              disabled={disabled}
+              key={suggestionKey}
+              onRun={() => runSuggestion(suggestion)}
+              pending={pendingSuggestionId === suggestionKey}
+              preparedProposal={preparedBotProposals[suggestionKey] ?? null}
+              proposal={paperBotProposal}
+              suggestion={suggestion}
+            />
+          ) : isActionAwareSuggestion(suggestion) ? (
             <ActionAwarenessCard
               actionRegistry={actionRegistry}
               disabled={disabled}
@@ -4144,8 +4287,8 @@ function SuggestionRail({
             >
               {pendingSuggestionId === suggestion.id ? "Starting..." : suggestion.label}
             </Button>
-          )
-        ))}
+          );
+        })}
       </div>
       {actionFeedback ? (
         <p className="text-muted-foreground text-xs">{actionFeedback}</p>
@@ -4227,6 +4370,79 @@ function ActionAwarenessCard({
   );
 }
 
+function PaperBotSuggestionCard({
+  disabled,
+  onRun,
+  pending,
+  preparedProposal,
+  proposal,
+  suggestion,
+}: {
+  disabled: boolean;
+  onRun: () => Promise<void>;
+  pending: boolean;
+  preparedProposal: BackendBotProposal | null;
+  proposal: PaperBotProposal | null;
+  suggestion: ChatSuggestionItem;
+}) {
+  if (!proposal) {
+    return null;
+  }
+  const missingFields = preparedProposal?.missing_inputs ?? [];
+  const readiness = preparedProposal?.readiness_checks ?? proposal.readiness;
+  const subscriptions = preparedProposal?.data_subscriptions ?? proposal.data_subscriptions;
+  return (
+    <div className="min-w-[260px] max-w-xl flex-1">
+      <PaperBotProposalCard
+        actionLabel={preparedProposal && missingFields.length === 0 ? "Start paper simulation" : "Prepare bot"}
+        disabled={disabled || suggestion.enabled === false}
+        missingFields={missingFields.map(readableKey)}
+        onStart={() => void onRun()}
+        pending={pending}
+        readiness={readiness}
+        status={suggestion.enabled === false ? "skipped" : pending ? "executing" : "inProgress"}
+        strategyName={preparedProposal?.strategy_name ?? proposal.strategy_name ?? suggestion.label}
+        subscriptions={paperBotSubscriptionLabels({ ...proposal, data_subscriptions: subscriptions })}
+      />
+    </div>
+  );
+}
+
+function paperBotProposalFromSuggestion(suggestion: ChatSuggestionItem): PaperBotProposal | null {
+  return suggestion.bot_proposal ?? suggestion.paper_bot ?? null;
+}
+
+function paperBotSuggestionKey(suggestion: ChatSuggestionItem, proposal: PaperBotProposal) {
+  return [
+    proposal.proposal_id,
+    proposal.source_run_id,
+    proposal.strategy_id,
+    proposal.source_artifact_ids?.join(","),
+    suggestion.id,
+  ].find((value) => typeof value === "string" && value.trim().length > 0) ?? suggestion.id;
+}
+
+function botProposalPayload(proposal: PaperBotProposal): BotProposalCreateRequest {
+  return {
+    account_id: proposal.account_id ?? "",
+    broker_connection_id: proposal.broker_connection_id ?? "",
+    data_subscriptions: proposal.data_subscriptions ?? [],
+    manifest: {
+      ...(proposal.manifest ?? {}),
+      name: proposal.manifest?.name ?? proposal.strategy_name ?? proposal.strategy_id ?? "Bot",
+    },
+    risk_policy_id: proposal.risk_policy_id ?? "",
+    run_id: proposal.source_run_id,
+    strategy_artifact_id: proposal.source_artifact_ids?.[0],
+    strategy_id: proposal.strategy_id ?? "",
+    strategy_name: proposal.strategy_name,
+  };
+}
+
+function paperBotSubscriptionLabels(proposal: PaperBotProposal) {
+  return (proposal.data_subscriptions ?? []).flatMap((subscription) => paperBotSubscriptionLabel(subscription) ?? []);
+}
+
 function isSuggestionUnavailable(
   suggestion: ChatSuggestionItem,
   actionRegistry?: ActionRegistryLookup
@@ -4298,6 +4514,9 @@ function renderSuggestionIcon(suggestion: ChatSuggestionItem) {
   }
   if (iconKey === "gauge") {
     return <Gauge className="size-3.5" />;
+  }
+  if (iconKey === "bot") {
+    return <Bot className="size-3.5" />;
   }
   if (iconKey === "checklist" || iconKey === "list") {
     return <ListChecks className="size-3.5" />;
@@ -4699,6 +4918,20 @@ function responseIntentFromRunEvents(events: RunEvent[]): ResponseIntent | null 
       intent === "strategy_building"
     ) {
       return intent;
+    }
+  }
+  return null;
+}
+
+function strategyWorkflowFromRunEvents(events: RunEvent[]): WorkflowState | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.type !== "chat.workflow.updated") {
+      continue;
+    }
+    const workflow = normalizeWorkflowState(event.payload);
+    if (workflow) {
+      return workflow;
     }
   }
   return null;

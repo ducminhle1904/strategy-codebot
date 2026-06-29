@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ducminhle1904/strategy-codebot/schemas/parity-report.schema.json",
+  "title": "ParityReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "created_at",
+    "status",
+    "target_platform",
+    "reference_runtime",
+    "compared_runtime",
+    "checks",
+    "evidence",
+    "warnings",
+    "next_actions"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "parity_report"
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "fail", "manual_required", "skipped"]
+    },
+    "target_platform": {
+      "type": "string",
+      "enum": ["pine_v6", "mql5", "nautilus_py", "both"]
+    },
+    "reference_runtime": {
+      "type": "string",
+      "minLength": 1
+    },
+    "compared_runtime": {
+      "type": "string",
+      "minLength": 1
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "status": {
+            "type": "string",
+            "enum": ["pass", "fail", "manual_required", "skipped"]
+          },
+          "details": { "type": "string" }
+        }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "source_refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy_spec_ref": { "type": "string" },
+        "validation_report_ref": { "type": "string" },
+        "backtest_report_ref": { "type": "string" }
+      }
+    }
+  }
+}

@@ -14,12 +14,15 @@ from strategy_codebot.harness_types import STATUS_FAIL, STATUS_PASS, STATUS_SKIP
 from strategy_codebot.knowledge_context import KNOWLEDGE_CONTEXT_PATH, knowledge_metadata
 from strategy_codebot.live import LIVE_ERROR_PATH, LIVE_WORKFLOW_TRACE_PATH, MARKET_RESEARCH_PATH, PROXY_ATTRIBUTION_EVENTS_PATH, WORKFLOW_COMPACT_FREE, WORKFLOW_MULTI_AGENT, LiveError, LiveGenerationResult, LiveRunOptions, generate_live, live_error_report
 from strategy_codebot.mql5 import runner_design, validation_report as mql5_validation_report
+from strategy_codebot.nautilus import nautilus_artifact_bundle
+from strategy_codebot.nautilus import validate_nautilus_spec
 from strategy_codebot.paths import ensure_dir, repo_root, resolve_repo_path
 from strategy_codebot.pine import generate_pine, manual_checklist, validate_pine
 from strategy_codebot.quality import QUALITY_REPORT_PATH, assess_strategy_quality, production_gate_with_quality
 from strategy_codebot.reporting import aggregate_status
 from strategy_codebot.review import REVIEW_MODE_NONE, REVIEW_MODE_PARALLEL, REVIEW_REPORT_PATH, write_review_report
 from strategy_codebot.schemas import load_strategy_spec, validate_payload, write_json
+from strategy_codebot.strategy_spec import TARGET_NAUTILUS, wants_target
 from strategy_codebot.tool_runtime import POLICY_MODES, POLICY_OBSERVE, RUNTIME_SUMMARY_PATH, RUNTIME_TRACE_PATH, ToolHarness, call_tool
 
 def run_strategy(
@@ -148,6 +151,20 @@ def run_strategy(
         mql5_report = mql5_validation_report()
         validation = _combine_validation(validation, mql5_report) if validation else mql5_report
 
+    if wants_target(spec, TARGET_NAUTILUS):
+        nautilus_report = call_tool(
+            tool_harness,
+            "validate_nautilus_contract",
+            validate_nautilus_spec,
+            spec,
+            input_refs=["strategy-spec.json"],
+            output_refs=["nautilus/strategy.py", "nautilus/runtime-manifest.json", "nautilus/parity-report.json"],
+        )
+        if nautilus_report["status"] == STATUS_PASS:
+            for relative_path, content in nautilus_artifact_bundle(spec).items():
+                write_text_artifact(relative_path, content)
+        validation = _combine_validation(validation, nautilus_report) if validation else nautilus_report
+
     if validation is None:
         validation = {
             "platform": spec["target_platform"],
@@ -230,6 +247,7 @@ def run_strategy(
         "tool_calls": [
             *([_live_generation_tool_call(live_result)] if live_result else []),
             *(["pine-static-validator"] if pine_code else []),
+            *(["nautilus-static-contract"] if wants_target(spec, TARGET_NAUTILUS) else []),
             *(["parallel-review"] if review_report else []),
         ],
         "output_refs": [*artifacts, *runtime_artifacts, "agent-run.json"],

@@ -49,6 +49,8 @@ REQUIRED_TABLES = {
     "backtest_equity_summary",
     "backtest_runner_stats",
     "strategy_specs",
+    "nautilus_runtimes",
+    "nautilus_runtime_events",
     "validation_reports",
     "review_reports",
     "policy_findings",
@@ -62,6 +64,8 @@ INITIAL_MIGRATION_TABLES = REQUIRED_TABLES - {
     "backtest_trade_index",
     "backtest_equity_summary",
     "backtest_runner_stats",
+    "nautilus_runtimes",
+    "nautilus_runtime_events",
 }
 
 
@@ -111,6 +115,17 @@ def test_alembic_upgrade_head_creates_api_schema(tmp_path: Path) -> None:
     assert "retry_of_run_id" in [column["name"] for column in inspector.get_columns("assistant_runs")]
     assert "retry_of_run_id" not in [column["name"] for column in inspector.get_columns("conversation_messages")]
     assert "summary" in [column["name"] for column in inspector.get_columns("conversation_memories")]
+    runtime_columns = [column["name"] for column in inspector.get_columns("nautilus_runtimes")]
+    event_columns = [column["name"] for column in inspector.get_columns("nautilus_runtime_events")]
+    assert "heartbeat_count" in runtime_columns
+    assert "heartbeat_metrics_json" in runtime_columns
+    assert "last_heartbeat_event_at" in runtime_columns
+    assert "desired_state" in runtime_columns
+    assert "worker_id" in runtime_columns
+    assert "lease_until" in runtime_columns
+    assert "generation" in runtime_columns
+    assert "stream_cursor_json" in runtime_columns
+    assert "idempotency_key" in event_columns
 
 
 def test_opaque_id_prefixes() -> None:
@@ -129,6 +144,8 @@ def test_opaque_id_prefixes() -> None:
         "rev",
         "pol",
         "usage",
+        "nrt",
+        "nevt",
     ]:
         assert re.fullmatch(rf"{prefix}_[0-9a-f]{{32}}", opaque_id(prefix))
 

@@ -263,6 +263,76 @@ services:
         condition: service_healthy
       migration:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from pathlib import Path; import sys; sys.exit(0 if b'strategy_codebot.server.chat_worker' in Path('/proc/1/cmdline').read_bytes() else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  market-data-collector:
+    image: strategy-codebot-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "strategy_codebot.server.market_data_collector"]
+    environment:
+      <<: *api-environment
+      STRATEGY_CODEBOT_API_DATABASE_URL: postgresql+psycopg://strategy_codebot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/strategy_codebot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from pathlib import Path; import sys; sys.exit(0 if b'strategy_codebot.server.market_data_collector' in Path('/proc/1/cmdline').read_bytes() else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  nautilus-paper-worker:
+    image: strategy-codebot-nautilus-paper-worker:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        STRATEGY_CODEBOT_UV_EXTRAS: "--extra live --extra nautilus"
+    command: ["python", "-m", "strategy_codebot.server.nautilus_paper_worker"]
+    environment:
+      <<: *api-environment
+      STRATEGY_CODEBOT_API_DATABASE_URL: postgresql+psycopg://strategy_codebot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/strategy_codebot
+      NAUTILUS_PAPER_WORKER_ID: ${NAUTILUS_PAPER_WORKER_ID:-}
+      MAX_RUNTIME_PROCESSES: ${MAX_RUNTIME_PROCESSES:-4}
+      MAX_STRATEGIES_PER_RUNTIME: ${MAX_STRATEGIES_PER_RUNTIME:-20}
+      HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-15}
+      EVENT_BATCH_SIZE: ${EVENT_BATCH_SIZE:-100}
+      STREAM_BLOCK_MS: ${STREAM_BLOCK_MS:-1000}
+      NAUTILUS_RUNTIME_LEASE_SECONDS: ${NAUTILUS_RUNTIME_LEASE_SECONDS:-60}
+      NAUTILUS_WORKER_POLL_INTERVAL_SECONDS: ${NAUTILUS_WORKER_POLL_INTERVAL_SECONDS:-2}
+    volumes:
+      - api-artifacts:/var/lib/strategy-codebot/artifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      market-data-collector:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"from pathlib import Path; import sys; sys.exit(0 if b'strategy_codebot.server.nautilus_paper_worker' in Path('/proc/1/cmdline').read_bytes() else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    cpus: ${NAUTILUS_PAPER_WORKER_CPUS:-2}
+    mem_limit: ${NAUTILUS_PAPER_WORKER_MEM_LIMIT:-2g}
     restart: unless-stopped
 
   pineforge-runner:

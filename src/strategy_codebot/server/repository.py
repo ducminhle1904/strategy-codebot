@@ -1,12 +1,15 @@
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from threading import RLock
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
+from strategy_codebot.nautilus_streams import MarketDataStreamSubscription
 from strategy_codebot.server.auth import AuthContext
 from strategy_codebot.server.artifact_kinds import INTERNAL_ARTIFACT_KINDS
+from strategy_codebot.server.bot_proposal_status import BOT_PROPOSAL_STATUS_STARTED
+from strategy_codebot.server.bot_proposal_status import BotProposalStatus
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.models import utc_now
 from strategy_codebot.server.run_modes import BACKTEST_JOB_MAX_ATTEMPTS
@@ -18,6 +21,9 @@ ArtifactInput = tuple[str, str | None, str, str, dict | None]
 CONVERSATION_ARTIFACT_STATE_LIMIT = 50
 CONVERSATION_ARTIFACT_PAGE_MAX_LIMIT = 100
 ArtifactVisibilityFilter = Literal["user", "all"]
+NAUTILUS_HEARTBEAT_SAMPLE_INTERVAL = timedelta(minutes=5)
+NAUTILUS_HEARTBEAT_RETENTION_MAX_AGE = timedelta(hours=24)
+NAUTILUS_HEARTBEAT_RETENTION_MAX_SAMPLES = 288
 
 
 @dataclass(frozen=True)
@@ -248,6 +254,99 @@ class UsageLedgerRecord:
     output_tokens: int
     cost_estimate_usd: float | None
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class NautilusRuntimeRecord:
+    id: str
+    owner_user_id: str
+    workspace_id: str
+    runtime_key: str
+    broker_connection_id: str
+    account_id: str
+    mode: str
+    risk_policy_id: str
+    state: str
+    strategy_ids: list[str]
+    manifest_json: dict
+    data_subscriptions_json: list
+    last_heartbeat_at: datetime | None
+    heartbeat_count: int
+    heartbeat_metrics_json: dict | None
+    last_heartbeat_event_at: datetime | None
+    kill_switch_active: bool
+    desired_state: str
+    worker_id: str | None
+    lease_until: datetime | None
+    generation: int
+    started_at: datetime | None
+    stopped_at: datetime | None
+    last_error_json: dict | None
+    stream_cursor_json: dict | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class NautilusRuntimeEventRecord:
+    id: str
+    runtime_id: str
+    owner_user_id: str
+    workspace_id: str
+    sequence: int
+    type: str
+    payload: dict | None
+    created_at: datetime
+    idempotency_key: str | None = None
+
+
+@dataclass(frozen=True)
+class NautilusHeartbeatRecord:
+    runtime: NautilusRuntimeRecord
+    event: NautilusRuntimeEventRecord | None
+    event_appended: bool
+
+NautilusRuntimeEventInput = tuple[str, dict | None, str | None]
+
+
+@dataclass(frozen=True)
+class BotProposalRecord:
+    id: str
+    owner_user_id: str
+    workspace_id: str
+    status: str
+    source_conversation_id: str | None
+    source_run_id: str | None
+    source_artifact_ids: list[str]
+    strategy_id: str
+    strategy_name: str
+    manifest_json: dict
+    data_subscriptions_json: list
+    broker_connection_id: str | None
+    account_id: str | None
+    risk_policy_id: str | None
+    readiness_checks_json: list
+    missing_inputs_json: list
+    runtime_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class BotProposalCreateInput:
+    status: BotProposalStatus
+    source_conversation_id: str | None
+    source_run_id: str | None
+    source_artifact_ids: list[str]
+    strategy_id: str
+    strategy_name: str
+    manifest_json: dict
+    data_subscriptions_json: list
+    broker_connection_id: str | None
+    account_id: str | None
+    risk_policy_id: str | None
+    readiness_checks_json: list
+    missing_inputs_json: list
 
 
 @dataclass(frozen=True)
@@ -551,6 +650,170 @@ class ConversationRepository(Protocol):
 
     def summarize_account_usage(self, auth: AuthContext) -> AccountUsageSummaryRecord: ...
 
+    def upsert_nautilus_runtime(
+        self,
+        auth: AuthContext,
+        *,
+        runtime_key: str,
+        broker_connection_id: str,
+        account_id: str,
+        mode: str,
+        risk_policy_id: str,
+        strategy_id: str,
+        manifest_json: dict,
+        data_subscriptions_json: list,
+    ) -> NautilusRuntimeRecord: ...
+
+    def list_nautilus_runtimes(
+        self,
+        auth: AuthContext,
+        *,
+        mode: str | None = None,
+        limit: int = 100,
+    ) -> list[NautilusRuntimeRecord]: ...
+
+    def get_nautilus_runtime(self, auth: AuthContext, runtime_id: str) -> NautilusRuntimeRecord | None: ...
+
+    def set_nautilus_runtime_state(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        state: str,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def record_nautilus_runtime_heartbeat(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        now: datetime | None = None,
+        payload: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> NautilusHeartbeatRecord | None: ...
+
+    def activate_nautilus_runtime_kill_switch(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def set_nautilus_runtime_desired_state(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        desired_state: str,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def list_desired_nautilus_runtimes(
+        self,
+        *,
+        mode: str = "paper",
+        desired_state: str = "running",
+        worker_id: str | None = None,
+        limit: int = 100,
+    ) -> list[NautilusRuntimeRecord]: ...
+
+    def list_active_nautilus_market_data_subscriptions(
+        self,
+        *,
+        mode: str = "paper",
+        desired_state: str = "running",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]: ...
+
+    def claim_nautilus_runtime_lease(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def renew_nautilus_runtime_lease(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def release_nautilus_runtime_lease(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        state: str | None = None,
+        last_error_json: dict | None = None,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def persist_nautilus_runtime_stream_cursor(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        stream_cursor_json: dict,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None: ...
+
+    def append_nautilus_runtime_events_for_worker(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        events: list[NautilusRuntimeEventInput],
+    ) -> list[NautilusRuntimeEventRecord] | None: ...
+
+    def append_nautilus_runtime_event(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        event_type: str,
+        payload: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> NautilusRuntimeEventRecord | None: ...
+
+    def list_nautilus_runtime_events(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        limit: int = 100,
+        after_sequence: int | None = None,
+    ) -> list[NautilusRuntimeEventRecord] | None: ...
+
+    def create_bot_proposal(
+        self,
+        auth: AuthContext,
+        proposal: BotProposalCreateInput,
+    ) -> BotProposalRecord: ...
+
+    def get_bot_proposal(self, auth: AuthContext, proposal_id: str) -> BotProposalRecord | None: ...
+
+    def mark_bot_proposal_started(
+        self,
+        auth: AuthContext,
+        proposal_id: str,
+        *,
+        runtime_id: str,
+    ) -> BotProposalRecord | None: ...
+
+    def get_strategy_spec_for_run(self, auth: AuthContext, run_id: str) -> StrategySpecRecord | None: ...
+
+    def cleanup_nautilus_heartbeat_events(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        now: datetime | None = None,
+        max_age: timedelta = timedelta(hours=24),
+        max_samples: int = 288,
+    ) -> int | None: ...
+
     def create_feedback(
         self,
         auth: AuthContext,
@@ -581,6 +844,9 @@ class InMemoryConversationRepository:
         self._tool_calls: dict[str, ToolCallRecord] = {}
         self._policy_findings: dict[str, PolicyFindingRecord] = {}
         self._usage_ledger: dict[str, UsageLedgerRecord] = {}
+        self._nautilus_runtimes: dict[str, NautilusRuntimeRecord] = {}
+        self._nautilus_runtime_events: dict[str, list[NautilusRuntimeEventRecord]] = {}
+        self._bot_proposals: dict[str, BotProposalRecord] = {}
         self._feedback: dict[str, FeedbackRecord] = {}
 
     def create_conversation(self, auth: AuthContext, title: str | None = None) -> ConversationRecord:
@@ -1210,6 +1476,20 @@ class InMemoryConversationRepository:
             self._strategy_specs[spec.id] = spec
         return spec
 
+    def get_strategy_spec_for_run(self, auth: AuthContext, run_id: str) -> StrategySpecRecord | None:
+        run = self.get_run(auth, run_id)
+        if run is None:
+            return None
+        with self._lock:
+            rows = [
+                spec
+                for spec in self._strategy_specs.values()
+                if spec.run_id == run.id
+                and spec.owner_user_id == auth.user_id
+                and spec.workspace_id == auth.workspace_id
+            ]
+        return sorted(rows, key=lambda spec: (spec.created_at, spec.id), reverse=True)[0] if rows else None
+
     def create_artifact(
         self,
         auth: AuthContext,
@@ -1635,6 +1915,515 @@ class InMemoryConversationRepository:
             estimated_cost_usd=sum(cost_values) if cost_values else None,
         )
 
+    def upsert_nautilus_runtime(
+        self,
+        auth: AuthContext,
+        *,
+        runtime_key: str,
+        broker_connection_id: str,
+        account_id: str,
+        mode: str,
+        risk_policy_id: str,
+        strategy_id: str,
+        manifest_json: dict,
+        data_subscriptions_json: list,
+    ) -> NautilusRuntimeRecord:
+        now = _now()
+        with self._lock:
+            existing = next(
+                (
+                    runtime
+                    for runtime in self._nautilus_runtimes.values()
+                    if runtime.runtime_key == runtime_key
+                    and runtime.owner_user_id == auth.user_id
+                    and runtime.workspace_id == auth.workspace_id
+                ),
+                None,
+            )
+            if existing is None:
+                runtime = NautilusRuntimeRecord(
+                    id=opaque_id("nrt"),
+                    owner_user_id=auth.user_id,
+                    workspace_id=auth.workspace_id,
+                    runtime_key=runtime_key,
+                    broker_connection_id=broker_connection_id,
+                    account_id=account_id,
+                    mode=mode,
+                    risk_policy_id=risk_policy_id,
+                    state="requested",
+                    strategy_ids=[strategy_id],
+                    manifest_json=manifest_json,
+                    data_subscriptions_json=data_subscriptions_json,
+                    last_heartbeat_at=None,
+                    heartbeat_count=0,
+                    heartbeat_metrics_json=None,
+                    last_heartbeat_event_at=None,
+                    kill_switch_active=False,
+                    desired_state="running" if mode == "paper" else "requested",
+                    worker_id=None,
+                    lease_until=None,
+                    generation=0,
+                    started_at=None,
+                    stopped_at=None,
+                    last_error_json=None,
+                    stream_cursor_json=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._nautilus_runtimes[runtime.id] = runtime
+                self._nautilus_runtime_events[runtime.id] = []
+                return runtime
+            strategy_ids = list(existing.strategy_ids)
+            if strategy_id not in strategy_ids:
+                strategy_ids.append(strategy_id)
+            updated = replace(
+                existing,
+                strategy_ids=strategy_ids,
+                manifest_json=manifest_json or existing.manifest_json,
+                data_subscriptions_json=data_subscriptions_json or existing.data_subscriptions_json,
+                updated_at=now,
+            )
+            self._nautilus_runtimes[updated.id] = updated
+            return updated
+
+    def list_nautilus_runtimes(
+        self,
+        auth: AuthContext,
+        *,
+        mode: str | None = None,
+        limit: int = 100,
+    ) -> list[NautilusRuntimeRecord]:
+        with self._lock:
+            rows = [
+                runtime
+                for runtime in self._nautilus_runtimes.values()
+                if _is_nautilus_runtime_authorized(auth, runtime)
+                and (mode is None or runtime.mode == mode)
+            ]
+        return sorted(rows, key=lambda runtime: (runtime.updated_at, runtime.created_at, runtime.id), reverse=True)[
+            : _bounded_nautilus_limit(limit)
+        ]
+
+    def get_nautilus_runtime(self, auth: AuthContext, runtime_id: str) -> NautilusRuntimeRecord | None:
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+        if runtime is None or not _is_nautilus_runtime_authorized(auth, runtime):
+            return None
+        return runtime
+
+    def set_nautilus_runtime_state(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        state: str,
+    ) -> NautilusRuntimeRecord | None:
+        now = _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or not _is_nautilus_runtime_authorized(auth, runtime):
+                return None
+            updated = replace(runtime, state=state, updated_at=now)
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def record_nautilus_runtime_heartbeat(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        now: datetime | None = None,
+        payload: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> NautilusHeartbeatRecord | None:
+        now = now or _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or not _is_nautilus_runtime_authorized(auth, runtime):
+                return None
+            previous_state = runtime.state
+            if runtime.kill_switch_active:
+                state = runtime.state if runtime.state in {"stopping", "stopped", "failed"} else "stopping"
+            else:
+                state = nautilus_runtime_state_from_heartbeat_payload(payload)
+            should_append_event = should_append_nautilus_heartbeat_event(runtime, state, now)
+            event = None
+            if should_append_event:
+                event = self._append_nautilus_runtime_event_locked(
+                    runtime,
+                    "heartbeat",
+                    payload,
+                    now=now,
+                    idempotency_key=idempotency_key,
+                )
+            updated = replace(
+                runtime,
+                state=state,
+                last_heartbeat_at=now,
+                heartbeat_count=runtime.heartbeat_count + 1,
+                heartbeat_metrics_json=payload,
+                last_heartbeat_event_at=now if event is not None else runtime.last_heartbeat_event_at,
+                updated_at=now,
+            )
+            self._nautilus_runtimes[runtime.id] = updated
+            return NautilusHeartbeatRecord(
+                runtime=updated,
+                event=event,
+                event_appended=event is not None and event.created_at == now and (state != previous_state or should_append_event),
+            )
+
+    def activate_nautilus_runtime_kill_switch(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+    ) -> NautilusRuntimeRecord | None:
+        now = _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or not _is_nautilus_runtime_authorized(auth, runtime):
+                return None
+            updated = replace(
+                runtime,
+                state="stopping",
+                desired_state="stopping",
+                kill_switch_active=True,
+                updated_at=now,
+            )
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def set_nautilus_runtime_desired_state(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        desired_state: str,
+    ) -> NautilusRuntimeRecord | None:
+        now = _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or not _is_nautilus_runtime_authorized(auth, runtime):
+                return None
+            updated = replace(runtime, desired_state=desired_state, updated_at=now)
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def list_desired_nautilus_runtimes(
+        self,
+        *,
+        mode: str = "paper",
+        desired_state: str = "running",
+        worker_id: str | None = None,
+        limit: int = 100,
+    ) -> list[NautilusRuntimeRecord]:
+        now = _now()
+        with self._lock:
+            rows = [
+                runtime
+                for runtime in self._nautilus_runtimes.values()
+                if runtime.mode == mode
+                and runtime.desired_state == desired_state
+                and runtime.state not in {"stopped", "failed"}
+                and (
+                    runtime.lease_until is None
+                    or runtime.lease_until < now
+                    or (worker_id is not None and runtime.worker_id == worker_id)
+                )
+            ]
+        return sorted(rows, key=lambda runtime: (runtime.updated_at, runtime.created_at, runtime.id))[
+            : _bounded_nautilus_limit(limit)
+        ]
+
+    def list_active_nautilus_market_data_subscriptions(
+        self,
+        *,
+        mode: str = "paper",
+        desired_state: str = "running",
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            payloads = [
+                payload
+                for runtime in self._nautilus_runtimes.values()
+                if runtime.mode == mode
+                and runtime.desired_state == desired_state
+                and runtime.state not in {"stopped", "failed"}
+                for payload in runtime.data_subscriptions_json
+            ]
+        return normalize_market_data_subscription_payloads(payloads, limit=limit)
+
+    def claim_nautilus_runtime_lease(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None:
+        current = now or _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None:
+                return None
+            lease_active = runtime.lease_until is not None and runtime.lease_until >= current
+            if lease_active and runtime.worker_id != worker_id:
+                return None
+            generation = runtime.generation if runtime.worker_id == worker_id else runtime.generation + 1
+            updated = replace(
+                runtime,
+                worker_id=worker_id,
+                lease_until=current + timedelta(seconds=lease_seconds),
+                generation=generation,
+                state="provisioning" if runtime.state == "requested" else runtime.state,
+                started_at=runtime.started_at or current,
+                updated_at=current,
+            )
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def renew_nautilus_runtime_lease(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        lease_seconds: int = 60,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None:
+        current = now or _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or runtime.worker_id != worker_id:
+                return None
+            updated = replace(
+                runtime,
+                lease_until=current + timedelta(seconds=lease_seconds),
+                updated_at=current,
+            )
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def release_nautilus_runtime_lease(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        state: str | None = None,
+        last_error_json: dict | None = None,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None:
+        current = now or _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or runtime.worker_id != worker_id:
+                return None
+            updated = replace(
+                runtime,
+                worker_id=None,
+                lease_until=None,
+                state=state or runtime.state,
+                stopped_at=current if state in {"stopping", "stopped", "failed"} else runtime.stopped_at,
+                last_error_json=last_error_json,
+                updated_at=current,
+            )
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def persist_nautilus_runtime_stream_cursor(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        stream_cursor_json: dict,
+        now: datetime | None = None,
+    ) -> NautilusRuntimeRecord | None:
+        current = now or _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or runtime.worker_id != worker_id:
+                return None
+            updated = replace(runtime, stream_cursor_json=stream_cursor_json, updated_at=current)
+            self._nautilus_runtimes[runtime.id] = updated
+            return updated
+
+    def append_nautilus_runtime_events_for_worker(
+        self,
+        runtime_id: str,
+        *,
+        worker_id: str,
+        events: list[NautilusRuntimeEventInput],
+    ) -> list[NautilusRuntimeEventRecord] | None:
+        now = _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or runtime.worker_id != worker_id:
+                return None
+            appended = [
+                self._append_nautilus_runtime_event_locked(
+                    runtime,
+                    event_type,
+                    payload,
+                    now=now,
+                    idempotency_key=idempotency_key,
+                )
+                for event_type, payload, idempotency_key in events
+            ]
+            return appended
+
+    def append_nautilus_runtime_event(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        event_type: str,
+        payload: dict | None = None,
+        idempotency_key: str | None = None,
+    ) -> NautilusRuntimeEventRecord | None:
+        now = _now()
+        with self._lock:
+            runtime = self._nautilus_runtimes.get(runtime_id)
+            if runtime is None or not _is_nautilus_runtime_authorized(auth, runtime):
+                return None
+            return self._append_nautilus_runtime_event_locked(
+                runtime,
+                event_type,
+                payload,
+                now=now,
+                idempotency_key=idempotency_key,
+            )
+
+    def _append_nautilus_runtime_event_locked(
+        self,
+        runtime: NautilusRuntimeRecord,
+        event_type: str,
+        payload: dict | None,
+        *,
+        now: datetime,
+        idempotency_key: str | None = None,
+    ) -> NautilusRuntimeEventRecord:
+        existing = self._nautilus_runtime_events.setdefault(runtime.id, [])
+        if idempotency_key is not None:
+            for event in existing:
+                if event.idempotency_key == idempotency_key:
+                    return event
+        event = NautilusRuntimeEventRecord(
+            id=opaque_id("nevt"),
+            runtime_id=runtime.id,
+            owner_user_id=runtime.owner_user_id,
+            workspace_id=runtime.workspace_id,
+            sequence=len(existing) + 1,
+            type=event_type,
+            payload=payload,
+            created_at=now,
+            idempotency_key=idempotency_key,
+        )
+        existing.append(event)
+        return event
+
+    def list_nautilus_runtime_events(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        limit: int = 100,
+        after_sequence: int | None = None,
+    ) -> list[NautilusRuntimeEventRecord] | None:
+        runtime = self.get_nautilus_runtime(auth, runtime_id)
+        if runtime is None:
+            return None
+        with self._lock:
+            events = [
+                event
+                for event in self._nautilus_runtime_events.get(runtime.id, [])
+                if after_sequence is None or event.sequence > after_sequence
+            ]
+        return events[: _bounded_nautilus_limit(limit)]
+
+    def create_bot_proposal(
+        self,
+        auth: AuthContext,
+        proposal: BotProposalCreateInput,
+    ) -> BotProposalRecord:
+        now = _now()
+        record = BotProposalRecord(
+            id=opaque_id("botp"),
+            owner_user_id=auth.user_id,
+            workspace_id=auth.workspace_id,
+            status=proposal.status,
+            source_conversation_id=proposal.source_conversation_id,
+            source_run_id=proposal.source_run_id,
+            source_artifact_ids=list(proposal.source_artifact_ids),
+            strategy_id=proposal.strategy_id,
+            strategy_name=proposal.strategy_name,
+            manifest_json=proposal.manifest_json,
+            data_subscriptions_json=list(proposal.data_subscriptions_json),
+            broker_connection_id=proposal.broker_connection_id,
+            account_id=proposal.account_id,
+            risk_policy_id=proposal.risk_policy_id,
+            readiness_checks_json=list(proposal.readiness_checks_json),
+            missing_inputs_json=list(proposal.missing_inputs_json),
+            runtime_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._lock:
+            self._bot_proposals[record.id] = record
+        return record
+
+    def get_bot_proposal(self, auth: AuthContext, proposal_id: str) -> BotProposalRecord | None:
+        with self._lock:
+            proposal = self._bot_proposals.get(proposal_id)
+        if proposal is None or proposal.owner_user_id != auth.user_id or proposal.workspace_id != auth.workspace_id:
+            return None
+        return proposal
+
+    def mark_bot_proposal_started(
+        self,
+        auth: AuthContext,
+        proposal_id: str,
+        *,
+        runtime_id: str,
+    ) -> BotProposalRecord | None:
+        now = _now()
+        with self._lock:
+            proposal = self._bot_proposals.get(proposal_id)
+            if proposal is None or proposal.owner_user_id != auth.user_id or proposal.workspace_id != auth.workspace_id:
+                return None
+            updated = replace(proposal, status=BOT_PROPOSAL_STATUS_STARTED, runtime_id=runtime_id, updated_at=now)
+            self._bot_proposals[proposal_id] = updated
+            return updated
+
+    def cleanup_nautilus_heartbeat_events(
+        self,
+        auth: AuthContext,
+        runtime_id: str,
+        *,
+        now: datetime | None = None,
+        max_age: timedelta = NAUTILUS_HEARTBEAT_RETENTION_MAX_AGE,
+        max_samples: int = NAUTILUS_HEARTBEAT_RETENTION_MAX_SAMPLES,
+    ) -> int | None:
+        runtime = self.get_nautilus_runtime(auth, runtime_id)
+        if runtime is None:
+            return None
+        current = now or _now()
+        cutoff = current - max_age
+        with self._lock:
+            events = self._nautilus_runtime_events.get(runtime.id, [])
+            heartbeat_events = [event for event in events if event.type == "heartbeat"]
+            keep_ids = {
+                event.id
+                for event in sorted(heartbeat_events, key=lambda event: (event.created_at, event.sequence), reverse=True)[
+                    : max(0, max_samples)
+                ]
+            }
+            retained = []
+            removed = 0
+            for event in events:
+                if event.type != "heartbeat" or (event.id in keep_ids and event.created_at >= cutoff):
+                    retained.append(event)
+                else:
+                    removed += 1
+            self._nautilus_runtime_events[runtime.id] = retained
+        return removed
+
     def create_feedback(
         self,
         auth: AuthContext,
@@ -1736,6 +2525,79 @@ def _is_authorized(auth: AuthContext, conversation: ConversationRecord) -> bool:
 
 def _is_run_authorized(auth: AuthContext, run: AssistantRunRecord) -> bool:
     return run.owner_user_id == auth.user_id and run.workspace_id == auth.workspace_id
+
+
+def _is_nautilus_runtime_authorized(auth: AuthContext, runtime: NautilusRuntimeRecord) -> bool:
+    return runtime.owner_user_id == auth.user_id and runtime.workspace_id == auth.workspace_id
+
+
+def _bounded_nautilus_limit(limit: int | None) -> int:
+    if limit is None:
+        return 100
+    return min(500, max(1, int(limit)))
+
+
+def _bounded_market_data_subscription_limit(limit: int | None) -> int:
+    if limit is None:
+        return 5000
+    return min(5000, max(1, int(limit)))
+
+
+def normalize_market_data_subscription_payloads(
+    payloads: list[Any],
+    *,
+    limit: int | None = 5000,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        try:
+            subscription = MarketDataStreamSubscription.from_payload(payload)
+            subscription.stream_key()
+        except Exception:
+            continue
+        key = (
+            subscription.venue,
+            subscription.symbol,
+            subscription.data_type,
+            subscription.timeframe or "",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        item: dict[str, Any] = {
+            "venue": subscription.venue,
+            "symbol": subscription.symbol,
+            "data_type": subscription.data_type,
+        }
+        if subscription.timeframe:
+            item["timeframe"] = subscription.timeframe
+        normalized.append(item)
+        if len(normalized) >= _bounded_market_data_subscription_limit(limit):
+            break
+    return normalized
+
+
+def should_append_nautilus_heartbeat_event(
+    runtime: NautilusRuntimeRecord,
+    next_state: str,
+    now: datetime,
+) -> bool:
+    if runtime.state != next_state:
+        return True
+    if runtime.last_heartbeat_event_at is None:
+        return True
+    return now - runtime.last_heartbeat_event_at >= NAUTILUS_HEARTBEAT_SAMPLE_INTERVAL
+
+
+def nautilus_runtime_state_from_heartbeat_payload(payload: dict | None) -> str:
+    metrics = payload.get("metrics") if isinstance(payload, dict) else None
+    warmup_status = metrics.get("warmup_status") if isinstance(metrics, dict) else None
+    if warmup_status in {"pending", "warming_up"}:
+        return "warming_up"
+    return "running"
 
 
 def _job_workspace_active_limit(job: RunJobRecord) -> int:

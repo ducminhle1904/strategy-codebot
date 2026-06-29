@@ -9,6 +9,7 @@ import {
   reasoningSummaryFromPythonEvent,
   responseIntentFromPythonEvent,
   runFailureMessage,
+  strategyWorkflowFromPythonEvent,
   suggestionsFromPythonEvent,
   textFromPythonEvent,
   webSourcesFromPythonEvent,
@@ -73,6 +74,16 @@ describe("chat stream helpers", () => {
                 },
                 priority: 1,
                 prompt: "Use this context for a strategy.",
+                paper_bot: {
+                  account_id: "acct_paper",
+                  broker_connection_id: "paper",
+                  data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+                  manifest: { name: "BTC paper bot" },
+                  readiness: ["Static contract passed"],
+                  risk_policy_id: "risk_default",
+                  strategy_id: "strategy_1",
+                  strategy_name: "BTC paper bot",
+                },
                 reason: "Strategy context is ready for deterministic review.",
                 required_inputs: ["stale_after"],
                 risk_level: "review_required",
@@ -117,6 +128,12 @@ describe("chat stream helpers", () => {
         {
           artifact_kind: "risk_gate_report",
           id: "use-market",
+          paper_bot: {
+            data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+            readiness: ["Static contract passed"],
+            strategy_id: "strategy_1",
+            strategy_name: "BTC paper bot",
+          },
           prompt: "Use this context for a strategy.",
           reason: "Strategy context is ready for deterministic review.",
           required_inputs: ["stale_after"],
@@ -140,6 +157,142 @@ describe("chat stream helpers", () => {
         semantic_suggested_actions: ["review_risk"],
       },
     });
+  });
+
+  it("normalizes Bot proposal suggestions from the server", () => {
+    expect(
+      suggestionsFromPythonEvent({
+        data: {
+          payload: {
+            actions: [
+              {
+                action: "send_prompt",
+                category: "strategy",
+                enabled: true,
+                id: "review-bot-setup-botp_1",
+                kind: "chat_action",
+                label: "Review Bot setup",
+                priority: 1,
+                bot_proposal: {
+                  account_id: "acct_paper",
+                  broker_connection_id: "paper",
+                  data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+                  id: "botp_1",
+                  readiness_checks: ["Static contract passed", "No broker execution"],
+                  risk_policy_id: "risk_default",
+                  source_artifact_ids: ["art_1"],
+                  source_run_id: "run_1",
+                  status: "ready",
+                  strategy_id: "strategy_1",
+                  strategy_name: "BTC bot",
+                },
+                presentation: {
+                  badge_key: "review_required",
+                  icon_key: "bot",
+                  visibility_key: "default",
+                },
+                prompt: "Review this Bot setup.",
+                reason: "Strategy evidence is ready.",
+                risk_level: "review_required",
+                tool_id: "review_bot_setup",
+              },
+            ],
+            version: 1,
+          },
+        },
+        event: "chat.suggestions.updated",
+      })
+    ).toMatchObject({
+      actions: [
+        {
+          bot_proposal: {
+            proposal_id: "botp_1",
+            readiness: ["Static contract passed", "No broker execution"],
+            source_artifact_ids: ["art_1"],
+            source_run_id: "run_1",
+            status: "ready",
+            strategy_id: "strategy_1",
+            strategy_name: "BTC bot",
+          },
+          presentation: {
+            icon_key: "bot",
+          },
+          tool_id: "review_bot_setup",
+        },
+      ],
+    });
+  });
+
+  it("normalizes Strategy to Paper Bot workflow events", () => {
+    expect(
+      strategyWorkflowFromPythonEvent({
+        data: {
+          payload: {
+            workflow_id: "strategy_bot_simulation",
+            current_step: "complete_setup_confirm_start",
+            completed_steps: ["collect_strategy_inputs", "bad-step", "draft_bot_proposal"],
+            blocked_reason: "missing_bot_setup_fields",
+            required_fields: ["broker_connection_id", "account_id"],
+            missing_fields: ["account_id"],
+            artifact_refs: {
+              bot_proposal_id: "botp_1",
+              ignored: 42,
+            },
+            evidence_status: "reviewable_with_caveats",
+            bot_proposal_id: "botp_1",
+            start_allowed: false,
+          },
+        },
+        event: "chat.workflow.updated",
+      })
+    ).toMatchObject({
+      schema_version: 1,
+      workflow_id: "strategy_bot_simulation",
+      intent: "strategy_to_paper_bot_simulation",
+      current_step: "complete_setup_confirm_start",
+      completed_steps: ["collect_strategy_inputs", "draft_bot_proposal"],
+      blocked_reason: "missing_bot_setup_fields",
+      required_fields: ["broker_connection_id", "account_id"],
+      missing_fields: ["account_id"],
+      artifact_refs: { bot_proposal_id: "botp_1" },
+      evidence_status: "reviewable_with_caveats",
+      bot_proposal_id: "botp_1",
+      start_allowed: false,
+      status: {
+        key: "reviewable_with_caveats",
+        label: "Reviewable with caveats",
+      },
+      actions: [
+        expect.objectContaining({
+          id: "confirm_paper_start",
+          enabled: false,
+        }),
+      ],
+      sections: [
+        expect.objectContaining({ id: "strategy_inputs" }),
+        expect.objectContaining({ id: "paper_setup" }),
+      ],
+    });
+  });
+
+  it("rejects workflow events with an unknown current step", () => {
+    expect(
+      strategyWorkflowFromPythonEvent({
+        data: {
+          payload: {
+            workflow_id: "strategy_bot_simulation",
+            current_step: "unknown_step",
+            completed_steps: ["collect_strategy_inputs"],
+            required_fields: [],
+            missing_fields: [],
+            artifact_refs: {},
+            evidence_status: "insufficient_evidence",
+            start_allowed: false,
+          },
+        },
+        event: "chat.workflow.updated",
+      })
+    ).toBeNull();
   });
 
   it("renders generic run failures without technical detail references", () => {

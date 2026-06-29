@@ -53,6 +53,27 @@ def test_knowledge_index_builds_required_types_and_schema(tmp_path: Path) -> Non
         and {"backtest", "quality", "learning_loop"} <= set(item["domain_tags"])
         for item in index["items"]
     )
+    assert any(
+        item["id"] == "internal-bots-chat-workflow"
+        and item["status"] == "active"
+        and item["trust_level"] == "high"
+        and {"bots", "chat_workflow", "simulation"} <= set(item["domain_tags"])
+        for item in index["items"]
+    )
+    workflow_sources = {
+        "internal-backtest-preview-workflow": {"backtest", "preview", "review_only"},
+        "internal-variant-robustness-workflow": {"variant_lab", "robustness", "review_only"},
+        "internal-risk-gate-order-intent-workflow": {"risk_gate", "order_intent", "review_only"},
+        "internal-model-workflow-boundaries": {"artifact_policy", "knowledge_proposal", "market_research"},
+    }
+    for source_id, expected_tags in workflow_sources.items():
+        assert any(
+            item["id"] == source_id
+            and item["status"] == "active"
+            and item["trust_level"] == "high"
+            and expected_tags <= set(item["domain_tags"])
+            for item in index["items"]
+        )
     assert any(source["id"] == "babypips-school-of-pipsology" and source["type"] == "external_ref" for source in index["sources"])
     assert any(source["id"] == "tradermonty-backtest-expert-skill" and source["type"] == "external_ref" for source in index["sources"])
     assert index["retrieval_index"]["source_map"]
@@ -260,6 +281,22 @@ def test_playbooks_keep_risk_boundary_retrievable(tmp_path: Path) -> None:
     assert any(chunk["source_id"] == "internal-risk-policy" for chunk in result["retrieved_chunks"])
     assert "internal-risk-policy" in result["required_source_hits"]
     assert result["low_confidence"] is False
+
+
+def test_model_workflow_boundaries_are_required_for_action_prompts(tmp_path: Path) -> None:
+    index_path = tmp_path / "kb" / "index.json"
+    build_knowledge_index(index_path=index_path)
+
+    prompts = [
+        "which artifacts are internal raw JSON validation trades compile report",
+        "create knowledge proposal with affected sources and recommendations",
+        "repair validation blockers before preview",
+    ]
+
+    for prompt in prompts:
+        result = search_knowledge(prompt, index_path=index_path)
+        assert result["retrieved_chunks"][0]["source_id"] == "internal-model-workflow-boundaries"
+        assert "internal-model-workflow-boundaries" in result["required_source_hits"]
 
 
 def test_trading_skill_integration_retrieves_robustness_checklist(tmp_path: Path) -> None:

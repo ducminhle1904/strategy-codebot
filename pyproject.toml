@@ -54,6 +54,9 @@ live = [
   "langgraph>=0.2",
   "litellm>=1.50",
 ]
+nautilus = [
+  "nautilus-trader>=1.228.0; python_version >= '3.12' and python_version < '3.15'",
+]
 
 [project.scripts]
 strategy-codebot = "strategy_codebot.cli:main"

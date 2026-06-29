@@ -174,6 +174,7 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "you haven't show it",
+          workflow: null,
         },
       ]);
     });
@@ -765,6 +766,7 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "BTC market card",
+          workflow: null,
         },
       ]);
     });
@@ -820,16 +822,21 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "Backtest summary for BNBUSDT",
+          workflow: null,
         },
       ]);
     });
 
     const hydrated = runtime.current.messages[0];
     expect(hydrated).toMatchObject({ text: "Backtest summary for BNBUSDT" });
-    expect(hydrated?.backtestReport?.metrics).toContainEqual(
+    expect(hydrated?.backtestReport?.kind).toBe("report");
+    if (hydrated?.backtestReport?.kind !== "report") {
+      throw new Error("Expected hydrated backtest report metadata");
+    }
+    expect(hydrated.backtestReport.metrics).toContainEqual(
       { key: "net_pnl", label: "PnL", value: "-222.53 (-2.23%)" }
     );
-    expect(hydrated?.backtestReport?.metrics).toContainEqual(
+    expect(hydrated.backtestReport.metrics).toContainEqual(
       { key: "trade_count", label: "Trade count", value: "236" }
     );
   });
@@ -878,6 +885,7 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "Loaded 1 indexed trades. See the table below.",
+          workflow: null,
         },
       ]);
     });
@@ -936,6 +944,7 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "Loaded 1 indexed trades. See the table below.",
+          workflow: null,
         },
       ]);
     });
@@ -987,6 +996,7 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "analyze ETH",
+          workflow: null,
         },
         {
           id: "msg_eth_answer",
@@ -1000,6 +1010,7 @@ describe("useStrategyChatRuntime", () => {
           sources: [],
           suggestions: null,
           text: "ETH is holding near resistance.",
+          workflow: null,
         },
       ]);
     });

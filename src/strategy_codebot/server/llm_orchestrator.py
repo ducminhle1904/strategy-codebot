@@ -10,6 +10,7 @@ from typing import Any
 from strategy_codebot.server.action_registry import action_registry_payload
 from strategy_codebot.server.action_registry import available_registry_tool_ids
 from strategy_codebot.server.agent_logging import agent_log
+from strategy_codebot.server.artifact_kinds import BACKTEST_PLAN_ARTIFACT_KIND
 from strategy_codebot.server.artifact_kinds import BACKTEST_REPORT_ARTIFACT_KIND
 from strategy_codebot.server.artifact_kinds import BACKTEST_RUN_METADATA_ARTIFACT_KIND
 from strategy_codebot.server.artifact_kinds import RISK_GATE_REPORT_ARTIFACT_KIND
@@ -19,6 +20,7 @@ from strategy_codebot.server.auth import AuthContext
 from strategy_codebot.server.backtest_auto_chain import BACKTEST_AUTO_CHAIN_EVENTS
 from strategy_codebot.server.backtest_auto_chain import BacktestAutoChainPlanner
 from strategy_codebot.server.backtest_summary_text import format_backtest_summary_text
+from strategy_codebot.server.bot_proposals import bot_required_missing
 from strategy_codebot.server.conversation_context import ConversationContextBuilder
 from strategy_codebot.server.llm_clients import LLMClient, LLMClientEvent, ResponsesClient
 from strategy_codebot.server.llm_clients import LLM_EVENT_MESSAGE_DELTA
@@ -68,11 +70,18 @@ from strategy_codebot.server.streaming import sse_frame
 from strategy_codebot.server.streaming import transient_delta_event
 from strategy_codebot.server.streaming import transient_reasoning_event
 from strategy_codebot.server.token_estimation import estimate_tokens as _token_estimate
+from strategy_codebot.server.workflow_registry import STRATEGY_BOT_REQUIRED_INPUT_FIELDS
+from strategy_codebot.server.workflow_registry import STRATEGY_BOT_SETUP_FIELDS
+from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_ID
+from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_STEPS
+from strategy_codebot.server.workflow_registry import validate_workflow_payload
+from strategy_codebot.server.workflow_registry import workflow_catalog_guidance
 
 logger = logging.getLogger(__name__)
 
 SAFE_REASONING_EVENT = "model.reasoning.delta"
 SUGGESTIONS_EVENT = "chat.suggestions.updated"
+STRATEGY_WORKFLOW_EVENT = "chat.workflow.updated"
 CLASSIFIER_TIMEOUT_SECONDS_ENV = "STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS"
 DEFAULT_CLASSIFIER_TIMEOUT_SECONDS = 25.0
 ACTION_PLANNER_ENABLED_ENV = "STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED"
@@ -102,7 +111,11 @@ CHAT_INTENT_MODEL_STAGES = {
 SEMANTIC_ACTIONS = {
     "build_robustness_report",
     "create_proposed_intent",
+    "draft_bot",
+    "get_bot_status",
     "get_backtest_summary",
+    "list_bot_events",
+    "list_bots",
     "market_research",
     "query_backtest_trades",
     "repair",
@@ -789,6 +802,11 @@ class LLMOrchestrator:
             web_search=web_search,
             action_plan=action_plan,
         )
+        workflow_payload = _strategy_bot_workflow_payload(
+            message_content=message_content,
+            context_text=suggestion_context_text,
+            artifact_kinds=artifact_kinds,
+        )
         if action_plan.source != "none":
             agent_log(
                 logger,
@@ -826,6 +844,8 @@ class LLMOrchestrator:
                 "chat.response_intent",
                 chat_decision.payload(),
             )
+            if workflow_payload is not None:
+                yield self._append_frame(auth, run, STRATEGY_WORKFLOW_EVENT, workflow_payload)
             if market_snapshot is not None:
                 response_state["market_snapshot_emitted"] = True
                 response_state["market_data_emitted"] = True
@@ -1455,17 +1475,46 @@ class LLMOrchestrator:
                         ),
                     },
                 )
+            workflow_candidate = _is_strategy_bot_workflow_request(
+                user_message or "",
+                context_text=context_text,
+                artifact_kinds=set(),
+                tool_name=tool_name,
+            )
+            post_tool_artifact_kinds: set[str] | None = None
+            if workflow_candidate or tool_name == "generate_pine":
+                post_tool_artifact_kinds = _conversation_user_artifact_kinds(
+                    self.repository,
+                    auth,
+                    run.conversation_id,
+                    current_run_id=run.id,
+                )
+                post_tool_artifact_kinds.update(_current_run_user_artifact_kinds(self.repository, auth, run.id))
+            workflow_payload = (
+                _strategy_bot_workflow_payload(
+                    message_content=user_message or "",
+                    context_text=context_text,
+                    artifact_kinds=post_tool_artifact_kinds or set(),
+                    tool_name=tool_name,
+                    tool_result=output,
+                )
+                if workflow_candidate
+                else None
+            )
+            if workflow_payload is not None:
+                yield self._append_frame(auth, run, STRATEGY_WORKFLOW_EVENT, workflow_payload)
             refreshed_suggestions = _post_tool_suggestions_payload(
                 repository=self.repository,
                 auth=auth,
                 run=run,
                 tool_name=tool_name,
-                tool_result=budget.completed_tool_results[-1],
+                tool_result=output if tool_name == "draft_bot" else budget.completed_tool_results[-1],
                 response_intent=response_intent,
                 message_content=user_message or "",
                 context_text=context_text,
                 language=language,
                 web_search=web_search,
+                artifact_kinds=post_tool_artifact_kinds,
             )
             if refreshed_suggestions is not None:
                 yield self._append_frame(auth, run, SUGGESTIONS_EVENT, refreshed_suggestions)
@@ -2518,6 +2567,234 @@ def _strategy_missing_fields(context: str) -> list[str]:
     return [field for field, terms in checks.items() if not any(term in context for term in terms)]
 
 
+def _strategy_bot_missing_fields(context: str) -> list[str]:
+    normalized = context.lower()
+    symbol_pattern = re.compile(
+        r"\b(?:BTC|ETH|SOL|BNB|XRP|EUR|GBP|JPY|XAU|AAPL|TSLA|NVDA)"
+        r"(?:[/:-]?(?:USD|USDT|USDC|BTC|ETH|JPY))?\b",
+        re.IGNORECASE,
+    )
+    timeframe_pattern = re.compile(r"\b(?:[1-9]\d?\s?(?:m|min|h|d|w)|[1-9]\d?[mhdw]|daily|hourly|weekly)\b")
+    checks = {
+        "market": ("market", "crypto", "forex", "stock", "equity", "futures", "thị trường", "chứng khoán"),
+        "symbol": ("symbol", "ticker", "btcusdt", "ethusdt", "eurusd", "xauusd"),
+        "timeframe": ("timeframe", "khung thời gian", "khung", "daily", "hourly", "intraday"),
+        "style": ("trend", "mean reversion", "breakout", "scalping", "dca", "style", "phong cách"),
+        "risk_preference": ("risk", "rủi ro", "conservative", "balanced", "aggressive", "an toàn", "mạo hiểm"),
+    }
+    missing = [field for field, terms in checks.items() if not any(term in normalized for term in terms)]
+    if "symbol" in missing and symbol_pattern.search(context):
+        missing.remove("symbol")
+    if "timeframe" in missing and timeframe_pattern.search(normalized):
+        missing.remove("timeframe")
+    return missing
+
+
+def _has_strategy_bot_signal(context: str) -> bool:
+    return any(
+        term in context
+        for term in (
+            "bot",
+            "paper bot",
+            "paper simulation",
+            "paper runtime",
+            "bot simulation",
+            "chạy bot",
+            "tạo bot",
+        )
+    )
+
+
+def _is_strategy_bot_workflow_request(
+    message_content: str,
+    *,
+    context_text: str,
+    artifact_kinds: set[str],
+    tool_name: str | None = None,
+) -> bool:
+    if tool_name in {
+        "generate_pine",
+        "static_validate",
+        "create_backtest_plan",
+        "run_backtest_preview",
+        "get_backtest_summary",
+        "build_robustness_report",
+        "draft_bot",
+    }:
+        combined_for_tool = f"{message_content}\n{context_text}".lower()
+        return tool_name == "draft_bot" or _has_strategy_bot_signal(combined_for_tool)
+    combined = f"{message_content}\n{context_text}".lower()
+    bot_signal = _has_strategy_bot_signal(combined)
+    strategy_signal = any(
+        term in combined
+        for term in (
+            "strategy",
+            "chiến lược",
+            "pine",
+            "backtest",
+            "entry",
+            "exit",
+        )
+    ) or _has_strategy_artifact_kind(artifact_kinds)
+    return bot_signal and strategy_signal
+
+
+def _proposal_missing_setup_fields(
+    proposal: dict[str, Any] | None,
+    explicit_missing: list[str],
+) -> list[str]:
+    if explicit_missing:
+        return explicit_missing
+    if proposal is None:
+        return list(STRATEGY_BOT_SETUP_FIELDS)
+    data_subscriptions = proposal.get("data_subscriptions")
+    return bot_required_missing(
+        broker_connection_id=_safe_string(proposal.get("broker_connection_id")),
+        account_id=_safe_string(proposal.get("account_id")),
+        risk_policy_id=_safe_string(proposal.get("risk_policy_id")),
+        strategy_id=_safe_string(proposal.get("strategy_id")),
+        data_subscriptions=data_subscriptions if isinstance(data_subscriptions, list) else [],
+    )
+
+
+def _workflow_ref(refs: dict[str, str], key: str, value: Any) -> None:
+    text = _safe_string(value)
+    if text:
+        refs[key] = text
+
+
+def _strategy_bot_workflow_payload(
+    *,
+    message_content: str,
+    context_text: str,
+    artifact_kinds: set[str],
+    tool_name: str | None = None,
+    tool_result: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not _is_strategy_bot_workflow_request(
+        message_content,
+        context_text=context_text,
+        artifact_kinds=artifact_kinds,
+        tool_name=tool_name,
+    ):
+        return None
+    result = tool_result if isinstance(tool_result, dict) else {}
+    combined_context = f"{message_content}\n{context_text}"
+    strategy_missing = _strategy_bot_missing_fields(combined_context)
+
+    proposal = result.get("bot_proposal") if isinstance(result.get("bot_proposal"), dict) else None
+    explicit_missing = [
+        field
+        for field in result.get("missing_inputs", [])
+        if isinstance(field, str) and field.strip()
+    ] if isinstance(result.get("missing_inputs"), list) else []
+    proposal_id = _safe_string(result.get("proposal_id"))
+    if proposal is not None:
+        proposal_id = proposal_id or _safe_string(proposal.get("proposal_id")) or _safe_string(proposal.get("id"))
+    setup_missing = _proposal_missing_setup_fields(proposal, explicit_missing) if proposal is not None else []
+    start_allowed = proposal is not None and not setup_missing
+
+    has_pine = bool({"pine_file", "pine_strategy_source"} & artifact_kinds) or tool_name in {
+        "generate_pine",
+        "create_backtest_plan",
+        "run_backtest_preview",
+    }
+    evidence_artifact_kinds = {
+        BACKTEST_PLAN_ARTIFACT_KIND,
+        BACKTEST_RUN_METADATA_ARTIFACT_KIND,
+        BACKTEST_REPORT_ARTIFACT_KIND,
+        ROBUSTNESS_REPORT_ARTIFACT_KIND,
+        RISK_GATE_REPORT_ARTIFACT_KIND,
+    }
+    has_validation = "validation_report" in artifact_kinds or bool(evidence_artifact_kinds & artifact_kinds) or tool_name in {
+        "static_validate",
+        "create_backtest_plan",
+        "run_backtest_preview",
+    } or _safe_string(result.get("validation_artifact_id")) is not None
+    has_backtest_preview = bool(evidence_artifact_kinds & artifact_kinds) or tool_name in {
+        "create_backtest_plan",
+        "run_backtest_preview",
+        "get_backtest_summary",
+        "build_robustness_report",
+    }
+    has_evidence_review = bool(
+        {BACKTEST_REPORT_ARTIFACT_KIND, ROBUSTNESS_REPORT_ARTIFACT_KIND, RISK_GATE_REPORT_ARTIFACT_KIND}
+        & artifact_kinds
+    ) or tool_name in {"get_backtest_summary", "build_robustness_report"}
+
+    completed: list[str] = []
+    if not strategy_missing:
+        completed.append("collect_strategy_inputs")
+    if has_pine:
+        completed.extend(["draft_strategy_spec", "generate_pine"])
+    if has_validation:
+        completed.append("static_validation")
+    if has_backtest_preview:
+        completed.append("backtest_preview")
+    if has_evidence_review:
+        completed.append("evidence_review")
+    if proposal is not None:
+        completed.append("draft_bot_proposal")
+    completed_steps = [step for step in STRATEGY_BOT_WORKFLOW_STEPS if step in set(completed)]
+
+    if strategy_missing:
+        current_step = "collect_strategy_inputs"
+    elif not has_pine:
+        current_step = "draft_strategy_spec"
+    elif not has_validation:
+        current_step = "static_validation"
+    elif not has_backtest_preview:
+        current_step = "backtest_preview"
+    elif not has_evidence_review:
+        current_step = "evidence_review"
+    elif proposal is None:
+        current_step = "draft_bot_proposal"
+    else:
+        current_step = "complete_setup_confirm_start"
+
+    if has_evidence_review:
+        evidence_status = "reviewable_with_caveats"
+    elif has_validation or has_backtest_preview:
+        evidence_status = "needs_validation_or_robustness_check"
+    else:
+        evidence_status = "insufficient_evidence"
+
+    artifact_refs: dict[str, str] = {}
+    if tool_name == "generate_pine":
+        _workflow_ref(artifact_refs, "pine_artifact_id", result.get("artifact_id"))
+    elif tool_name == "static_validate":
+        _workflow_ref(artifact_refs, "validation_artifact_id", result.get("artifact_id"))
+    elif tool_name == "create_backtest_plan":
+        _workflow_ref(artifact_refs, "backtest_plan_artifact_id", result.get("artifact_id"))
+        _workflow_ref(artifact_refs, "pine_artifact_id", result.get("pine_code_artifact_id"))
+        _workflow_ref(artifact_refs, "validation_artifact_id", result.get("validation_artifact_id"))
+    elif tool_name in {"run_backtest_preview", "get_backtest_summary"}:
+        _workflow_ref(artifact_refs, "backtest_run_id", result.get("run_id"))
+    if proposal_id:
+        artifact_refs["bot_proposal_id"] = proposal_id
+
+    required_fields = list(STRATEGY_BOT_SETUP_FIELDS if proposal is not None else STRATEGY_BOT_REQUIRED_INPUT_FIELDS)
+    missing_fields = setup_missing if proposal is not None else strategy_missing
+    blocked_reason = None
+    if strategy_missing:
+        blocked_reason = "missing_strategy_inputs"
+    elif proposal is not None and setup_missing:
+        blocked_reason = "missing_bot_setup_fields"
+
+    return validate_workflow_payload({
+        "workflow_id": STRATEGY_BOT_WORKFLOW_ID,
+        "current_step": current_step,
+        "completed_steps": completed_steps,
+        "blocked_reason": blocked_reason,
+        "required_fields": required_fields,
+        "missing_fields": missing_fields,
+        "artifact_refs": artifact_refs,
+        "evidence_status": evidence_status,
+        "bot_proposal_id": proposal_id,
+        "start_allowed": start_allowed,
+    })
+
+
 def _conversation_user_artifact_kinds(
     repository: ConversationRepository,
     auth: AuthContext,
@@ -2570,16 +2847,47 @@ def _post_tool_suggestions_payload(
     context_text: str,
     language: str,
     web_search: str,
+    artifact_kinds: set[str] | None = None,
 ) -> dict[str, Any] | None:
+    if tool_name == "draft_bot":
+        proposal = tool_result.get("bot_proposal") if isinstance(tool_result.get("bot_proposal"), dict) else None
+        if proposal is None:
+            return None
+        action = _suggestion_action(
+            "review-bot-setup",
+            _copy(language, "Review Bot setup", "Review Bot setup"),
+            _copy(language, "Review the Bot setup before starting simulation. No broker execution.", "Review the Bot setup before starting simulation. No broker execution."),
+            "risk",
+            priority=-10,
+            enabled=True,
+            reason=tool_result.get("next_action") if isinstance(tool_result.get("next_action"), str) else None,
+            risk_level="review_required",
+            tool_id="review_bot_setup",
+            next_state="bot_setup_review",
+            presentation={"badge_key": "review_required", "icon_key": "bot", "visibility_key": "default"},
+        )
+        action["bot_proposal"] = proposal
+        return {
+            "actions": [action],
+            "composer_blocks": [],
+            "context": {
+                "artifact_available": True,
+                "intent": response_intent or "strategy_building",
+                "readiness": tool_result.get("status") or "missing_inputs",
+            },
+            "safe": True,
+            "version": 1,
+        }
     if tool_name not in {"generate_pine"}:
         return None
-    artifact_kinds = _conversation_user_artifact_kinds(
-        repository,
-        auth,
-        run.conversation_id,
-        current_run_id=run.id,
-    )
-    artifact_kinds.update(_current_run_user_artifact_kinds(repository, auth, run.id))
+    if artifact_kinds is None:
+        artifact_kinds = _conversation_user_artifact_kinds(
+            repository,
+            auth,
+            run.conversation_id,
+            current_run_id=run.id,
+        )
+        artifact_kinds.update(_current_run_user_artifact_kinds(repository, auth, run.id))
     if not artifact_kinds:
         return None
     post_tool_context_text = f"{context_text}\n{_tool_result_context_text(tool_result)}"
@@ -3169,6 +3477,8 @@ def _normalize_semantic_action(value: Any) -> str | None:
     normalized = value.strip().lower().replace("-", "_")
     aliases = {
         "build_robustness": "build_robustness_report",
+        "bot_status": "get_bot_status",
+        "prepare_bot": "draft_bot",
         "proposed_intent": "create_proposed_intent",
         "repair_validation": "repair",
         "risk_gate": "run_risk_gate",
@@ -3208,7 +3518,7 @@ def _direct_action_plan_tool_args(
 ) -> tuple[str, dict[str, Any]] | None:
     if not action_plan.is_active() or action_plan.decision != "call_tool" or not action_plan.tool_id:
         return None
-    if action_plan.tool_id not in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report"}:
+    if action_plan.tool_id not in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report", "get_bot_status", "list_bots", "list_bot_events"}:
         return None
     available_tools = available_registry_tool_ids(
         artifact_kinds=artifact_kinds,
@@ -3218,7 +3528,8 @@ def _direct_action_plan_tool_args(
     if action_plan.tool_id not in available_tools:
         return None
     arguments = dict(action_plan.arguments or {})
-    arguments.setdefault("run_id", "latest_completed_backtest")
+    if action_plan.tool_id in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report"}:
+        arguments.setdefault("run_id", "latest_completed_backtest")
     if action_plan.tool_id == "query_backtest_trades":
         bucket = arguments.get("bucket")
         if bucket is not None and bucket not in {"sample", "top_loser", "top_winner"}:
@@ -3994,6 +4305,7 @@ def _system_prompt(language: str = "en", *, web_search: str = "auto") -> str:
         else "Respond in English for user-facing chat text unless the user explicitly asks otherwise. Keep code, Pine syntax, JSON schema keys, tool ids, artifact filenames, and policy/event codes unchanged."
     )
     web_search_instruction = _web_search_instruction(web_search)
+    workflow_guidance = workflow_catalog_guidance()
     return f"""You are Strategy Codebot, a trading-strategy assistant that helps users create reviewable strategy specs, code artifacts, and review notes.
 
 <language>
@@ -4008,6 +4320,7 @@ def _system_prompt(language: str = "en", *, web_search: str = "auto") -> str:
 - You may only request the provided trading strategy tools.
 - You may use the built-in web_search tool only when Search mode enables it.
 - Do not request shell, arbitrary network, arbitrary file, broker, exchange, or live trading actions.
+- For Bots, you may draft setup proposals and read status/events only; starting, stopping, or kill-switch actions require explicit user confirmation through the UI.
 - Do not claim profitability, compile success, runtime success, or backtest success without evidence.
 - Keep every generated artifact and recommendation review-only.
 - Do not reveal internal implementation names, package names, service names, provider routes, runner names, or engine/vendor names.
@@ -4030,7 +4343,12 @@ def _system_prompt(language: str = "en", *, web_search: str = "auto") -> str:
 - For generated code or reports, keep the chat answer brief and point users to the reviewable artifact when available.
 - After generate_pine succeeds, always produce a short final summary covering the strategy premise, symbol/timeframe assumptions, artifact name, key risk/review caveat, and the next validation or preview action. Do not stop after the tool call unless the runtime stops you.
 - For Backtest Preview requests, require PineScript v6 strategy source, use create_backtest_plan before queueing when config assumptions are not explicit, and treat run_backtest_preview and run_backtest_variant_lab outputs as queued local preview jobs only; never claim backtest success until report artifacts exist.
-</domain_shape>"""
+- For Strategy to Paper Bot Simulation workflows, ask only the missing strategy design fields first; draft a strategy spec before any Bot proposal; keep Bot setup as paper simulation only; never start or imply broker execution from chat text.
+</domain_shape>
+
+<workflow_ui>
+{workflow_guidance}
+</workflow_ui>"""
 
 
 def _web_search_instruction(web_search: str) -> str:

@@ -5,6 +5,7 @@ import {
   parseSseFrames,
   reasoningSummaryFromPythonEvent,
   responseIntentFromPythonEvent,
+  strategyWorkflowFromPythonEvent,
   suggestionsFromPythonEvent,
   textFromPythonEvent,
   webSourcesFromPythonEvent,
@@ -961,6 +962,16 @@ function writePythonEventMetadataAsAgUi(
       timestamp: Date.now(),
       type: "CUSTOM",
       value: suggestions,
+    });
+  }
+
+  const workflow = strategyWorkflowFromPythonEvent(event);
+  if (workflow) {
+    write({
+      name: "strategy.workflow",
+      timestamp: Date.now(),
+      type: "CUSTOM",
+      value: workflow,
     });
   }
 

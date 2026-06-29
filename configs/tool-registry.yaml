@@ -74,6 +74,16 @@ tools:
     evidence_required:
       - mql5/runner-design.md
     phase_status: implemented
+  - id: validate_nautilus_contract
+    capability: nautilus-static-contract-validation
+    risk_tier: validation
+    input_schema_ref: schemas/strategy-spec.schema.json
+    output_schema_ref: schemas/validation-report.schema.json
+    evidence_required:
+      - nautilus/strategy.py
+      - nautilus/runtime-manifest.json
+      - nautilus/parity-report.json
+    phase_status: implemented
   - id: run_parallel_review
     capability: strategy-risk-review
     risk_tier: review

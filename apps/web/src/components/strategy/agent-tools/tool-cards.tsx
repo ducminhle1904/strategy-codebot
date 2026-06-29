@@ -2,6 +2,7 @@
 
 import {
   AlertTriangle,
+  Bot,
   CheckCircle2,
   FileCode2,
   Gauge,
@@ -231,6 +232,74 @@ export function ApplyMarketContextHitlCard({
       status={status}
       title="Apply market context"
     />
+  );
+}
+
+export function PaperBotProposalCard({
+  actionLabel,
+  disabled = false,
+  missingFields = [],
+  onStart,
+  pending = false,
+  readiness = [],
+  status,
+  strategyName,
+  subscriptions = [],
+}: {
+  actionLabel?: string;
+  disabled?: boolean;
+  missingFields?: string[];
+  onStart?: () => void;
+  pending?: boolean;
+  readiness?: string[];
+  status: ToolStatus;
+  strategyName?: string;
+  subscriptions?: string[];
+}) {
+  const canStart = missingFields.length === 0 && Boolean(onStart);
+  return (
+    <AgentToolCard
+      action={
+        onStart ? (
+          <Button
+            className="h-8 rounded-[4px] text-xs"
+            disabled={disabled || pending || !canStart}
+            onClick={onStart}
+            type="button"
+            variant="outline"
+          >
+            {pending ? "Working..." : canStart ? actionLabel ?? "Prepare bot" : "Draft only"}
+          </Button>
+        ) : null
+      }
+      description={`${strategyName ?? "Bot proposal"} uses simulated order intents only. No broker execution.`}
+      icon={<Bot className="size-4" />}
+      status={status}
+      title="Bot proposal"
+    >
+      <div className="space-y-2 text-xs">
+        <div className="flex flex-wrap gap-1.5">
+          {(subscriptions.length > 0 ? subscriptions : ["No market subscription"]).slice(0, 3).map((item) => (
+            <span className="rounded-[4px] bg-muted px-2 py-0.5 text-muted-foreground" key={item}>
+              {item}
+            </span>
+          ))}
+        </div>
+        {missingFields.length > 0 ? (
+          <p className="text-amber-300">Missing: {missingFields.join(", ")}</p>
+        ) : null}
+        {readiness.length > 0 ? (
+          <ul className="space-y-1 text-muted-foreground">
+            {readiness.slice(0, 3).map((item) => (
+              <li className="flex items-center gap-1.5" key={item}>
+                <CheckCircle2 className="size-3 text-emerald-300" />
+                <span>{item}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    </AgentToolCard>
   );
 }
 

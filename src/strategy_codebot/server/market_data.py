@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 import os
+import threading
 from typing import Any
 from urllib import parse, request
 
@@ -393,6 +395,54 @@ class MarketDataGateway:
         if include_series or tier in {"paid_medium", "paid_high"}:
             return _dedupe_providers((self.twelve_data, self.alpha_vantage))
         return _dedupe_providers((self.alpha_vantage, self.twelve_data))
+
+
+MarketDataRequestKey = tuple[str, bool, str]
+
+
+@dataclass(frozen=True)
+class MarketDataSubscription:
+    key: MarketDataRequestKey
+    _future: Future[MarketSnapshot | None]
+
+    def result(self, timeout: float | None = None) -> MarketSnapshot | None:
+        return self._future.result(timeout=timeout)
+
+
+class SharedMarketDataFanout:
+    def __init__(self, collector: MarketDataGateway, *, max_workers: int = 4) -> None:
+        self.collector = collector
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="market-data-fanout")
+        self._lock = threading.Lock()
+        self._inflight: dict[MarketDataRequestKey, Future[MarketSnapshot | None]] = {}
+
+    def subscribe(
+        self,
+        symbol: str,
+        *,
+        include_series: bool = False,
+        tier: str = "free",
+    ) -> MarketDataSubscription:
+        key = (symbol.upper(), include_series, tier)
+        with self._lock:
+            future = self._inflight.get(key)
+            if future is None:
+                future = self._executor.submit(self.collector.snapshot, key[0], include_series=include_series, tier=tier)
+                self._inflight[key] = future
+                future.add_done_callback(lambda completed, request_key=key: self._clear_inflight(request_key, completed))
+        return MarketDataSubscription(key=key, _future=future)
+
+    def snapshot(self, symbol: str, *, include_series: bool = False, tier: str = "free") -> MarketSnapshot | None:
+        return self.subscribe(symbol, include_series=include_series, tier=tier).result()
+
+    def inflight_count(self) -> int:
+        with self._lock:
+            return len(self._inflight)
+
+    def _clear_inflight(self, key: MarketDataRequestKey, future: Future[MarketSnapshot | None]) -> None:
+        with self._lock:
+            if self._inflight.get(key) is future:
+                self._inflight.pop(key, None)
 
 
 def market_data_context(snapshot: MarketSnapshot | None) -> str | None:

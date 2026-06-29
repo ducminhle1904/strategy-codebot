@@ -2,6 +2,29 @@ import type { BackendApiError } from "@/lib/backend-client";
 import type { MessageMode, WebSearchMode } from "@/lib/backend-schemas";
 import { normalizeLanguage, type LanguagePreference } from "@/lib/i18n";
 import { parseSseMessages } from "@/lib/sse";
+import {
+  normalizeStrategyWorkflowState,
+  normalizeWorkflowState,
+  STRATEGY_BOT_WORKFLOW_ID,
+  STRATEGY_BOT_WORKFLOW_STEP_IDS,
+  type StrategyWorkflowEvidenceStatus,
+  type StrategyWorkflowState,
+  type StrategyWorkflowStep,
+  type WorkflowState,
+} from "@/lib/workflow-ui";
+
+export {
+  normalizeStrategyWorkflowState,
+  normalizeWorkflowState,
+  STRATEGY_BOT_WORKFLOW_ID,
+  STRATEGY_BOT_WORKFLOW_STEP_IDS,
+};
+export type {
+  StrategyWorkflowEvidenceStatus,
+  StrategyWorkflowState,
+  StrategyWorkflowStep,
+  WorkflowState,
+};
 
 export type PythonSseEvent = {
   id?: string;
@@ -71,6 +94,21 @@ export type ChatSuggestionVariant = {
   label: string;
 };
 
+export type PaperBotProposal = {
+  account_id?: string;
+  broker_connection_id?: string;
+  data_subscriptions?: Array<Record<string, unknown>>;
+  manifest?: Record<string, unknown>;
+  proposal_id?: string;
+  readiness?: string[];
+  risk_policy_id?: string;
+  source_artifact_ids?: string[];
+  source_run_id?: string;
+  status?: string;
+  strategy_id?: string;
+  strategy_name?: string;
+};
+
 export type ChatSuggestionItem = {
   action: ChatSuggestionAction;
   artifact_kind?: string;
@@ -83,6 +121,8 @@ export type ChatSuggestionItem = {
   kind: ChatSuggestionKind;
   label: string;
   next_state?: string;
+  bot_proposal?: PaperBotProposal;
+  paper_bot?: PaperBotProposal;
   presentation?: {
     badge_key?: string;
     icon_key?: string;
@@ -283,6 +323,13 @@ export function suggestionsFromPythonEvent(event: PythonSseEvent): ChatSuggestio
   return normalizeSuggestionsPayload(event.data.payload);
 }
 
+export function strategyWorkflowFromPythonEvent(event: PythonSseEvent): WorkflowState | null {
+  if (event.event !== "chat.workflow.updated") {
+    return null;
+  }
+  return normalizeWorkflowState(event.data.payload);
+}
+
 export function normalizeSuggestionsPayload(value: unknown): ChatSuggestionsPayload | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -447,6 +494,8 @@ function normalizeSuggestions(value: unknown): ChatSuggestionItem[] {
       kind,
       label,
       next_state: sourceText(record.next_state),
+      bot_proposal: normalizePaperBotProposal(record.bot_proposal),
+      paper_bot: normalizePaperBotProposal(record.paper_bot),
       presentation: normalizeSuggestionPresentation(record.presentation),
       priority: typeof record.priority === "number" ? record.priority : 100,
       prompt: sourceText(record.prompt),
@@ -462,6 +511,36 @@ function normalizeSuggestions(value: unknown): ChatSuggestionItem[] {
   return suggestions.sort((left, right) => left.priority - right.priority).slice(0, 8);
 }
 
+function normalizePaperBotProposal(value: unknown): PaperBotProposal | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as Record<string, unknown>;
+  const proposal: PaperBotProposal = {
+    account_id: sourceText(record.account_id),
+    broker_connection_id: sourceText(record.broker_connection_id),
+    proposal_id: sourceText(record.proposal_id) ?? sourceText(record.id),
+    risk_policy_id: sourceText(record.risk_policy_id),
+    source_artifact_ids: normalizeStringList(record.source_artifact_ids),
+    source_run_id: sourceText(record.source_run_id),
+    status: sourceText(record.status),
+    strategy_id: sourceText(record.strategy_id),
+    strategy_name: sourceText(record.strategy_name),
+    readiness: preferStringList(record.readiness, record.readiness_checks),
+  };
+  if (record.manifest && typeof record.manifest === "object" && !Array.isArray(record.manifest)) {
+    proposal.manifest = record.manifest as Record<string, unknown>;
+  }
+  if (Array.isArray(record.data_subscriptions)) {
+    proposal.data_subscriptions = record.data_subscriptions.flatMap((item) =>
+      item && typeof item === "object" && !Array.isArray(item) ? [item as Record<string, unknown>] : []
+    );
+  }
+  return Object.values(proposal).some((item) => Array.isArray(item) ? item.length > 0 : Boolean(item))
+    ? proposal
+    : undefined;
+}
+
 function normalizeStringList(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -470,6 +549,16 @@ function normalizeStringList(value: unknown): string[] {
     const text = sourceText(item);
     return text ? [text] : [];
   });
+}
+
+function preferStringList(...values: unknown[]): string[] {
+  for (const value of values) {
+    const normalized = normalizeStringList(value);
+    if (normalized.length > 0) {
+      return normalized;
+    }
+  }
+  return [];
 }
 
 function normalizeSuggestionPresentation(value: unknown): ChatSuggestionItem["presentation"] | undefined {

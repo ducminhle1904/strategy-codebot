@@ -33,6 +33,7 @@ describe("action tool metadata", () => {
         id: "robustness",
         label: "Backend robustness",
         next_state: "robustness_ready",
+        presentation: {},
         prompt: "Use the backend prompt.",
         risk_level: "read_only",
         tool_id: "build_robustness_report",

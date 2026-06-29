@@ -83,7 +83,6 @@ fi
 if [[ "$ONLY" == "public-data-smoke" || "$ONLY" == "live-model-public-smoke" ]]; then
   export BACKTEST_WORKER_MARKET_DATA_MODE=ccxt
 fi
-
 mkdir -p "$REPORT_DIR"
 
 collect_evidence() {
@@ -108,8 +107,13 @@ analysis = {
         "docker-stats.txt",
         "pytest-api-worker.log",
         "pytest-chat-tools.log",
+        "pytest-paper-bot.log",
+        "pytest-paper-bot-native.log",
         "pytest-load.log",
         "web-e2e.log",
+        "paper-bot-chat-plan.json",
+        "paper-bot-redis-streams.json",
+        "paper-bot-db-runtime.json",
         "audit.log",
     ],
     "classification_hint": "If failed, inspect failing test output, run IDs, queue snapshots, worker logs, and artifacts in this directory.",
@@ -177,7 +181,11 @@ if [[ "$BUILD" == "1" ]]; then
 fi
 
 STARTED=1
-"${COMPOSE[@]}" up -d --build --scale "backtest-worker=$WORKERS" postgres redis litellm-proxy migration api backtest-worker chat-worker web
+SERVICES=(postgres redis litellm-proxy migration api backtest-worker chat-worker web)
+if [[ "$ONLY" == "paper-bot" || "$ONLY" == "paper-bot-native" ]]; then
+  SERVICES+=(market-data-collector nautilus-paper-worker)
+fi
+"${COMPOSE[@]}" up -d --build --scale "backtest-worker=$WORKERS" "${SERVICES[@]}"
 
 wait_url "$STRATEGY_CODEBOT_E2E_API_BASE_URL/health" "api health"
 wait_url "$STRATEGY_CODEBOT_E2E_API_BASE_URL/ready" "api readiness"
@@ -194,6 +202,12 @@ case "$ONLY" in
     ;;
   chat-tools)
     run_pytest pytest-chat-tools tests/e2e/docker/test_chat_tools.py
+    ;;
+  paper-bot)
+    run_pytest pytest-paper-bot tests/e2e/docker/test_paper_bot.py
+    ;;
+  paper-bot-native)
+    run_pytest pytest-paper-bot-native tests/e2e/docker/test_paper_bot_native.py
     ;;
   load)
     run_pytest pytest-load tests/e2e/docker/test_load.py

@@ -916,6 +916,7 @@ function strategyChatMessageMetadataFromStrategyMessage(
     responseIntent: message.responseIntent,
     sources: message.sources,
     suggestions: message.suggestions,
+    workflow: message.workflow,
   };
 }
 

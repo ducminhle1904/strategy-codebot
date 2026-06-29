@@ -9,13 +9,15 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
+ARG STRATEGY_CODEBOT_UV_EXTRAS="--extra live"
+
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --extra live --no-install-project
+    uv sync --frozen --no-dev ${STRATEGY_CODEBOT_UV_EXTRAS} --no-install-project
 
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --extra live
+    uv sync --frozen --no-dev ${STRATEGY_CODEBOT_UV_EXTRAS}
 
 FROM python:3.13-slim-bookworm AS runtime
 

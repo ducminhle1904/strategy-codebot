@@ -34,6 +34,7 @@ from strategy_codebot.server.llm_orchestrator import _action_planner_system_prom
 from strategy_codebot.server.llm_orchestrator import _chat_intent_decision_system_prompt
 from strategy_codebot.server.llm_orchestrator import _direct_action_plan_tool_args
 from strategy_codebot.server.llm_orchestrator import _suggestions_payload
+from strategy_codebot.server.llm_orchestrator import _strategy_bot_workflow_payload
 from strategy_codebot.server.llm_orchestrator import _system_prompt
 from strategy_codebot.server.llm_orchestrator import _maybe_backtest_summary_response
 from strategy_codebot.server.llm_orchestrator import _maybe_backtest_trades_response
@@ -41,6 +42,8 @@ from strategy_codebot.server.llm_orchestrator import _tool_only_success_message
 from strategy_codebot.server.llm_orchestrator import _tool_success_result
 from strategy_codebot.server.market_data import MarketDataGateway
 from strategy_codebot.server.schemas import MessageCreate
+from strategy_codebot.server.workflow_registry import validate_workflow_payload
+from strategy_codebot.server.workflow_registry import workflow_catalog_guidance
 from strategy_codebot.server.llm_tools import compact_tool_output, tool_catalog_consistency_errors
 from strategy_codebot.pine import generate_pine
 from server_helpers import parse_sse
@@ -49,6 +52,214 @@ from server_helpers import valid_spec
 AUTH_A = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-a"}
 AUTH_B = {"X-User-Id": "user-b", "X-Workspace-Id": "workspace-a"}
 AUTH_OTHER_WORKSPACE = {"X-User-Id": "user-a", "X-Workspace-Id": "workspace-b"}
+
+
+def test_direct_bot_action_args_do_not_inject_backtest_run_id() -> None:
+    result = _direct_action_plan_tool_args(
+        ActionPlanDecision(
+            decision="call_tool",
+            intent_id="bot_status",
+            confidence=0.9,
+            source="planner",
+            tool_id="get_bot_status",
+            arguments={"runtime_id": "rt_1"},
+        ),
+        artifact_kinds=set(),
+        context_text="Show bot runtime rt_1 status",
+        web_search="auto",
+    )
+
+    assert result == ("get_bot_status", {"runtime_id": "rt_1"})
+
+
+def test_strategy_bot_prompt_emits_workflow_collect_inputs(tmp_path: Path) -> None:
+    llm = FakeLLMClient([LLMClientEvent(type="message.delta", text="Mình cần vài thông tin tối thiểu.")])
+    client = TestClient(create_app(repository=create_sqlite_repository(), artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": "Mình muốn xây dựng một trading strategy mới và sau đó tạo Bot simulation để theo dõi thử.",
+            "language": "vi",
+        },
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    workflow = next(frame for frame in frames if frame["event"] == "chat.workflow.updated")
+    payload = workflow["data"]["payload"]
+    assert payload["workflow_id"] == "strategy_bot_simulation"
+    assert payload["current_step"] == "collect_strategy_inputs"
+    assert payload["blocked_reason"] == "missing_strategy_inputs"
+    assert payload["start_allowed"] is False
+    assert set(payload["missing_fields"]) >= {"market", "symbol", "timeframe", "style", "risk_preference"}
+
+
+def test_strategy_bot_workflow_keeps_missing_setup_start_locked() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content="Create a paper bot simulation from this strategy.",
+        context_text="market crypto symbol BTCUSDT timeframe 1h style trend risk 1%. strategy artifact with backtest evidence",
+        artifact_kinds={"pine_file", "backtest_report"},
+        tool_name="draft_bot",
+        tool_result={
+            "proposal_id": "botp_1",
+            "bot_proposal": {
+                "proposal_id": "botp_1",
+                "strategy_id": "strategy_1",
+                "data_subscriptions": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+            },
+            "missing_inputs": ["broker_connection_id", "account_id", "risk_policy_id"],
+        },
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "complete_setup_confirm_start"
+    assert payload["bot_proposal_id"] == "botp_1"
+    assert payload["blocked_reason"] == "missing_bot_setup_fields"
+    assert payload["start_allowed"] is False
+    assert payload["missing_fields"] == ["broker_connection_id", "account_id", "risk_policy_id"]
+    assert payload["schema_version"] == 1
+    assert payload["intent"] == "strategy_to_paper_bot_simulation"
+    assert payload["status"]["key"] == "reviewable_with_caveats"
+    assert payload["actions"][0]["kind"] == "confirm_start_bot_proposal"
+    assert payload["actions"][0]["enabled"] is False
+    assert [section["id"] for section in payload["sections"]] == ["strategy_inputs", "paper_setup"]
+
+
+def test_workflow_registry_sanitizes_model_proposed_ui_parts() -> None:
+    payload = validate_workflow_payload(
+        {
+            "workflow_id": "strategy_bot_simulation",
+            "current_step": "collect_strategy_inputs",
+            "completed_steps": ["collect_strategy_inputs", "unknown_step"],
+            "evidence_status": "profitable",
+            "intent": "live_trading",
+            "required_fields": ["market", "live_broker_secret"],
+            "missing_fields": ["market", "live_broker_secret"],
+            "sections": [
+                {"id": "strategy_inputs", "component_kind": "field_status_section"},
+                {"id": "paper_setup", "component_kind": "custom_adapter_section"},
+                {"id": "unknown", "component_kind": "field_status_section"},
+            ],
+            "actions": [
+                {"id": "confirm_paper_start", "enabled": True, "label": "Confirm"},
+                {"id": "runtime_start", "enabled": True, "label": "Start live runtime"},
+            ],
+            "start_allowed": True,
+        }
+    )
+
+    assert payload is not None
+    assert payload["intent"] == "strategy_to_paper_bot_simulation"
+    assert payload["evidence_status"] == "insufficient_evidence"
+    assert payload["completed_steps"] == ["collect_strategy_inputs"]
+    assert payload["required_fields"] == ["market"]
+    assert payload["missing_fields"] == ["market"]
+    assert payload["sections"] == [
+        {
+            "id": "strategy_inputs",
+            "component_kind": "field_status_section",
+            "title": "Strategy inputs",
+            "fields": ["market", "symbol", "timeframe", "style", "entry_exit_idea", "risk_preference"],
+        }
+    ]
+    assert payload["actions"] == [
+        {
+            "id": "confirm_paper_start",
+            "kind": "confirm_start_bot_proposal",
+            "label": "Confirm",
+            "enabled": False,
+            "disabled_reason": "Setup fields are incomplete.",
+            "target_ref": None,
+        }
+    ]
+    assert payload["start_allowed"] is False
+
+
+def test_workflow_catalog_guidance_reads_generated_registry() -> None:
+    guidance = workflow_catalog_guidance()
+
+    assert "strategy_bot_simulation (strategy_to_paper_bot_simulation)" in guidance
+    assert "field_status_section" in guidance
+    assert "Do not invent component names" in guidance
+
+
+def test_strategy_bot_workflow_ignores_generic_simulation_without_bot_signal() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content="Simulate this strategy with a backtest preview.",
+        context_text="market crypto symbol BTCUSDT timeframe 1h style trend risk 1%.",
+        artifact_kinds={"pine_file"},
+        tool_name="run_backtest_preview",
+        tool_result={"run_id": "bt_1", "status": "queued"},
+    )
+
+    assert payload is None
+
+
+def test_strategy_bot_workflow_accepts_lowercase_stock_symbol() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content="Create a stock nvda daily trend strategy paper bot simulation with balanced risk.",
+        context_text="",
+        artifact_kinds=set(),
+    )
+
+    assert payload is not None
+    assert "symbol" not in payload["missing_fields"]
+
+
+def test_strategy_bot_workflow_allows_confirmation_without_autostart() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content="Create a paper bot simulation from this strategy.",
+        context_text="market crypto symbol BTCUSDT timeframe 1h style trend risk 1%. strategy artifact with backtest evidence",
+        artifact_kinds={"pine_file", "backtest_report"},
+        tool_name="draft_bot",
+        tool_result={
+            "proposal_id": "botp_1",
+            "bot_proposal": {
+                "proposal_id": "botp_1",
+                "broker_connection_id": "paper",
+                "account_id": "acct_1",
+                "risk_policy_id": "risk_1",
+                "strategy_id": "strategy_1",
+                "data_subscriptions": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+            },
+            "missing_inputs": [],
+        },
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "complete_setup_confirm_start"
+    assert payload["start_allowed"] is True
+    assert payload["missing_fields"] == []
+    assert payload["artifact_refs"] == {"bot_proposal_id": "botp_1"}
+
+
+def test_strategy_bot_workflow_draft_bot_alone_does_not_claim_evidence() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content="Create a paper bot simulation from this strategy.",
+        context_text="market crypto symbol BTCUSDT timeframe 1h style trend risk 1%. strategy artifact",
+        artifact_kinds={"pine_file"},
+        tool_name="draft_bot",
+        tool_result={
+            "proposal_id": "botp_1",
+            "bot_proposal": {
+                "proposal_id": "botp_1",
+                "broker_connection_id": "paper",
+                "account_id": "acct_1",
+                "risk_policy_id": "risk_1",
+                "strategy_id": "strategy_1",
+                "data_subscriptions": [{"symbol": "BTCUSDT", "timeframe": "1h"}],
+            },
+            "missing_inputs": [],
+        },
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "static_validation"
+    assert payload["evidence_status"] == "insufficient_evidence"
+    assert payload["start_allowed"] is False
 
 
 def test_classifier_timeout_defaults_to_route_aware_budget(monkeypatch) -> None:

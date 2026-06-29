@@ -8,6 +8,10 @@ import {
   ArtifactPreviewResponseSchema,
   BacktestApprovalDecisionResponseSchema,
   BackendErrorResponseSchema,
+  BotProposalConfirmStartRequestSchema,
+  BotProposalConfirmStartResponseSchema,
+  BotProposalCreateRequestSchema,
+  BotProposalSchema,
   ConversationCreateSchema,
   ConversationListResponseSchema,
   ConversationSchema,
@@ -22,6 +26,11 @@ import {
   MessageCreateSchema,
   MessageListResponseSchema,
   MessageSchema,
+  NautilusRuntimeEventSchema,
+  NautilusRuntimeKillSwitchRequestSchema,
+  NautilusRuntimeListResponseSchema,
+  NautilusRuntimeSchema,
+  NautilusRuntimeStartRequestSchema,
   ProviderStatusResponseSchema,
   ReadyResponseSchema,
   RunCreateResponseSchema,
@@ -36,6 +45,10 @@ import {
   type ArtifactContentResponse,
   type ArtifactListResponse,
   type ArtifactPreviewResponse,
+  type BotProposal,
+  type BotProposalConfirmStartRequest,
+  type BotProposalConfirmStartResponse,
+  type BotProposalCreateRequest,
   type Conversation,
   type ConversationCreate,
   type ConversationListResponse,
@@ -50,6 +63,12 @@ import {
   type Message,
   type MessageCreate,
   type MessageListResponse,
+  type NautilusRuntime,
+  type NautilusRuntimeEvent,
+  type NautilusRuntimeKillSwitchRequest,
+  type NautilusRuntimeListResponse,
+  type NautilusRuntimeMode,
+  type NautilusRuntimeStartRequest,
   type ProviderStatusResponse,
   type ReadyResponse,
   type Run,
@@ -114,6 +133,20 @@ type ArtifactListOptions = {
   cursor?: string | null;
   limit?: number;
   visibility?: "user" | "all";
+};
+
+export type NautilusPaperRuntimeStartRequest = Omit<NautilusRuntimeStartRequest, "mode"> & {
+  mode?: "paper";
+};
+
+type NautilusRuntimeListOptions = RequestOptions & {
+  limit?: number;
+  mode?: NautilusRuntimeMode;
+};
+
+type NautilusRuntimeEventListOptions = RequestOptions & {
+  afterSequence?: number | null;
+  limit?: number;
 };
 
 export class BackendClientError extends Error {
@@ -409,6 +442,107 @@ export class BackendClient {
     });
   }
 
+  createBotProposal(
+    payload: BotProposalCreateRequest,
+    options: RequestOptions = {}
+  ): Promise<BotProposal> {
+    return this.request("/v1/bots/proposals", {
+      method: "POST",
+      body: BotProposalCreateRequestSchema.parse(payload),
+      responseSchema: BotProposalSchema,
+      ...createOperationOptions(options),
+    });
+  }
+
+  getBotProposal(proposalId: string): Promise<BotProposal> {
+    return this.request(`/v1/bots/proposals/${encodePath(proposalId)}`, {
+      responseSchema: BotProposalSchema,
+    });
+  }
+
+  confirmStartBotProposal(
+    proposalId: string,
+    payload: BotProposalConfirmStartRequest = {},
+    options: RequestOptions = {}
+  ): Promise<BotProposalConfirmStartResponse> {
+    return this.request(`/v1/bots/proposals/${encodePath(proposalId)}/confirm-start`, {
+      method: "POST",
+      body: BotProposalConfirmStartRequestSchema.parse(payload),
+      responseSchema: BotProposalConfirmStartResponseSchema,
+      ...createOperationOptions(options),
+    });
+  }
+
+  startNautilusRuntime(
+    payload: NautilusPaperRuntimeStartRequest,
+    options: RequestOptions = {}
+  ): Promise<NautilusRuntime> {
+    return this.request("/v1/nautilus/runtimes", {
+      method: "POST",
+      body: NautilusRuntimeStartRequestSchema.parse({
+        ...payload,
+        mode: "paper",
+      }),
+      responseSchema: NautilusRuntimeSchema,
+      ...createOperationOptions(options),
+    });
+  }
+
+  listNautilusRuntimes(
+    options: NautilusRuntimeListOptions = {}
+  ): Promise<NautilusRuntimeListResponse> {
+    return this.request(`/v1/nautilus/runtimes${nautilusRuntimeListQuery(options)}`, {
+      responseSchema: NautilusRuntimeListResponseSchema,
+      signal: options.signal,
+    });
+  }
+
+  getNautilusRuntime(runtimeId: string): Promise<NautilusRuntime> {
+    return this.request(`/v1/nautilus/runtimes/${encodePath(runtimeId)}`, {
+      responseSchema: NautilusRuntimeSchema,
+    });
+  }
+
+  listNautilusRuntimeEvents(
+    runtimeId: string,
+    options: NautilusRuntimeEventListOptions = {}
+  ): Promise<NautilusRuntimeEvent[]> {
+    return this.request(
+      `/v1/nautilus/runtimes/${encodePath(runtimeId)}/events${nautilusRuntimeEventsQuery(options)}`,
+      {
+        responseSchema: z.array(NautilusRuntimeEventSchema),
+        signal: options.signal,
+      }
+    );
+  }
+
+  stopNautilusRuntime(
+    runtimeId: string,
+    options: RequestOptions = {}
+  ): Promise<NautilusRuntime> {
+    return this.request(`/v1/nautilus/runtimes/${encodePath(runtimeId)}/stop`, {
+      method: "POST",
+      responseSchema: NautilusRuntimeSchema,
+      ...createOperationOptions(options),
+    });
+  }
+
+  killSwitchNautilusRuntime(
+    runtimeId: string,
+    payload: NautilusRuntimeKillSwitchRequest,
+    options: RequestOptions = {}
+  ): Promise<NautilusRuntime> {
+    return this.request(
+      `/v1/nautilus/runtimes/${encodePath(runtimeId)}/kill-switch`,
+      {
+        method: "POST",
+        body: NautilusRuntimeKillSwitchRequestSchema.parse(payload),
+        responseSchema: NautilusRuntimeSchema,
+        ...createOperationOptions(options),
+      }
+    );
+  }
+
   getFeedbackOptions(): Promise<FeedbackOptionsResponse> {
     return this.request("/v1/feedback/options", {
       responseSchema: FeedbackOptionsResponseSchema,
@@ -655,6 +789,28 @@ function artifactListQuery(options: ArtifactListOptions): string {
   }
   if (options.visibility) {
     query.set("visibility", options.visibility);
+  }
+  return queryString(query);
+}
+
+function nautilusRuntimeListQuery(options: NautilusRuntimeListOptions): string {
+  const query = new URLSearchParams();
+  if (options.mode) {
+    query.set("mode", options.mode);
+  }
+  if (options.limit !== undefined) {
+    query.set("limit", String(options.limit));
+  }
+  return queryString(query);
+}
+
+function nautilusRuntimeEventsQuery(options: NautilusRuntimeEventListOptions): string {
+  const query = new URLSearchParams();
+  if (options.afterSequence !== null && options.afterSequence !== undefined) {
+    query.set("after_sequence", String(options.afterSequence));
+  }
+  if (options.limit !== undefined) {
+    query.set("limit", String(options.limit));
   }
   return queryString(query);
 }

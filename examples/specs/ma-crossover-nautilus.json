@@ -1,0 +1,29 @@
+{
+  "target_platform": "nautilus_py",
+  "script_type": "strategy",
+  "market": "crypto",
+  "venue": "BINANCE",
+  "symbol": "BTCUSDT-PERP",
+  "timeframe": "15m",
+  "entry_rules": [
+    "Enter long when the 9-period SMA crosses above the 21-period SMA after bar close"
+  ],
+  "exit_rules": [
+    "Exit when the 9-period SMA crosses below the 21-period SMA after bar close"
+  ],
+  "risk_rules": [
+    "Use fixed fractional risk and always attach a stop-loss and take-profit"
+  ],
+  "position_sizing": "Risk 1% of equity per trade",
+  "stop_loss": "2% below average entry price",
+  "take_profit": "4% above average entry price",
+  "assumptions": [
+    "Signals are confirmed only after bar close",
+    "Nautilus output is paper/sim only until live execution is explicitly approved"
+  ],
+  "constraints": [
+    "No live trading automation",
+    "No profitability claims"
+  ],
+  "user_notes": "Nautilus V1 dry-run fixture"
+}

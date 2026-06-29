@@ -3,8 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { BackendClient, buildBackendHeaders, parseBackendSseEvents } from "./backend-client";
 import {
   BACKTEST_RUN_EVENT_TYPES,
+  BOT_PROPOSAL_STATUSES,
   BacktestApprovalDecisionRequestSchema,
   BacktestConfigSchema,
+  BotProposalSchema,
   ConversationStateResponseSchema,
   KNOWN_RUN_EVENT_TYPES,
   RunCreateSchema,
@@ -47,6 +49,32 @@ describe("BackendClient", () => {
     expect(BacktestApprovalDecisionRequestSchema.parse({ decision: "approved" }).decision).toBe(
       "approved"
     );
+  });
+
+  it("parses every canonical Bot proposal status", () => {
+    for (const status of BOT_PROPOSAL_STATUSES) {
+      expect(
+        BotProposalSchema.parse({
+          account_id: null,
+          broker_connection_id: null,
+          created_at: isoNow,
+          data_subscriptions: [],
+          id: `botp_${status}`,
+          manifest: {},
+          missing_inputs: [],
+          readiness_checks: [],
+          risk_policy_id: null,
+          runtime_id: null,
+          source_artifact_ids: [],
+          source_conversation_id: null,
+          source_run_id: null,
+          status,
+          strategy_id: "strategy_1",
+          strategy_name: "Bot",
+          updated_at: isoNow,
+        }).status
+      ).toBe(status);
+    }
   });
 
   it("validates executable backtest config bounds", () => {
@@ -419,15 +447,19 @@ describe("BackendClient", () => {
   });
 
   it("updates conversation titles with normalized payloads", async () => {
-    const fetcher = vi.fn(async () =>
-      jsonResponse({
-        id: "cnv_1",
-        owner_user_id: "usr_1",
-        workspace_id: "wsp_1",
-        title: "Renamed",
-        created_at: isoNow,
-        updated_at: isoNow,
-      })
+    const fetcher = vi.fn(
+      async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        void input;
+        void init;
+        return jsonResponse({
+          id: "cnv_1",
+          owner_user_id: "usr_1",
+          workspace_id: "wsp_1",
+          title: "Renamed",
+          created_at: isoNow,
+          updated_at: isoNow,
+        });
+      }
     );
     const client = new BackendClient({
       baseUrl: "https://api.example.test",
@@ -457,7 +489,13 @@ describe("BackendClient", () => {
   });
 
   it("passes stream correlation headers through shared stream options", async () => {
-    const fetcher = vi.fn(async () => new Response("event: ping\ndata: {}\n\n"));
+    const fetcher = vi.fn(
+      async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        void input;
+        void init;
+        return new Response("event: ping\ndata: {}\n\n");
+      }
+    );
     const client = new BackendClient({
       baseUrl: "https://api.example.test",
       fetcher,
@@ -772,6 +810,203 @@ describe("BackendClient", () => {
     expect(fetcher).toHaveBeenCalledWith(
       "/api/backend/v1/artifacts?cursor=cursor_1&limit=20",
       expect.any(Object)
+    );
+  });
+
+  it("calls Bot proposal review and confirmed start endpoints", async () => {
+    const proposal = {
+      account_id: "acct_paper",
+      broker_connection_id: "paper",
+      created_at: isoNow,
+      data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+      id: "botp_1",
+      manifest: { name: "BTC bot", strategy_id: "strategy_1" },
+      missing_inputs: [],
+      readiness_checks: ["Static contract passed", "No broker execution"],
+      risk_policy_id: "risk_default",
+      runtime_id: null,
+      source_artifact_ids: ["art_1"],
+      source_conversation_id: "conv_1",
+      source_run_id: "run_1",
+      status: "ready",
+      strategy_id: "strategy_1",
+      strategy_name: "BTC bot",
+      updated_at: isoNow,
+    };
+    const runtime = {
+      account_id: "acct_paper",
+      broker_connection_id: "paper",
+      created_at: isoNow,
+      data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+      desired_state: "running",
+      generation: 0,
+      heartbeat_count: 0,
+      heartbeat_metrics: null,
+      id: "rt_1",
+      kill_switch_active: false,
+      last_error: null,
+      last_heartbeat_at: null,
+      last_heartbeat_event_at: null,
+      lease_until: null,
+      manifest: { name: "BTC bot", bot_proposal_id: "botp_1" },
+      mode: "paper",
+      risk_policy_id: "risk_default",
+      runtime_key: "runtime_key",
+      started_at: null,
+      state: "requested",
+      stopped_at: null,
+      strategy_ids: ["strategy_1"],
+      stream_cursor: null,
+      updated_at: isoNow,
+      worker_id: null,
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(proposal))
+      .mockResolvedValueOnce(jsonResponse(proposal))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proposal: { ...proposal, status: "started", runtime_id: "rt_1" },
+          runtime,
+        })
+      );
+    const client = new BackendClient({
+      baseUrl: "/api/backend",
+      fetcher,
+      idempotencyKeyFactory: () => "idem_bot_1",
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+    });
+
+    await expect(
+      client.createBotProposal({
+        strategy_artifact_id: "art_1",
+        broker_connection_id: "paper",
+        account_id: "acct_paper",
+        risk_policy_id: "risk_default",
+      })
+    ).resolves.toMatchObject({ id: "botp_1", status: "ready" });
+    await expect(client.getBotProposal("botp_1")).resolves.toMatchObject({ id: "botp_1" });
+    await expect(client.confirmStartBotProposal("botp_1")).resolves.toMatchObject({
+      proposal: { status: "started", runtime_id: "rt_1" },
+      runtime: { id: "rt_1", mode: "paper" },
+    });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/backend/v1/bots/proposals",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/backend/v1/bots/proposals/botp_1",
+      expect.objectContaining({ method: "GET" })
+    );
+    const confirmRequest = fetcher.mock.calls[2]?.[1] as RequestInit;
+    expect(fetcher).toHaveBeenNthCalledWith(
+      3,
+      "/api/backend/v1/bots/proposals/botp_1/confirm-start",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(new Headers(confirmRequest.headers).get("Idempotency-Key")).toBe("idem_bot_1");
+  });
+
+  it("calls Nautilus paper runtime endpoints with typed payloads", async () => {
+    const runtime = {
+      account_id: "acct_paper",
+      broker_connection_id: "paper",
+      created_at: isoNow,
+      data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+      desired_state: "running",
+      generation: 0,
+      heartbeat_count: 1,
+      heartbeat_metrics: { pnl: 12.5 },
+      id: "rt_1",
+      kill_switch_active: false,
+      last_error: null,
+      last_heartbeat_at: isoNow,
+      last_heartbeat_event_at: isoNow,
+      lease_until: null,
+      manifest: { name: "BTC paper bot" },
+      mode: "paper",
+      risk_policy_id: "risk_default",
+      runtime_key: "runtime_key",
+      started_at: isoNow,
+      state: "running",
+      stopped_at: null,
+      strategy_ids: ["strategy_1"],
+      stream_cursor: null,
+      updated_at: isoNow,
+      worker_id: "worker_1",
+    };
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ items: [runtime] }))
+      .mockResolvedValueOnce(jsonResponse(runtime))
+      .mockResolvedValueOnce(
+        jsonResponse([
+          {
+            created_at: isoNow,
+            event_id: "evt_1",
+            payload: { order_id: "ord_1" },
+            runtime_id: "rt_1",
+            sequence: 1,
+            type: "order_intent",
+          },
+        ])
+      )
+      .mockResolvedValueOnce(jsonResponse(runtime))
+      .mockResolvedValueOnce(jsonResponse(runtime))
+      .mockResolvedValueOnce(jsonResponse(runtime));
+    const client = new BackendClient({
+      baseUrl: "/api/backend",
+      fetcher,
+      idempotencyKeyFactory: () => "idem_1",
+      userId: "usr_1",
+      workspaceId: "wsp_1",
+    });
+
+    await expect(client.listNautilusRuntimes({ limit: 25, mode: "paper" })).resolves.toMatchObject({
+      items: [{ id: "rt_1", mode: "paper" }],
+    });
+    await expect(client.getNautilusRuntime("rt_1")).resolves.toMatchObject({ id: "rt_1" });
+    await expect(client.listNautilusRuntimeEvents("rt_1", { afterSequence: 1, limit: 50 })).resolves.toMatchObject([
+      { event_id: "evt_1", type: "order_intent" },
+    ]);
+    await client.startNautilusRuntime({
+      account_id: "acct_paper",
+      broker_connection_id: "paper",
+      data_subscriptions: [{ symbol: "BTC/USDT", timeframe: "1h" }],
+      manifest: { name: "BTC paper bot" },
+      mode: "paper",
+      risk_policy_id: "risk_default",
+      strategy_id: "strategy_1",
+    });
+    await client.stopNautilusRuntime("rt_1");
+    await client.killSwitchNautilusRuntime("rt_1", { reason: "Manual safety stop" });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      "/api/backend/v1/nautilus/runtimes?mode=paper&limit=25",
+      expect.any(Object)
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      3,
+      "/api/backend/v1/nautilus/runtimes/rt_1/events?after_sequence=1&limit=50",
+      expect.any(Object)
+    );
+    const startRequest = fetcher.mock.calls[3]?.[1] as RequestInit;
+    expect(JSON.parse(String(startRequest.body))).toMatchObject({ mode: "paper" });
+    expect(new Headers(startRequest.headers).get("Idempotency-Key")).toBe("idem_1");
+    expect(fetcher).toHaveBeenNthCalledWith(
+      5,
+      "/api/backend/v1/nautilus/runtimes/rt_1/stop",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(fetcher).toHaveBeenNthCalledWith(
+      6,
+      "/api/backend/v1/nautilus/runtimes/rt_1/kill-switch",
+      expect.objectContaining({ method: "POST" })
     );
   });
 });

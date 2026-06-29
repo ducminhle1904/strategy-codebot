@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import threading
 from typing import Iterable
 
 from fastapi.testclient import TestClient
@@ -13,6 +14,7 @@ from strategy_codebot.server.market_data import MarketPricePoint
 from strategy_codebot.server.market_data import MarketQuote
 from strategy_codebot.server.market_data import MarketSnapshot
 from strategy_codebot.server.market_data import MarketSource
+from strategy_codebot.server.market_data import SharedMarketDataFanout
 from strategy_codebot.server.market_data import TwelveDataProvider
 from strategy_codebot.server.market_data import market_data_context
 from server_helpers import parse_sse
@@ -234,6 +236,41 @@ def test_market_snapshot_context_is_user_safe_and_concise() -> None:
     assert context is not None
     assert "ETH quote" in context
     assert "raw" not in context.lower()
+
+
+def test_market_data_fanout_shares_one_upstream_collector_for_100_subscribers() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    class BlockingGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def snapshot(self, symbol: str, *, include_series: bool = False, tier: str = "free"):
+            self.calls += 1
+            started.set()
+            assert symbol == "ETH"
+            assert include_series is True
+            assert tier == "free"
+            release.wait(timeout=2)
+            return MarketSnapshot(
+                quote=MarketQuote(symbol="ETH", price=1721.95, currency="USD", provider="test"),
+            )
+
+    gateway = BlockingGateway()
+    fanout = SharedMarketDataFanout(gateway)
+
+    subscribers = [fanout.subscribe("ETH", include_series=True, tier="free") for _ in range(100)]
+
+    assert started.wait(timeout=1)
+    assert gateway.calls == 1
+
+    release.set()
+    results = [subscriber.result(timeout=1) for subscriber in subscribers]
+
+    assert gateway.calls == 1
+    assert len(results) == 100
+    assert all(result is results[0] for result in results)
 
 
 class FakeMarketDataGateway:

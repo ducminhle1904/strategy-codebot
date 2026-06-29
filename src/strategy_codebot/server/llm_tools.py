@@ -21,8 +21,13 @@ from strategy_codebot.server.action_registry import action_registry_backend_tool
 from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
 from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
+from strategy_codebot.server.bot_proposals import BotProposalArtifactUnreadableError
+from strategy_codebot.server.bot_proposals import BotProposalDraftInput
+from strategy_codebot.server.bot_proposals import BotProposalSourceNotFoundError
+from strategy_codebot.server.bot_proposals import build_bot_proposal_create_input
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
+from strategy_codebot.server.redaction import redact_value
 from strategy_codebot.server.repository import AssistantRunRecord
 from strategy_codebot.server.repository import ConversationRepository
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
@@ -312,6 +317,61 @@ TOOL_DEFINITIONS: dict[str, ToolDefinition] = {
             "additionalProperties": False,
             "required": ["run_id"],
             "properties": {"run_id": {"type": "string", "minLength": 1}},
+        },
+    ),
+    "draft_bot": ToolDefinition(
+        name="draft_bot",
+        description="Draft a Bot proposal for user review. This does not start a runtime or execute broker orders.",
+        parameters={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "strategy_spec": STRATEGY_SPEC_SCHEMA,
+                "strategy_artifact_id": {"type": "string", "minLength": 1},
+                "run_id": {"type": "string", "minLength": 1},
+                "broker_connection_id": {"type": "string"},
+                "account_id": {"type": "string"},
+                "risk_policy_id": {"type": "string"},
+                "strategy_id": {"type": "string"},
+                "strategy_name": {"type": "string"},
+                "manifest": OBJECT_SCHEMA,
+                "data_subscriptions": {"type": "array", "items": OBJECT_SCHEMA},
+                "readiness_checks": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    ),
+    "get_bot_status": ToolDefinition(
+        name="get_bot_status",
+        description="Fetch current Bot proposal/runtime status for chat explanation. Read-only.",
+        parameters={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "proposal_id": {"type": "string", "minLength": 1},
+                "runtime_id": {"type": "string", "minLength": 1},
+            },
+        },
+    ),
+    "list_bots": ToolDefinition(
+        name="list_bots",
+        description="List current simulated Bots for chat explanation. Read-only.",
+        parameters={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50}},
+        },
+    ),
+    "list_bot_events": ToolDefinition(
+        name="list_bot_events",
+        description="List recent Bot lifecycle and risk events. Read-only.",
+        parameters={
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["runtime_id"],
+            "properties": {
+                "runtime_id": {"type": "string", "minLength": 1},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            },
         },
     ),
 }
@@ -1001,6 +1061,129 @@ def _get_equity_curve_sample_tool(arguments: dict[str, Any], context: ToolExecut
     }
 
 
+def _draft_bot_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    strategy_spec = arguments.get("strategy_spec") if isinstance(arguments.get("strategy_spec"), dict) else None
+    broker_connection_id = _string_or_none(arguments.get("broker_connection_id"))
+    account_id = _string_or_none(arguments.get("account_id"))
+    risk_policy_id = _string_or_none(arguments.get("risk_policy_id"))
+    try:
+        draft = build_bot_proposal_create_input(
+            auth=context.auth,
+            repository=context.repository,
+            artifact_store=context.artifact_store,
+            draft=BotProposalDraftInput(
+                strategy_artifact_id=_string_or_none(arguments.get("strategy_artifact_id")),
+                run_id=_string_or_none(arguments.get("run_id")),
+                fallback_run_id=context.run.id,
+                fallback_conversation_id=context.run.conversation_id,
+                strategy_spec=strategy_spec,
+                strategy_id=_string_or_none(arguments.get("strategy_id")),
+                strategy_name=_string_or_none(arguments.get("strategy_name")),
+                manifest=arguments.get("manifest") if isinstance(arguments.get("manifest"), dict) else {},
+                data_subscriptions=arguments.get("data_subscriptions") if isinstance(arguments.get("data_subscriptions"), list) else [],
+                broker_connection_id=broker_connection_id,
+                account_id=account_id,
+                risk_policy_id=risk_policy_id,
+                readiness_checks=[item for item in arguments.get("readiness_checks", []) if isinstance(item, str)],
+            ),
+        )
+    except BotProposalSourceNotFoundError as exc:
+        return {"status": "not_found", "source": exc.source}
+    except BotProposalArtifactUnreadableError as exc:
+        return {"status": "error", "error": exc.__class__.__name__, "message": "Could not read strategy artifact"}
+    proposal = context.repository.create_bot_proposal(
+        context.auth,
+        draft.create_input,
+    )
+    return {
+        "status": proposal.status,
+        "proposal_id": proposal.id,
+        "bot_proposal": _bot_proposal_tool_payload(proposal),
+        "missing_inputs": draft.missing_inputs,
+        "next_action": "review_setup" if not draft.missing_inputs else "collect_missing_inputs",
+    }
+
+
+def _get_bot_status_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    proposal = None
+    proposal_id = _string_or_none(arguments.get("proposal_id"))
+    if proposal_id:
+        proposal = context.repository.get_bot_proposal(context.auth, proposal_id)
+    runtime_id = _string_or_none(arguments.get("runtime_id")) or (proposal.runtime_id if proposal else None)
+    runtime = context.repository.get_nautilus_runtime(context.auth, runtime_id) if runtime_id else None
+    if proposal is None and runtime is None:
+        return {"status": "not_found"}
+    return {
+        "status": "ok",
+        "proposal": _bot_proposal_tool_payload(proposal) if proposal else None,
+        "runtime": _bot_runtime_tool_payload(runtime) if runtime else None,
+    }
+
+
+def _list_bots_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    limit = min(50, max(1, int(arguments.get("limit") or 20)))
+    runtimes = context.repository.list_nautilus_runtimes(context.auth, mode="paper", limit=limit)
+    return {"status": "ok", "bots": [_bot_runtime_tool_payload(runtime) for runtime in runtimes]}
+
+
+def _list_bot_events_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
+    runtime_id = str(arguments["runtime_id"])
+    events = context.repository.list_nautilus_runtime_events(
+        context.auth,
+        runtime_id,
+        limit=min(100, max(1, int(arguments.get("limit") or 20))),
+    )
+    if events is None:
+        return {"status": "not_found", "runtime_id": runtime_id, "events": []}
+    return {
+        "status": "ok",
+        "runtime_id": runtime_id,
+        "events": [
+            {"sequence": event.sequence, "type": event.type, "payload": event.payload, "created_at": event.created_at.isoformat()}
+            for event in events
+        ],
+    }
+
+
+def _bot_proposal_tool_payload(proposal: Any) -> dict[str, Any]:
+    return {
+        "id": proposal.id,
+        "status": proposal.status,
+        "strategy_id": proposal.strategy_id,
+        "strategy_name": proposal.strategy_name,
+        "broker_connection_id": proposal.broker_connection_id,
+        "account_id": proposal.account_id,
+        "risk_policy_id": proposal.risk_policy_id,
+        "source_run_id": proposal.source_run_id,
+        "source_artifact_ids": proposal.source_artifact_ids,
+        "data_subscriptions": redact_value(proposal.data_subscriptions_json),
+        "readiness": redact_value(proposal.readiness_checks_json),
+        "missing_inputs": redact_value(proposal.missing_inputs_json),
+        "runtime_id": proposal.runtime_id,
+        "no_broker_execution": True,
+    }
+
+
+def _bot_runtime_tool_payload(runtime: Any) -> dict[str, Any]:
+    return {
+        "id": runtime.id,
+        "name": runtime.manifest_json.get("name") if isinstance(runtime.manifest_json, dict) else runtime.id,
+        "state": runtime.state,
+        "desired_state": runtime.desired_state,
+        "kill_switch_active": runtime.kill_switch_active,
+        "last_heartbeat_at": runtime.last_heartbeat_at.isoformat() if runtime.last_heartbeat_at else None,
+        "last_error": redact_value(runtime.last_error_json),
+        "data_subscriptions": redact_value(runtime.data_subscriptions_json),
+        "no_broker_execution": runtime.mode == "paper",
+    }
+
+
+def _string_or_none(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 def _build_robustness_payload(
     *,
     run_id: str,
@@ -1534,6 +1717,10 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "query_backtest_trades": _query_backtest_trades_tool,
     "build_robustness_report": _build_robustness_report_tool,
     "get_equity_curve_sample": _get_equity_curve_sample_tool,
+    "draft_bot": _draft_bot_tool,
+    "get_bot_status": _get_bot_status_tool,
+    "list_bots": _list_bots_tool,
+    "list_bot_events": _list_bot_events_tool,
 }
 
 

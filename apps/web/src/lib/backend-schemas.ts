@@ -239,6 +239,133 @@ export const ArtifactListResponseSchema = z.object({
   next_cursor: z.string().min(1).nullable(),
 });
 
+export const NautilusRuntimeStateSchema = z.enum([
+  "requested",
+  "provisioning",
+  "warming_up",
+  "running",
+  "degraded",
+  "stopping",
+  "stopped",
+  "failed",
+]);
+
+export const NautilusRuntimeDesiredStateSchema = z.enum([
+  "requested",
+  "running",
+  "stopping",
+  "stopped",
+]);
+
+export const NautilusRuntimeModeSchema = z.enum(["paper", "live"]);
+
+export const NautilusRuntimeStartRequestSchema = z.object({
+  broker_connection_id: z.string().min(1).max(120),
+  account_id: z.string().min(1).max(120),
+  mode: NautilusRuntimeModeSchema.default("paper"),
+  risk_policy_id: z.string().min(1).max(120),
+  strategy_id: z.string().min(1).max(160),
+  manifest: JsonObjectSchema.default({}),
+  data_subscriptions: z.array(JsonObjectSchema).max(100).default([]),
+});
+
+export const NautilusRuntimeKillSwitchRequestSchema = z.object({
+  reason: z.string().min(1).max(500),
+});
+
+export const NautilusRuntimeEventSchema = z.object({
+  event_id: IdSchema,
+  runtime_id: IdSchema,
+  sequence: z.number().int().nonnegative(),
+  type: z.string().min(1),
+  payload: JsonObjectSchema.nullable(),
+  created_at: IsoDateTimeSchema,
+});
+
+export const NautilusRuntimeSchema = z.object({
+  id: IdSchema,
+  runtime_key: z.string().min(1),
+  broker_connection_id: z.string().min(1),
+  account_id: z.string().min(1),
+  mode: NautilusRuntimeModeSchema,
+  risk_policy_id: z.string().min(1),
+  state: NautilusRuntimeStateSchema,
+  strategy_ids: z.array(z.string().min(1)),
+  manifest: JsonObjectSchema,
+  data_subscriptions: z.array(JsonObjectSchema),
+  last_heartbeat_at: IsoDateTimeSchema.nullable().default(null),
+  heartbeat_count: z.number().int().nonnegative().default(0),
+  heartbeat_metrics: JsonObjectSchema.nullable().default(null),
+  last_heartbeat_event_at: IsoDateTimeSchema.nullable().default(null),
+  kill_switch_active: z.boolean(),
+  desired_state: NautilusRuntimeDesiredStateSchema.default("running"),
+  worker_id: z.string().nullable().default(null),
+  lease_until: IsoDateTimeSchema.nullable().default(null),
+  generation: z.number().int().nonnegative().default(0),
+  started_at: IsoDateTimeSchema.nullable().default(null),
+  stopped_at: IsoDateTimeSchema.nullable().default(null),
+  last_error: JsonObjectSchema.nullable().default(null),
+  stream_cursor: JsonObjectSchema.nullable().default(null),
+  created_at: IsoDateTimeSchema,
+  updated_at: IsoDateTimeSchema,
+});
+
+export const NautilusRuntimeListResponseSchema = z.object({
+  items: z.array(NautilusRuntimeSchema),
+});
+
+export const BOT_PROPOSAL_STATUSES = [
+  "draft",
+  "missing_inputs",
+  "ready",
+  "started",
+  "rejected",
+] as const;
+
+export const BotProposalCreateRequestSchema = z.object({
+  strategy_artifact_id: z.string().min(1).max(120).optional(),
+  run_id: z.string().min(1).max(120).optional(),
+  broker_connection_id: z.string().max(120).optional(),
+  account_id: z.string().max(120).optional(),
+  risk_policy_id: z.string().max(120).optional(),
+  strategy_id: z.string().max(160).optional(),
+  strategy_name: z.string().max(240).optional(),
+  manifest: JsonObjectSchema.default({}),
+  data_subscriptions: z.array(JsonObjectSchema).max(100).default([]),
+  readiness_checks: z.array(z.string()).max(50).default([]),
+});
+
+export const BotProposalSchema = z.object({
+  id: IdSchema,
+  status: z.enum(BOT_PROPOSAL_STATUSES),
+  source_conversation_id: IdSchema.nullable().default(null),
+  source_run_id: IdSchema.nullable().default(null),
+  source_artifact_ids: z.array(IdSchema).default([]),
+  strategy_id: z.string().min(1),
+  strategy_name: z.string().min(1),
+  manifest: JsonObjectSchema,
+  data_subscriptions: z.array(JsonObjectSchema),
+  broker_connection_id: z.string().nullable().default(null),
+  account_id: z.string().nullable().default(null),
+  risk_policy_id: z.string().nullable().default(null),
+  readiness_checks: z.array(z.string()).default([]),
+  missing_inputs: z.array(z.string()).default([]),
+  runtime_id: IdSchema.nullable().default(null),
+  created_at: IsoDateTimeSchema,
+  updated_at: IsoDateTimeSchema,
+});
+
+export const BotProposalConfirmStartRequestSchema = z.object({
+  broker_connection_id: z.string().max(120).optional(),
+  account_id: z.string().max(120).optional(),
+  risk_policy_id: z.string().max(120).optional(),
+});
+
+export const BotProposalConfirmStartResponseSchema = z.object({
+  proposal: BotProposalSchema,
+  runtime: NautilusRuntimeSchema,
+});
+
 export const ConversationSidebarItemSchema = z.object({
   conversation: ConversationSchema,
   last_message_preview: z.string().nullable(),
@@ -657,6 +784,29 @@ export type ArtifactPreviewResponse = z.infer<
   typeof ArtifactPreviewResponseSchema
 >;
 export type ArtifactListResponse = z.infer<typeof ArtifactListResponseSchema>;
+export type NautilusRuntimeMode = z.infer<typeof NautilusRuntimeModeSchema>;
+export type NautilusRuntimeState = z.infer<typeof NautilusRuntimeStateSchema>;
+export type NautilusRuntimeStartRequest = z.input<
+  typeof NautilusRuntimeStartRequestSchema
+>;
+export type NautilusRuntimeKillSwitchRequest = z.infer<
+  typeof NautilusRuntimeKillSwitchRequestSchema
+>;
+export type NautilusRuntimeEvent = z.infer<typeof NautilusRuntimeEventSchema>;
+export type NautilusRuntime = z.infer<typeof NautilusRuntimeSchema>;
+export type NautilusRuntimeListResponse = z.infer<
+  typeof NautilusRuntimeListResponseSchema
+>;
+export type BotProposalCreateRequest = z.input<
+  typeof BotProposalCreateRequestSchema
+>;
+export type BotProposal = z.infer<typeof BotProposalSchema>;
+export type BotProposalConfirmStartRequest = z.input<
+  typeof BotProposalConfirmStartRequestSchema
+>;
+export type BotProposalConfirmStartResponse = z.infer<
+  typeof BotProposalConfirmStartResponseSchema
+>;
 export type RunMode = z.infer<typeof RunModeSchema>;
 export type BacktestConfig = z.infer<typeof BacktestConfigSchema>;
 export type BacktestApprovalDecisionRequest = z.infer<

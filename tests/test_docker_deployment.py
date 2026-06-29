@@ -29,6 +29,18 @@ def test_backtest_ohlcv_contract_generated_files_are_current() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_workflow_registry_contract_generated_files_are_current() -> None:
+    result = subprocess.run(
+        ["python", "scripts/sync-workflow-registry.py", "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_backtest_contract_covers_runtime_vocab_and_bounds() -> None:
     contract = backtest_ohlcv_contract()
 
@@ -44,7 +56,8 @@ def test_dockerfile_uses_production_runtime_practices() -> None:
 
     assert "FROM python:3.13-slim-bookworm AS builder" in dockerfile
     assert "FROM python:3.13-slim-bookworm AS runtime" in dockerfile
-    assert "uv sync --frozen --no-dev --extra live" in dockerfile
+    assert 'ARG STRATEGY_CODEBOT_UV_EXTRAS="--extra live"' in dockerfile
+    assert "uv sync --frozen --no-dev ${STRATEGY_CODEBOT_UV_EXTRAS}" in dockerfile
     assert "USER strategy-codebot" in dockerfile
     assert "strategy_codebot.server.asgi:app" in dockerfile
     assert "strategy-codebot-migrate" in dockerfile
@@ -55,7 +68,17 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     compose = yaml.safe_load((ROOT / "compose.yml").read_text(encoding="utf-8"))
     services = compose["services"]
 
-    assert {"api", "migration", "knowledge-init", "postgres", "redis", "litellm-proxy", "pineforge-runner"} <= set(services)
+    assert {
+        "api",
+        "migration",
+        "knowledge-init",
+        "postgres",
+        "redis",
+        "litellm-proxy",
+        "pineforge-runner",
+        "market-data-collector",
+        "nautilus-paper-worker",
+    } <= set(services)
     assert services["postgres"]["image"] == "pgvector/pgvector:pg17"
     assert "ports" not in services["postgres"]
     assert "ports" not in services["redis"]
@@ -80,6 +103,16 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     assert "PINEFORGE_NATIVE_ARGS" not in services["pineforge-runner"]["environment"]
     assert services["pineforge-runner"]["environment"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.7.5}"
     assert services["backtest-worker"]["depends_on"]["pineforge-runner"]["condition"] == "service_healthy"
+    assert services["market-data-collector"]["depends_on"]["redis"]["condition"] == "service_healthy"
+    assert services["market-data-collector"]["command"] == ["python", "-m", "strategy_codebot.server.market_data_collector"]
+    assert "healthcheck" in services["market-data-collector"]
+    assert services["nautilus-paper-worker"]["build"]["args"]["STRATEGY_CODEBOT_UV_EXTRAS"] == "--extra live --extra nautilus"
+    assert services["nautilus-paper-worker"]["command"] == ["python", "-m", "strategy_codebot.server.nautilus_paper_worker"]
+    assert services["nautilus-paper-worker"]["depends_on"]["market-data-collector"]["condition"] == "service_healthy"
+    assert services["nautilus-paper-worker"]["environment"]["MAX_RUNTIME_PROCESSES"] == "${MAX_RUNTIME_PROCESSES:-4}"
+    assert services["nautilus-paper-worker"]["environment"]["STREAM_BLOCK_MS"] == "${STREAM_BLOCK_MS:-1000}"
+    assert services["nautilus-paper-worker"]["cpus"] == "${NAUTILUS_PAPER_WORKER_CPUS:-2}"
+    assert services["nautilus-paper-worker"]["mem_limit"] == "${NAUTILUS_PAPER_WORKER_MEM_LIMIT:-2g}"
     assert services["backtest-worker"]["environment"]["BACKTEST_PINEFORGE_RUNNER_URL"] == "${BACKTEST_PINEFORGE_RUNNER_URL:-http://pineforge-runner:8080}"
     assert services["backtest-worker"]["environment"]["BACKTEST_WORKER_ALLOWED_EXCHANGES"] == f"${{BACKTEST_WORKER_ALLOWED_EXCHANGES:-{exchange_env_default()}}}"
     assert services["backtest-worker"]["environment"]["BACKTEST_WORKER_DEFAULT_EXCHANGE"] == f"${{BACKTEST_WORKER_DEFAULT_EXCHANGE:-{backtest_ohlcv_contract()['default_exchange']}}}"
@@ -331,6 +364,15 @@ def test_paid_registry_routes_use_litellm_proxy_aliases_and_free_stays_direct() 
                     "litellm_proxy/paid_low.balanced_review_minimax",
                     "litellm_proxy/paid_medium.balanced_review",
                 ]
+            elif tier == "paid_low" and stage == "knowledge_learning_review":
+                assert routes == [
+                    "litellm_proxy/paid_low.balanced_review",
+                    "litellm_proxy/paid_low.balanced_review_vercel",
+                    "litellm_proxy/paid_low.balanced_review_minimax",
+                    "litellm_proxy/paid_medium.balanced_review",
+                ]
+            elif tier in {"paid_medium", "paid_high"} and stage == "knowledge_learning_review":
+                assert routes == [f"litellm_proxy/{tier}.balanced_review"]
             elif tier == "paid_low" and stage == "repair":
                 assert routes == [
                     "litellm_proxy/paid_low.repair",

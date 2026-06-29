@@ -4,6 +4,10 @@ from decimal import Decimal
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from strategy_codebot.nautilus_runtime import RUNTIME_STATES
+from strategy_codebot.server.bot_proposal_status import BOT_PROPOSAL_STATUSES
+from strategy_codebot.server.bot_proposal_status import BOT_PROPOSAL_STATUS_DRAFT
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -20,6 +24,10 @@ class TimestampMixin:
 class TenantMixin(TimestampMixin):
     owner_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     workspace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+
+def _sql_string_set(values: set[str]) -> str:
+    return ",".join(f"'{value}'" for value in sorted(values))
 
 
 class User(Base):
@@ -291,6 +299,96 @@ class StrategySpec(TenantMixin, Base):
     run_id: Mapped[str] = mapped_column(ForeignKey("assistant_runs.id"), nullable=False, index=True)
     payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
     schema_version: Mapped[str] = mapped_column(String(40), nullable=False)
+
+
+class NautilusRuntime(TenantMixin, Base):
+    __tablename__ = "nautilus_runtimes"
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "owner_user_id", "runtime_key", name="uq_nautilus_runtimes_tenant_key"),
+        Index("ix_nautilus_runtimes_workspace_owner", "workspace_id", "owner_user_id"),
+        Index("ix_nautilus_runtimes_workspace_state", "workspace_id", "state"),
+        Index("ix_nautilus_runtimes_desired_lease", "mode", "desired_state", "lease_until"),
+        CheckConstraint("mode IN ('paper','live')", name="ck_nautilus_runtimes_mode"),
+        CheckConstraint(
+            f"state IN ({_sql_string_set(RUNTIME_STATES)})",
+            name="ck_nautilus_runtimes_state",
+        ),
+        CheckConstraint(
+            "desired_state IN ('requested','running','stopping','stopped')",
+            name="ck_nautilus_runtimes_desired_state",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    runtime_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    broker_connection_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    account_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    mode: Mapped[str] = mapped_column(String(20), nullable=False)
+    risk_policy_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="requested")
+    strategy_ids_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    manifest_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    data_subscriptions_json: Mapped[list] = mapped_column(JSON, nullable=False)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    heartbeat_metrics_json: Mapped[dict | None] = mapped_column(JSON)
+    last_heartbeat_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    kill_switch_active: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    desired_state: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    worker_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error_json: Mapped[dict | None] = mapped_column(JSON)
+    stream_cursor_json: Mapped[dict | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class NautilusRuntimeEvent(TenantMixin, Base):
+    __tablename__ = "nautilus_runtime_events"
+    __table_args__ = (
+        UniqueConstraint("runtime_id", "sequence", name="uq_nautilus_runtime_events_runtime_sequence"),
+        UniqueConstraint("runtime_id", "idempotency_key", name="uq_nautilus_runtime_events_runtime_idempotency"),
+        Index("ix_nautilus_runtime_events_workspace_owner", "workspace_id", "owner_user_id"),
+        Index("ix_nautilus_runtime_events_runtime_sequence", "runtime_id", "sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    runtime_id: Mapped[str] = mapped_column(ForeignKey("nautilus_runtimes.id"), nullable=False, index=True)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[str] = mapped_column(String(80), nullable=False)
+    payload_json: Mapped[dict | None] = mapped_column(JSON)
+    idempotency_key: Mapped[str | None] = mapped_column(String(160), index=True)
+
+
+class BotProposal(TenantMixin, Base):
+    __tablename__ = "bot_proposals"
+    __table_args__ = (
+        Index("ix_bot_proposals_workspace_owner", "workspace_id", "owner_user_id"),
+        Index("ix_bot_proposals_workspace_status", "workspace_id", "status"),
+        CheckConstraint(
+            f"status IN ({_sql_string_set(BOT_PROPOSAL_STATUSES)})",
+            name="ck_bot_proposals_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default=BOT_PROPOSAL_STATUS_DRAFT)
+    source_conversation_id: Mapped[str | None] = mapped_column(ForeignKey("conversation_threads.id"), index=True)
+    source_run_id: Mapped[str | None] = mapped_column(ForeignKey("assistant_runs.id"), index=True)
+    source_artifact_ids_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    strategy_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(240), nullable=False)
+    manifest_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    data_subscriptions_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    broker_connection_id: Mapped[str | None] = mapped_column(String(120))
+    account_id: Mapped[str | None] = mapped_column(String(120))
+    risk_policy_id: Mapped[str | None] = mapped_column(String(120))
+    readiness_checks_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    missing_inputs_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    runtime_id: Mapped[str | None] = mapped_column(ForeignKey("nautilus_runtimes.id"), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
 class ValidationReport(TenantMixin, Base):

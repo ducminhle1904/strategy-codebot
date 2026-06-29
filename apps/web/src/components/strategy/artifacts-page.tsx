@@ -12,6 +12,7 @@ import { getArtifactUserSummary } from "@/lib/artifact-workspace";
 import { useI18n } from "@/lib/language";
 import { useTheme } from "@/lib/theme";
 import {
+  DEFAULT_ARTIFACT_PREVIEW_BYTES,
   getArtifactPreviewForViewer,
   useBrowserBackendClient,
 } from "@/lib/use-browser-backend-client";
@@ -28,7 +29,7 @@ import {
   X,
 } from "lucide-react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const ARTIFACT_PAGE_SIZE = 30;
@@ -77,6 +78,7 @@ function artifactSearchText(artifact: Artifact) {
 export function ArtifactsPage() {
   const client = useBrowserBackendClient();
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { language, setLanguage } = useI18n();
   const { setTheme, theme } = useTheme();
   const [searchQuery, setSearchQuery] = useState("");
@@ -114,21 +116,35 @@ export function ArtifactsPage() {
     }
     return artifacts.filter((artifact) => artifactSearchText(artifact).includes(query));
   }, [artifacts, searchQuery]);
-  const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(null);
+  const selectedArtifactId = searchParams.get("artifact");
   const selectedArtifact = useMemo(
     () => artifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null,
     [artifacts, selectedArtifactId]
   );
   const preview = useQuery({
-    enabled: Boolean(selectedArtifact?.id),
-    queryFn: () =>
-      selectedArtifact
+    enabled: Boolean(selectedArtifactId),
+    queryFn: () => {
+      if (!selectedArtifactId) {
+        return Promise.reject(new Error("No artifact selected"));
+      }
+      return selectedArtifact
         ? getArtifactPreviewForViewer(client, selectedArtifact)
-        : Promise.reject(new Error("No artifact selected")),
-    queryKey: ["artifact-preview", selectedArtifact?.id],
+        : client.getArtifactPreview(selectedArtifactId, {
+            maxBytes: DEFAULT_ARTIFACT_PREVIEW_BYTES,
+          });
+    },
+    queryKey: ["artifact-preview", selectedArtifactId],
     refetchOnWindowFocus: false,
     staleTime: Infinity,
   });
+  const activeArtifact = selectedArtifact ?? preview.data ?? null;
+  const artifactDrawerOpen = Boolean(selectedArtifactId);
+  const selectArtifact = (artifactId: string | null) => {
+    router.replace(
+      artifactId ? `/artifacts?artifact=${encodeURIComponent(artifactId)}` : "/artifacts",
+      { scroll: false }
+    );
+  };
 
   useEffect(() => {
     const sentinel = loadMoreRef.current;
@@ -167,6 +183,7 @@ export function ArtifactsPage() {
         onLanguageChange={setLanguage}
         onOpenAccountDialog={() => undefined}
         onOpenArtifacts={() => undefined}
+        onOpenPaperBots={() => router.push("/paper-bots")}
         onOpenSettingsTab={() => undefined}
         onRename={() => undefined}
         onSelect={(conversationId) => router.push(`/c/${encodeURIComponent(conversationId)}`)}
@@ -180,7 +197,7 @@ export function ArtifactsPage() {
           <div
             className={cn(
               "mx-auto w-full px-4 py-8 transition-[max-width,padding] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] md:px-8 md:py-10",
-              selectedArtifact ? "max-w-none" : "max-w-7xl"
+              artifactDrawerOpen ? "max-w-none" : "max-w-7xl"
             )}
           >
           <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
@@ -238,12 +255,12 @@ export function ArtifactsPage() {
                 <div
                   className={cn(
                     "grid grid-cols-1 gap-5 transition-[gap] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] sm:grid-cols-2",
-                    selectedArtifact ? "xl:grid-cols-2 2xl:grid-cols-3" : "xl:grid-cols-3"
+                    artifactDrawerOpen ? "xl:grid-cols-2 2xl:grid-cols-3" : "xl:grid-cols-3"
                   )}
                 >
                   {filteredArtifacts.map((artifact) => {
                   const summaryLines = previewSummaryLines(artifact);
-                  const isSelected = selectedArtifact?.id === artifact.id;
+                  const isSelected = selectedArtifactId === artifact.id;
                   return (
                     <button
                       className={cn(
@@ -251,7 +268,7 @@ export function ArtifactsPage() {
                         isSelected ? "border-primary/45 shadow-sm" : "border-border"
                       )}
                       key={artifact.id}
-                      onClick={() => setSelectedArtifactId(artifact.id)}
+                      onClick={() => selectArtifact(artifact.id)}
                       type="button"
                     >
                       <span className="pointer-events-none absolute right-0 top-0 size-5 border-b border-l border-border bg-muted shadow-sm transition group-hover:bg-muted/80" />
@@ -306,10 +323,10 @@ export function ArtifactsPage() {
           </div>
         </div>
         <aside
-          aria-hidden={!selectedArtifact}
+          aria-hidden={!artifactDrawerOpen}
           className={cn(
             "shrink-0 overflow-hidden bg-background transition-[width,max-height,opacity,transform,border-color] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]",
-            selectedArtifact
+            artifactDrawerOpen
               ? "max-h-[82dvh] translate-y-0 border-t border-border opacity-100 lg:h-auto lg:max-h-none lg:w-[min(980px,62vw)] lg:translate-x-0 lg:border-l lg:border-t-0 2xl:w-[980px]"
               : "max-h-0 translate-y-3 border-t border-transparent opacity-0 lg:max-h-none lg:w-0 lg:translate-x-4 lg:border-l lg:border-t-0"
           )}
@@ -317,22 +334,28 @@ export function ArtifactsPage() {
           <div
             className={cn(
               "grid h-full min-h-0 grid-rows-[auto_1fr] transition-opacity duration-200 ease-out",
-              selectedArtifact ? "opacity-100 delay-100" : "pointer-events-none opacity-0"
+              artifactDrawerOpen ? "opacity-100 delay-100" : "pointer-events-none opacity-0"
             )}
           >
-            {selectedArtifact ? (
+            {artifactDrawerOpen ? (
               <>
                 <div className="border-b border-border p-4 md:p-5">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
-                  <p className="text-xs font-medium uppercase text-muted-foreground">{artifactKindLabel(selectedArtifact)}</p>
-                  <h2 className="mt-1 truncate text-base font-semibold">{selectedArtifact.display_name}</h2>
-                  <p className="mt-1 text-sm text-muted-foreground">{formatArtifactDate(selectedArtifact.created_at)}</p>
+                  <p className="text-xs font-medium uppercase text-muted-foreground">
+                    {activeArtifact ? artifactKindLabel(activeArtifact) : "Artifact"}
+                  </p>
+                  <h2 className="mt-1 truncate text-base font-semibold">
+                    {activeArtifact?.display_name ?? "Loading artifact"}
+                  </h2>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {activeArtifact ? formatArtifactDate(activeArtifact.created_at) : selectedArtifactId}
+                  </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  {selectedArtifact.conversation_id ? (
+                  {activeArtifact?.conversation_id ? (
                     <Button asChild className="self-start" size="sm" variant="outline">
-                      <Link href={`/c/${encodeURIComponent(selectedArtifact.conversation_id)}`}>
+                      <Link href={`/c/${encodeURIComponent(activeArtifact.conversation_id)}`}>
                         <ExternalLink className="size-4" />
                         Open chat
                       </Link>
@@ -340,7 +363,7 @@ export function ArtifactsPage() {
                   ) : null}
                   <Button
                     aria-label="Close artifact preview"
-                    onClick={() => setSelectedArtifactId(null)}
+                    onClick={() => selectArtifact(null)}
                     size="icon-sm"
                     type="button"
                     variant="ghost"

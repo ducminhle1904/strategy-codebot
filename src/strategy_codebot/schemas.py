@@ -9,6 +9,8 @@ from jsonschema import Draft202012Validator
 
 from strategy_codebot.paths import ensure_parent
 from strategy_codebot.paths import repo_root
+from strategy_codebot.strategy_spec import StrategySpec
+from strategy_codebot.strategy_spec import parse_strategy_spec
 
 
 SCHEMA_DIR = repo_root() / "schemas"
@@ -40,3 +42,7 @@ def load_strategy_spec(path: Path) -> dict[str, Any]:
     payload = load_json(path)
     validate_payload(payload, "strategy-spec.schema.json")
     return payload
+
+
+def load_strategy_spec_model(path: Path) -> StrategySpec:
+    return parse_strategy_spec(load_strategy_spec(path))

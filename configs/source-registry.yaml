@@ -50,6 +50,61 @@ sources:
     domain_tags: [risk, safety_boundary]
     market_tags: [general]
     platform_tags: [general]
+  - id: internal-bots-chat-workflow
+    platform: general
+    type: internal
+    knowledge_type: procedural
+    trust_level: high
+    path: docs/product/bots-chat-workflow.md
+    freshness_ttl_days: 90
+    domain_tags: [bots, chat_workflow, safety_boundary, simulation, runtime]
+    market_tags: [general]
+    platform_tags: [general]
+    stages: [strategy_reasoning, balanced_review, repair]
+  - id: internal-backtest-preview-workflow
+    platform: general
+    type: internal
+    knowledge_type: procedural
+    trust_level: high
+    path: docs/product/backtest-preview-workflow.md
+    freshness_ttl_days: 90
+    domain_tags: [backtest, preview, local_sandbox, review_only, trades, equity_curve, risk]
+    market_tags: [general]
+    platform_tags: [general, pine_v6]
+    stages: [strategy_reasoning, balanced_review, repair]
+  - id: internal-variant-robustness-workflow
+    platform: general
+    type: internal
+    knowledge_type: procedural
+    trust_level: high
+    path: docs/product/variant-robustness-workflow.md
+    freshness_ttl_days: 90
+    domain_tags: [backtest, variant_lab, robustness, anti_overfit, review_only, risk]
+    market_tags: [general]
+    platform_tags: [general, pine_v6]
+    stages: [balanced_review, repair]
+  - id: internal-risk-gate-order-intent-workflow
+    platform: general
+    type: internal
+    knowledge_type: procedural
+    trust_level: high
+    path: docs/product/risk-gate-order-intent-workflow.md
+    freshness_ttl_days: 90
+    domain_tags: [risk, risk_gate, order_intent, safety_boundary, review_only]
+    market_tags: [general]
+    platform_tags: [general]
+    stages: [strategy_reasoning, balanced_review, repair]
+  - id: internal-model-workflow-boundaries
+    platform: general
+    type: internal
+    knowledge_type: procedural
+    trust_level: high
+    path: docs/product/model-workflow-boundaries.md
+    freshness_ttl_days: 90
+    domain_tags: [artifact_policy, validation, repair, knowledge_proposal, market_research, safety_boundary]
+    market_tags: [general]
+    platform_tags: [general, pine_v6, mql5]
+    stages: [strategy_reasoning, strategy_coding, balanced_review, repair]
   - id: internal-anti-overfit-checklist
     platform: general
     type: internal

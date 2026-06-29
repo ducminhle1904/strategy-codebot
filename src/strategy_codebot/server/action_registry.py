@@ -87,6 +87,44 @@ ACTION_REGISTRY: tuple[ActionRegistryEntry, ...] = (
         backend_tool=False,
     ),
     ActionRegistryEntry(
+        action_id="prepare-bot",
+        tool_id="draft_bot",
+        label="Prepare bot",
+        prompt="Draft a Bot setup for user review. Do not start the simulation or broker execution.",
+        category="strategy",
+        risk_level="review_required",
+        next_state="bot_proposal",
+    ),
+    ActionRegistryEntry(
+        action_id="review-bot-setup",
+        tool_id="review_bot_setup",
+        label="Review setup",
+        prompt="Review Bot account, risk policy, source strategy, and subscriptions before start.",
+        category="risk",
+        risk_level="review_required",
+        next_state="bot_setup_review",
+        backend_tool=False,
+    ),
+    ActionRegistryEntry(
+        action_id="explain-bot-status",
+        tool_id="get_bot_status",
+        label="Explain Bot status",
+        prompt="Fetch current Bot status, heartbeat, risk state, and recent issue context.",
+        category="review",
+        risk_level="read_only",
+        next_state="bot_status",
+    ),
+    ActionRegistryEntry(
+        action_id="stop-bot-requires-confirmation",
+        tool_id="stop_bot_requires_confirmation",
+        label="Stop bot",
+        prompt="Open the Bot controls for explicit user confirmation before stop or kill switch.",
+        category="risk",
+        risk_level="review_required",
+        next_state="bot_stop_review",
+        backend_tool=False,
+    ),
+    ActionRegistryEntry(
         action_id="review-assumptions",
         tool_id="review_assumptions",
         label="Review assumptions",
@@ -209,8 +247,10 @@ def _default_action_presentation(entry: ActionRegistryEntry, *, risk_level: str)
         icon_key = "search"
     elif entry.tool_id in {"run_backtest_preview", "run_backtest_variant_lab"}:
         icon_key = "play"
-    elif entry.tool_id in {"create_proposed_intent", "review_risk", "run_risk_gate"}:
+    elif entry.tool_id in {"create_proposed_intent", "review_risk", "run_risk_gate", "review_bot_setup", "stop_bot_requires_confirmation"}:
         icon_key = "gauge"
+    elif entry.tool_id in {"draft_bot", "get_bot_status"}:
+        icon_key = "bot"
     elif entry.tool_id == "query_backtest_trades":
         icon_key = "list"
     elif entry.tool_id == "build_robustness_report":
@@ -258,6 +298,10 @@ def _action_available(
         return bot_boundary_prompt and not has_proposed_intent
     if entry.tool_id == "run_risk_gate":
         return (bot_boundary_prompt or has_proposed_intent or has_strategy_artifact) and not has_risk_gate and not _risk_gate_required_inputs(context_text)
+    if entry.tool_id == "draft_bot":
+        return bot_boundary_prompt and has_strategy_artifact
+    if entry.tool_id in {"review_bot_setup", "get_bot_status", "stop_bot_requires_confirmation"}:
+        return "bot" in context_text.lower() or "runtime" in context_text.lower()
     if entry.tool_id == "review_assumptions":
         return True
     if entry.tool_id in {"query_backtest_trades", "get_backtest_summary"}:
@@ -293,6 +337,10 @@ def _disabled_reason(
         if required:
             return "Required Risk Gate inputs are missing."
         return "A proposed intent or strategy artifact is required."
+    if entry.tool_id == "draft_bot":
+        return "A strategy artifact and Bot request are required."
+    if entry.tool_id in {"review_bot_setup", "get_bot_status", "stop_bot_requires_confirmation"}:
+        return "A Bot context is required."
     if entry.tool_id in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report"}:
         return "A completed backtest report is required."
     if entry.tool_id == "run_backtest_preview":
