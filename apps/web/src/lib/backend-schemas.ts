@@ -40,9 +40,14 @@ export const ReadyResponseSchema = z.object({
 });
 
 export const TierSchema = z.enum(["free", "paid_low", "paid_medium", "paid_high"]);
-export const MessageModeSchema = z.enum(["deterministic", "agent"]);
+export const MessageModeSchema = z.enum(["deterministic", "agent", "workflow_task_continuation"]);
 export const LanguagePreferenceSchema = z.enum(["en", "vi"]);
 export const RunModeSchema = z.enum(["dry-run", "agent", "live-generation", "backtest-preview"]);
+export const CapabilityModeStatusSchema = z.object({
+  status: z.enum(["available", "degraded", "blocked"]),
+  reason_codes: z.array(z.string()).default([]),
+  missing_components: z.array(z.string()).default([]),
+});
 
 export const WorkspaceCapabilitySchema = z.object({
   user_id: IdSchema,
@@ -52,6 +57,7 @@ export const WorkspaceCapabilitySchema = z.object({
   tier_label: z.string().min(1),
   allowed_message_modes: z.array(MessageModeSchema),
   allowed_run_modes: z.array(RunModeSchema),
+  capability_matrix: z.record(z.string(), CapabilityModeStatusSchema).default({}),
 });
 
 export const MeResponseSchema = z.object({
@@ -67,6 +73,7 @@ export const ProviderStatusResponseSchema = z.object({
   tier_label: z.string().min(1),
   allowed_message_modes: z.array(MessageModeSchema),
   allowed_run_modes: z.array(RunModeSchema),
+  capability_matrix: z.record(z.string(), CapabilityModeStatusSchema).default({}),
   fallback_mode: z.enum(["deterministic"]),
   model_routing_mode: z.string().min(1).default("registry"),
   model_tier: z.string().nullable().optional(),
@@ -366,6 +373,52 @@ export const BotProposalConfirmStartResponseSchema = z.object({
   runtime: NautilusRuntimeSchema,
 });
 
+export const WorkflowTaskResponseRequestSchema = z.object({
+  values: JsonObjectSchema.default({}),
+  action_id: z.string().min(1).max(120).optional(),
+  status: z.enum(["completed", "approved", "rejected", "cancelled", "blocked"]).default("completed"),
+});
+
+export const WorkflowTaskContinuationStateSchema = z.object({
+  required: z.boolean().default(false),
+  task_id: IdSchema,
+  workflow_id: z.string().min(1),
+  task_template_id: z.string().min(1),
+  resume_intent: z.string().nullable().default(null),
+  reason: z.string().nullable().default(null),
+});
+
+export const WorkflowTaskContinuationRequestSchema = z.object({
+  language: z.string().default("en"),
+  web_search: z.enum(["off", "auto", "on"]).default("auto"),
+});
+
+export const WorkflowTaskSchema = z.object({
+  id: IdSchema,
+  workflow_id: z.string().min(1),
+  task_template_id: z.string().min(1),
+  step_id: z.string().min(1),
+  kind: z.string().min(1),
+  status: z.string().min(1),
+  title: z.string().min(1),
+  blocking: z.boolean(),
+  input_request_ids: z.array(z.string()).default([]),
+  action_ids: z.array(z.string()).default([]),
+  input_requests: z.array(JsonObjectSchema).default([]),
+  actions: z.array(JsonObjectSchema).default([]),
+  values: JsonObjectSchema.default({}),
+  response: JsonObjectSchema.nullable().default(null),
+  reason: z.string().nullable().default(null),
+  continuation: WorkflowTaskContinuationStateSchema.nullable().default(null),
+  created_at: IsoDateTimeSchema,
+  updated_at: IsoDateTimeSchema,
+  resolved_at: IsoDateTimeSchema.nullable().default(null),
+});
+
+export const WorkflowTaskListResponseSchema = z.object({
+  items: z.array(WorkflowTaskSchema),
+});
+
 export const ConversationSidebarItemSchema = z.object({
   conversation: ConversationSchema,
   last_message_preview: z.string().nullable(),
@@ -574,12 +627,47 @@ export const BACKTEST_PREVIEW_APPROVAL_EVENT_TYPES = [
   "backtest.preview.heartbeat",
 ] as const;
 
+export const PROMPT_CHAIN_RUN_EVENT_TYPES = [
+  "prompt_chain.started",
+  "prompt_chain.stage_completed",
+  "prompt_chain.completed",
+  "prompt_chain.fallback",
+  "prompt_chain.failed",
+] as const;
+
+export const EVALUATOR_OPTIMIZER_RUN_EVENT_TYPES = ["evaluator_optimizer.summary"] as const;
+
+export const AGENT_LOOP_RUN_EVENT_TYPES = [
+  "agent_loop.started",
+  "agent_loop.llm_completed",
+  "agent_loop.tool_checked",
+  "agent_loop.completed",
+] as const;
+
+export const AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES = [
+  ...PROMPT_CHAIN_RUN_EVENT_TYPES,
+  ...EVALUATOR_OPTIMIZER_RUN_EVENT_TYPES,
+  ...AGENT_LOOP_RUN_EVENT_TYPES,
+] as const;
+
+export const WORKFLOW_CONTINUATION_EVENT_TYPES = [
+  "workflow.continuation.required",
+  "workflow.continuation.started",
+  "workflow.continuation.completed",
+  "workflow.continuation.failed",
+] as const;
+
 export const KNOWN_RUN_EVENT_TYPES = [
   "message.delta",
   "provider.started",
   "provider.route",
   "provider.waiting",
   "provider.retrying",
+  "classifier.started",
+  "classifier.route",
+  "classifier.completed",
+  "classifier.timeout",
+  "classifier.failed",
   "model.reasoning.delta",
   "model.usage",
   "tool.started",
@@ -596,7 +684,16 @@ export const KNOWN_RUN_EVENT_TYPES = [
   "knowledge.candidate.rejected",
   "knowledge.learning.completed",
   "knowledge.learning.failed",
+  "model_action.proposed",
+  "model_action.validated",
+  "model_action.rejected",
+  "model_action.executed",
+  ...AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES,
   "policy.blocked",
+  "workflow.gate.required",
+  "workflow.gate.confirmed",
+  "workflow.gate.rejected",
+  ...WORKFLOW_CONTINUATION_EVENT_TYPES,
   "observability.stage.completed",
   "progress.snapshot",
   "progress.update",
@@ -692,6 +789,7 @@ export const ConversationStateResponseSchema = z.object({
   conversation_run_events: z.array(RunEventSchema).default([]),
   feedback_targets: FeedbackTargetSchema,
   strategy_profile: StrategyProfileSchema.nullable().optional(),
+  pending_workflow_continuation: WorkflowTaskContinuationStateSchema.nullable().default(null),
 });
 
 export const ObservabilityToolCallSchema = z.object({
@@ -806,6 +904,19 @@ export type BotProposalConfirmStartRequest = z.input<
 >;
 export type BotProposalConfirmStartResponse = z.infer<
   typeof BotProposalConfirmStartResponseSchema
+>;
+export type WorkflowTaskResponseRequest = z.input<
+  typeof WorkflowTaskResponseRequestSchema
+>;
+export type WorkflowTaskContinuationRequest = z.input<
+  typeof WorkflowTaskContinuationRequestSchema
+>;
+export type WorkflowTaskContinuationState = z.infer<
+  typeof WorkflowTaskContinuationStateSchema
+>;
+export type WorkflowTask = z.infer<typeof WorkflowTaskSchema>;
+export type WorkflowTaskListResponse = z.infer<
+  typeof WorkflowTaskListResponseSchema
 >;
 export type RunMode = z.infer<typeof RunModeSchema>;
 export type BacktestConfig = z.infer<typeof BacktestConfigSchema>;

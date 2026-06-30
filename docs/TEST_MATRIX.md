@@ -80,6 +80,16 @@
 | Release artifacts workflow | `.github/workflows/release-artifacts.yml` builds and uploads wheel plus sdist artifacts | planned |
 | Local package build | `uv build --out-dir dist` creates installable distributions | planned |
 
+## App Workflow Matrix
+
+| Artifact | Proof | Status |
+| --- | --- | --- |
+| Workflow registry task contract | `uv run pytest tests/test_workflow_registry_contract.py tests/test_docker_deployment.py::test_workflow_registry_contract_generated_files_are_current -q` validates shared FE/BE generated registry currentness | pass |
+| Workflow task inbox backend | `uv run pytest tests/test_server_llm_orchestration.py -q` verifies task creation, response validation, tenant isolation, and paper-bot workflow gates | pass |
+| Workflow rail task UI | `cd apps/web && npm test -- src/lib/workflow-ui.test.ts src/components/strategy/workflow-panel.test.tsx` verifies generic task normalization, rendering, and structured submit callbacks | pass |
+| Workflow rail integration typing | `cd apps/web && npx tsc --noEmit --pretty false` verifies workspace task handlers and backend client integration | pass |
+| Workflow container rebuild | `docker compose -f compose.yml build api chat-worker web` rebuilds API, chat worker, and web images after registry/API/UI changes | pass |
+
 ## Evidence Rules
 
 - Do not mark Pine strategy backtests as passed without TradingView evidence.

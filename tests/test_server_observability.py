@@ -200,6 +200,10 @@ def test_trading_chat_safety_eval_cases_at_api_boundary(tmp_path: Path) -> None:
         event
         for event in unsafe_events
         if event not in {"model.reasoning.delta", "provider.started", "provider.route"}
+        and not event.startswith("model_action.")
+        and not event.startswith("prompt_chain.")
+        and not event.startswith("agent_loop.")
+        and event != "evaluator_optimizer.summary"
     ] == ["chat.response_intent", "chat.suggestions.updated", "policy.blocked", "message.delta", "run.completed"]
 
     safe_llm = FakeLLMClient([LLMClientEvent(type="message.delta", text="Education only: trading strategies can lose money and need manual validation.")])

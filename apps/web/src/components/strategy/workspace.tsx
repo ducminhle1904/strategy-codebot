@@ -71,7 +71,7 @@ import {
   BacktestPreviewHitlCard,
   PaperBotProposalCard,
 } from "@/components/strategy/agent-tools/tool-cards";
-import { WorkflowRail } from "@/components/strategy/workflow-panel";
+import { WorkflowRail, WorkflowTaskPrompt } from "@/components/strategy/workflow-panel";
 import { StatusPill } from "@/components/strategy/status-pill";
 import { BacktestReportCard } from "@/components/strategy/backtest-report-card";
 import { BacktestResultInlineCard } from "@/components/strategy/backtest-result-inline-card";
@@ -136,6 +136,10 @@ import {
   runEventMetadataByAnchorMessage,
 } from "@/lib/chat-ui";
 import {
+  isChatResponseIntent,
+  shouldSuggestMarketToStrategyForIntent,
+} from "@/lib/chat-intent-registry-contract";
+import {
   accountInitial,
   accountName,
   accountSubtitle,
@@ -186,6 +190,7 @@ import type {
   WebSearchMode,
   BotProposal as BackendBotProposal,
   BotProposalCreateRequest,
+  BotProposalConfirmStartRequest,
 } from "@/lib/backend-schemas";
 import { useStrategyUiStore } from "@/lib/ui-store";
 import {
@@ -201,6 +206,7 @@ import {
   type PaperBotProposal,
   type WorkflowState,
 } from "@/lib/chat-stream";
+import type { WorkflowAction } from "@/lib/workflow-ui";
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -399,6 +405,7 @@ export function StrategyWorkspace({
   const lastHydratedMessagesKeyRef = useRef<string | null>(null);
   const sendingConversationIdRef = useRef<string | null>(null);
   const promptSubmitPendingRef = useRef(false);
+  const workflowContinuationTaskIdsRef = useRef(new Set<string>());
   const consumedPendingInitialPromptRef = useRef<string | null>(null);
   const setMessagesFromConversationStateRef = useRef<
     ((messages: StrategyChatMessage[]) => void) | null
@@ -468,7 +475,7 @@ export function StrategyWorkspace({
     queryFn: () => client.getAccountUsage(),
     queryKey: ["account-usage"],
   });
-  const allowedRunModes = providerStatus.data?.allowed_run_modes ?? ["dry-run", "agent", "live-generation"];
+  const allowedRunModes = allowedRunModesFromCapability(providerStatus.data);
   const activeRunMode = allowedRunModes.includes(runMode) ? runMode : "dry-run";
 
   const openAccountDialog = useCallback((dialog: AccountDialog) => {
@@ -716,6 +723,39 @@ export function StrategyWorkspace({
       stopChatRef.current = null;
     };
   }, [chat]);
+
+  const continueWorkflowTask = useCallback(
+    async (taskId: string) => {
+      if (!activeConversationId || workflowContinuationTaskIdsRef.current.has(taskId)) {
+        return;
+      }
+      workflowContinuationTaskIdsRef.current.add(taskId);
+      sendingConversationIdRef.current = activeConversationId;
+      try {
+        await chat.continueWorkflowTask(taskId, {
+          body: { conversationId: activeConversationId },
+        });
+      } finally {
+        workflowContinuationTaskIdsRef.current.delete(taskId);
+      }
+    },
+    [activeConversationId, chat]
+  );
+
+  useEffect(() => {
+    const pending = stateBelongsToActiveConversation
+      ? state.data?.pending_workflow_continuation
+      : null;
+    if (!pending?.required || !pending.task_id || chat.status !== "ready" || promptSubmitPendingRef.current) {
+      return;
+    }
+    void continueWorkflowTask(pending.task_id);
+  }, [
+    chat.status,
+    continueWorkflowTask,
+    state.data?.pending_workflow_continuation,
+    stateBelongsToActiveConversation,
+  ]);
 
   useEffect(() => {
     if (!autoChainContinuation) {
@@ -1480,6 +1520,7 @@ export function StrategyWorkspace({
                 setArtifactPanelOpen(true);
               }}
               onOpenCreateSpec={() => setSpecDialogOpen(true)}
+              onContinueWorkflowTask={continueWorkflowTask}
               onViewArtifactWorkspace={openArtifactDrawer}
               onStop={() => void chat.stop()}
               isBacktestApprovalSubmitting={decideBacktestApproval.isPending}
@@ -2911,6 +2952,7 @@ function ChatColumn({
   onBacktestApprovalDecision,
   onCreateConversation,
   onFeedback,
+  onContinueWorkflowTask,
   onPromptSubmit,
   onOpenCreateSpec,
   onWebSearchModeChange,
@@ -2947,6 +2989,7 @@ function ChatColumn({
   }) => Promise<void>;
   onCreateConversation: () => void;
   onFeedback: (messageId: string, rating: "up" | "down") => Promise<void>;
+  onContinueWorkflowTask: (taskId: string) => Promise<void>;
   onOpenCreateSpec: () => void;
   onPromptSubmit: (message: { text: string }) => Promise<void>;
   onWebSearchModeChange: (mode: WebSearchMode) => void;
@@ -2961,6 +3004,10 @@ function ChatColumn({
   strategyProfile: StrategyProfile | null;
   webSearchMode: WebSearchMode;
 }) {
+  const client = useBrowserBackendClient();
+  const queryClient = useQueryClient();
+  const router = useRouter();
+  const [workflowTaskOverrides, setWorkflowTaskOverrides] = useState<Record<string, unknown>>({});
   const [backtestStatusNowMs, setBacktestStatusNowMs] = useState(() => Date.now());
   const activities = useMemo(
     () => mapRunEventsToChatActivities(runEvents, language, actionRegistry),
@@ -2974,6 +3021,11 @@ function ChatColumn({
     () => pendingBacktestApprovalFromRunEvents(runEvents),
     [runEvents]
   );
+  useEffect(() => {
+    setWorkflowTaskOverrides((current) => (
+      Object.keys(current).length > 0 ? {} : current
+    ));
+  }, [selectedConversationId]);
   useEffect(() => {
     if (
       !backtestLiveStatus ||
@@ -3122,6 +3174,96 @@ function ChatColumn({
     persistedRunMetadata,
     turnAssistantMessage,
   ]);
+  const activeWorkflowTaskIdentity = useMemo(
+    () =>
+      activeWorkflow
+        ? `${activeWorkflow.workflow_id}:${activeWorkflow.tasks.map((task) => task.id).join("|")}`
+        : "none",
+    [activeWorkflow]
+  );
+  useEffect(() => {
+    setWorkflowTaskOverrides((current) => (
+      Object.keys(current).length > 0 ? {} : current
+    ));
+  }, [activeWorkflowTaskIdentity]);
+  const activeWorkflowWithTaskOverrides = useMemo(() => {
+    if (!activeWorkflow || Object.keys(workflowTaskOverrides).length === 0) {
+      return activeWorkflow;
+    }
+    const overriddenTasks = activeWorkflow.tasks.map((task) =>
+      workflowTaskOverrides[task.id]
+        ? { ...task, ...(workflowTaskOverrides[task.id] as Record<string, unknown>) }
+        : task
+    );
+    return (
+      normalizeWorkflowState({
+        ...activeWorkflow,
+        tasks: overriddenTasks,
+      }) ?? activeWorkflow
+    );
+  }, [activeWorkflow, workflowTaskOverrides]);
+  const handleWorkflowTaskSubmit = useCallback(
+    async (taskId: string, values: Record<string, unknown>) => {
+      const task = await client.submitWorkflowTaskResponse(taskId, { values, status: "completed" });
+      setWorkflowTaskOverrides((current) => ({ ...current, [task.id]: task }));
+      if (selectedConversationId) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation-state", selectedConversationId] });
+      }
+      if (task.continuation?.required && task.continuation.task_id) {
+        await onContinueWorkflowTask(task.continuation.task_id);
+      }
+    },
+    [client, onContinueWorkflowTask, queryClient, selectedConversationId]
+  );
+  const handleWorkflowTaskAction = useCallback(
+    async (taskId: string, action: WorkflowAction, values: Record<string, unknown> = {}) => {
+      if (action.kind === "confirm_start_bot_proposal") {
+        const proposalId =
+          action.target_ref ??
+          activeWorkflowWithTaskOverrides?.actions.find((item) => item.id === action.id)?.target_ref ??
+          activeWorkflowWithTaskOverrides?.bot_proposal_id;
+        if (!proposalId) {
+          const task = await client.submitWorkflowTaskResponse(taskId, {
+            values,
+            status: "completed",
+          });
+          setWorkflowTaskOverrides((current) => ({ ...current, [task.id]: task }));
+          return;
+        }
+        const result = await client.confirmStartBotProposal(
+          proposalId,
+          botProposalConfirmStartPayloadFromWorkflowValues(values)
+        );
+        const task = action.enabled
+          ? await client.submitWorkflowTaskAction(taskId, action.id, {
+              values,
+              status: "approved",
+            })
+          : await client.submitWorkflowTaskResponse(taskId, {
+              values,
+              status: "completed",
+            });
+        setWorkflowTaskOverrides((current) => ({ ...current, [task.id]: task }));
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["paper-bot-runtimes"] }),
+          selectedConversationId
+            ? queryClient.invalidateQueries({ queryKey: ["conversation-state", selectedConversationId] })
+            : Promise.resolve(),
+        ]);
+        router.push(`/paper-bots?runtime=${encodeURIComponent(result.runtime.id)}`);
+        return;
+      }
+      const task = await client.submitWorkflowTaskAction(taskId, action.id, {
+        values,
+        status: "approved",
+      });
+      setWorkflowTaskOverrides((current) => ({ ...current, [task.id]: task }));
+      if (selectedConversationId) {
+        await queryClient.invalidateQueries({ queryKey: ["conversation-state", selectedConversationId] });
+      }
+    },
+    [activeWorkflowWithTaskOverrides, client, queryClient, router, selectedConversationId]
+  );
   const staticSuggestions = useMemo(() => getChatSuggestions(language), [language]);
   const fallbackSuggestionPayload = useMemo(
     () =>
@@ -3139,6 +3281,7 @@ function ChatColumn({
       ? streamedComposerBlocks
       : fallbackSuggestionPayload.composer_blocks;
   const isEmptyChat = !isLoadingConversation && displayMessages.length === 0;
+  const shouldHideComposerForWorkflowTask = hasBlockingWorkflowTask(activeWorkflowWithTaskOverrides);
 
   return (
     <section
@@ -3155,7 +3298,15 @@ function ChatColumn({
         onSelect={onSelectConversation}
         selectedConversationId={selectedConversationId}
       />
-      {activeWorkflow ? <WorkflowRail workflow={activeWorkflow} /> : null}
+      {activeWorkflowWithTaskOverrides ? (
+        <WorkflowRail
+          activities={activities}
+          onSelectArtifact={onSelectArtifact}
+          onSubmitTask={handleWorkflowTaskSubmit}
+          onTaskAction={handleWorkflowTaskAction}
+          workflow={activeWorkflowWithTaskOverrides}
+        />
+      ) : null}
       <Conversation className="min-h-0 overflow-hidden">
         <ConversationContent className="mx-auto w-full max-w-3xl px-4 py-8">
           <div className="min-w-0 space-y-4">
@@ -3253,6 +3404,12 @@ function ChatColumn({
             language={language}
             onSelectArtifact={onSelectArtifact}
           />
+          {activeWorkflowWithTaskOverrides ? (
+            <WorkflowTaskPrompt
+              onSubmitTask={handleWorkflowTaskSubmit}
+              workflow={activeWorkflowWithTaskOverrides}
+            />
+          ) : null}
           {pendingBacktestApproval && selectedConversationId ? (
             <BacktestApprovalPanel
               approval={pendingBacktestApproval}
@@ -3274,7 +3431,7 @@ function ChatColumn({
       <div
         className={cn(
           "mx-auto w-full max-w-3xl shrink-0 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]",
-          isEmptyChat && "hidden"
+          (isEmptyChat || shouldHideComposerForWorkflowTask) && !error && "hidden"
         )}
       >
         {error && (
@@ -3283,18 +3440,20 @@ function ChatColumn({
             <span>{error}</span>
           </div>
         )}
-        <div className={cn(isEmptyChat && "pointer-events-auto")}>
-          <ChatPromptComposer
-            chatStatus={chatStatus}
-            disabled={disabled}
-            language={language}
-            onPromptSubmit={onPromptSubmit}
-            onWebSearchModeChange={onWebSearchModeChange}
-            onStop={onStop}
-            suggestionBlocks={composerBlocks}
-            webSearchMode={webSearchMode}
-          />
-        </div>
+        {!shouldHideComposerForWorkflowTask ? (
+          <div className={cn(isEmptyChat && "pointer-events-auto")}>
+            <ChatPromptComposer
+              chatStatus={chatStatus}
+              disabled={disabled}
+              language={language}
+              onPromptSubmit={onPromptSubmit}
+              onWebSearchModeChange={onWebSearchModeChange}
+              onStop={onStop}
+              suggestionBlocks={composerBlocks}
+              webSearchMode={webSearchMode}
+            />
+          </div>
+        ) : null}
       </div>
     </section>
   );
@@ -4439,6 +4598,20 @@ function botProposalPayload(proposal: PaperBotProposal): BotProposalCreateReques
   };
 }
 
+function botProposalConfirmStartPayloadFromWorkflowValues(
+  values: Record<string, unknown>
+): BotProposalConfirmStartRequest {
+  return {
+    account_id: workflowStringValue(values.account_id),
+    broker_connection_id: workflowStringValue(values.broker_connection_id),
+    risk_policy_id: workflowStringValue(values.risk_policy_id),
+  };
+}
+
+function workflowStringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 function paperBotSubscriptionLabels(proposal: PaperBotProposal) {
   return (proposal.data_subscriptions ?? []).flatMap((subscription) => paperBotSubscriptionLabel(subscription) ?? []);
 }
@@ -4902,21 +5075,48 @@ function knowledgeSourcesFromRunEvents(events: RunEvent[]): ChatMessageSource[] 
   return sources;
 }
 
+function allowedRunModesFromCapability(providerStatus?: ProviderStatusResponse): RunMode[] {
+  const matrix = providerStatus?.capability_matrix;
+  if (matrix && Object.keys(matrix).length > 0) {
+    return (Object.entries(matrix)
+      .filter(([, capability]) => capability.status === "available" || capability.status === "degraded")
+      .map(([mode]) => mode) as RunMode[]);
+  }
+  return providerStatus?.allowed_run_modes ?? ["dry-run", "agent", "live-generation"];
+}
+
+function hasBlockingWorkflowTask(workflow: WorkflowState | null): boolean {
+  return Boolean(
+    workflow?.tasks.some((task) => {
+      if (!task.blocking || task.status !== "pending_user" || task.input_requests.length === 0) {
+        return false;
+      }
+      const values = { ...workflow.task_values, ...task.values };
+      return task.input_requests.some((request) => !workflowTaskPromptValueAnswered(values[request.id]));
+    })
+  );
+}
+
+function workflowTaskPromptValueAnswered(value: unknown): boolean {
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  if (typeof value === "boolean") {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  return false;
+}
+
 function responseIntentFromRunEvents(events: RunEvent[]): ResponseIntent | null {
   for (const event of [...events].reverse()) {
     if (event.type !== "chat.response_intent") {
       continue;
     }
     const intent = event.payload?.intent;
-    if (
-      intent === "artifact_generation" ||
-      intent === "capability_help" ||
-      intent === "docs_research" ||
-      intent === "general_chat" ||
-      intent === "market_research" ||
-      intent === "market_snapshot" ||
-      intent === "strategy_building"
-    ) {
+    if (isChatResponseIntent(intent)) {
       return intent;
     }
   }
@@ -5103,6 +5303,19 @@ function AssistantActivity({
                     <p className="text-muted-foreground text-sm">
                       {activity.description}
                     </p>
+                    {activity.details && activity.details.length > 0 ? (
+                      <dl className="grid gap-1 rounded-[4px] border border-border/60 bg-muted/30 p-2 text-xs">
+                        {activity.details.map((detail) => (
+                          <div
+                            className="grid grid-cols-[5rem_minmax(0,1fr)] gap-2"
+                            key={`${activity.id}-${detail.label}`}
+                          >
+                            <dt className="text-muted-foreground">{detail.label}</dt>
+                            <dd className="truncate text-foreground">{detail.value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    ) : null}
                     <ToolOutput
                       errorText={activity.errorText}
                       output={activity.output}
@@ -5838,14 +6051,13 @@ function buildFallbackSuggestionPayload({
 }) {
   const t = getUiCopy(language);
   const strategyRelevant =
-    intent === "strategy_building" ||
-    intent === "artifact_generation" ||
+    shouldShowStrategyProfile(intent) ||
     (intent === null && Boolean(strategyProfile));
   const composerBlocks = strategyRelevant ? fallbackComposerBlocks(language, strategyProfile) : [];
   const actions: ChatSuggestionItem[] = [];
   const ready = strategyProfile?.snapshot.completeness === "ready_for_artifact";
 
-  if (!artifactAvailable && (intent === "market_snapshot" || intent === "market_research")) {
+  if (!artifactAvailable && shouldSuggestMarketToStrategyForIntent(intent)) {
     actions.push({
       action: "send_prompt",
       category: "strategy",
@@ -5861,7 +6073,7 @@ function buildFallbackSuggestionPayload({
     });
   } else if (
     !ready &&
-    (intent === "strategy_building" || intent === "artifact_generation") &&
+    shouldShowStrategyProfile(intent) &&
     strategyProfile?.snapshot.missing_fields?.length
   ) {
     actions.push(

@@ -269,6 +269,17 @@ const BACKTEST_LIVE_STATUS_EVENT_TYPES = new Set([
   "chat.auto_chain.waiting_for_backtest",
 ]);
 
+function isBacktestLiveStatusEvent(event: RunEvent): boolean {
+  if (BACKTEST_LIVE_STATUS_EVENT_TYPES.has(event.type)) {
+    return true;
+  }
+  const payload = recordPayload(event);
+  return (
+    stringPayload(payload, "card_kind") === "backtest_live_status" ||
+    stringPayload(payload, "preferred_artifact_kind") === "backtest_report"
+  );
+}
+
 export function backtestLiveStatusFromRunEvents(
   events: RunEvent[],
   nowMs = Date.now()
@@ -276,7 +287,7 @@ export function backtestLiveStatusFromRunEvents(
   let latestRelevant: RunEvent | null = null;
   let latestRelevantIndex = -1;
   for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (BACKTEST_LIVE_STATUS_EVENT_TYPES.has(events[index].type)) {
+    if (isBacktestLiveStatusEvent(events[index])) {
       latestRelevant = events[index];
       latestRelevantIndex = index;
       break;
@@ -285,8 +296,12 @@ export function backtestLiveStatusFromRunEvents(
   if (!latestRelevant) {
     return null;
   }
-  if (latestRelevant.type === "backtest.preview.heartbeat") {
-    const payload = recordPayload(latestRelevant);
+  const latestPayload = recordPayload(latestRelevant);
+  if (
+    latestRelevant.type === "backtest.preview.heartbeat" ||
+    stringPayload(latestPayload, "card_kind") === "backtest_live_status"
+  ) {
+    const payload = latestPayload;
     const status = stringPayload(payload, "status");
     const stage = stringPayload(payload, "stage");
     const updatedAt = stringPayload(payload, "updated_at") ?? latestRelevant.created_at;
@@ -312,7 +327,7 @@ export function backtestLiveStatusFromRunEvents(
     return null;
   }
   if (latestRelevant.type === "backtest.preview.failed") {
-    const payload = recordPayload(latestRelevant);
+    const payload = latestPayload;
     return {
       runId: latestRelevant.run_id,
       status: "failed",
@@ -327,7 +342,7 @@ export function backtestLiveStatusFromRunEvents(
       fetchWindowsTotal: null,
     };
   }
-  const payload = recordPayload(latestRelevant);
+  const payload = latestPayload;
   const childRunId = stringPayload(payload, "child_run_id");
   if (childRunId) {
     const terminal = backtestChildTerminalStatus(events, latestRelevantIndex, childRunId);

@@ -81,7 +81,13 @@ def _pineforge_runner_check() -> dict[str, Any]:
         "pineforge_runner_version": None,
     }
     if not url:
-        payload.update({"status": "unavailable", "reason": "BACKTEST_PINEFORGE_RUNNER_URL is not configured"})
+        payload.update(
+            {
+                "status": "ok",
+                "configured": False,
+                "reason": "BACKTEST_PINEFORGE_RUNNER_URL is not configured",
+            }
+        )
         return payload
     try:
         with urlopen(f"{url}/ready", timeout=2) as response:

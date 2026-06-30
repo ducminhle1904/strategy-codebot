@@ -30,6 +30,23 @@
     "phase_status": {
       "type": "string",
       "enum": ["implemented", "planned", "manual_required", "skipped"]
+    },
+    "backend_handler": { "type": "string", "minLength": 1 },
+    "provider_exposed": { "type": "boolean" },
+    "aliases": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "card_kind": { "type": "string", "minLength": 1 },
+        "tool_name": { "type": "string", "minLength": 1 },
+        "preferred_artifact_kind": { "type": "string", "minLength": 1 },
+        "source_payload_path": { "type": "string", "minLength": 1 }
+      }
     }
   }
 }

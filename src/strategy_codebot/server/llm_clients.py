@@ -44,6 +44,21 @@ class LLMClient(Protocol):
     ) -> Iterable[LLMClientEvent]: ...
 
 
+def stream_client(
+    client: LLMClient,
+    *,
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]],
+    routing_context: dict[str, Any] | None = None,
+) -> Iterable[LLMClientEvent]:
+    try:
+        yield from client.stream(messages=messages, tools=tools, routing_context=routing_context)
+    except TypeError as exc:
+        if "routing_context" not in str(exc):
+            raise
+        yield from client.stream(messages=messages, tools=tools)
+
+
 class ResponsesClient:
     def __init__(self, *, model: str = "gpt-5.5", api_key: str | None = None, timeout_seconds: float | None = None) -> None:
         self.model = model

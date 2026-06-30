@@ -270,12 +270,82 @@ def stage_messages(
     repair_note = f" Repair iteration {repair_iteration}." if repair_iteration else ""
     content = (
         f"You are the {stage} stage in a multi-model strategy generation workflow. "
-        f"{role_prompt}{repair_note} {SHARED_SAFETY_BOUNDARY}"
+        f"{role_prompt}{repair_note} "
+        "Return exactly one strict JSON object and no markdown, prose, code fences, or extra text. "
+        "The JSON object must match the response_contract in the user payload. "
+        "Do not expose internal handoff JSON to the user; it is consumed only by the next backend stage. "
+        f"{SHARED_SAFETY_BOUNDARY}"
     )
+    user_payload = {
+        "context": context_packet,
+        "response_contract": build_stage_json_contract(stage),
+    }
     return [
         {"role": "system", "content": content},
-        {"role": "user", "content": json.dumps(context_packet, ensure_ascii=False, sort_keys=True)},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, sort_keys=True)},
     ]
+
+
+def build_stage_json_contract(stage: str) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "json_only": True,
+        "required_top_level_keys": ["stage", "output", "assumptions", "handoff_notes", "policy_observations"],
+        "top_level_schema": {
+            "stage": {"type": "string", "const": stage},
+            "output": {"type": "object"},
+            "assumptions": {"type": "array", "items": "string"},
+            "handoff_notes": {"type": "string"},
+            "policy_observations": {"type": "array", "items": "string"},
+        },
+    }
+    if stage == STAGE_STRATEGY_REASONING:
+        base["output_schema"] = {
+            "summary": "non-empty string",
+            "constraints": "array of strings",
+            "indicators": "array of strings",
+            "entries": "array of strings",
+            "exits": "array of strings",
+            "risk_rules": "array of strings",
+            "non_goals": "array of strings",
+        }
+        base["required_output_keys"] = [
+            "summary",
+            "constraints",
+            "indicators",
+            "entries",
+            "exits",
+            "risk_rules",
+            "non_goals",
+        ]
+        return base
+    if stage == STAGE_STRATEGY_CODING:
+        base["output_schema"] = {
+            "strategy_spec": "non-empty object matching schemas/strategy-spec.schema.json",
+        }
+        base["required_output_keys"] = ["strategy_spec"]
+        return base
+    if stage == STAGE_PINE_CODE_GENERATION:
+        base["output_schema"] = {
+            "pine_code": "non-empty Pine Script string starting with //@version=6",
+        }
+        base["required_output_keys"] = ["pine_code"]
+        return base
+    if stage == STAGE_BALANCED_REVIEW:
+        base["output_schema"] = {
+            "verdict": "string",
+            "required_fixes": "array of strings",
+            "rationale": "string",
+        }
+        base["required_output_keys"] = ["verdict", "required_fixes", "rationale"]
+        return base
+    if stage == STAGE_REPAIR:
+        base["output_schema"] = {
+            "strategy_spec": "object",
+            "pine_code": "string",
+        }
+        base["required_output_keys"] = ["strategy_spec", "pine_code"]
+        return base
+    return base
 
 
 def _current_stage_prompt(stage: str, conservative_sizing_guidance: str) -> str:

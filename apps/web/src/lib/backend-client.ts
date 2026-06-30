@@ -38,6 +38,10 @@ import {
   RunEventSchema,
   RunObservabilityResponseSchema,
   RunSchema,
+  WorkflowTaskListResponseSchema,
+  WorkflowTaskContinuationRequestSchema,
+  WorkflowTaskResponseRequestSchema,
+  WorkflowTaskSchema,
   type BacktestApprovalDecisionRequest,
   type BacktestApprovalDecisionResponse,
   type AccountUsageResponse,
@@ -76,6 +80,10 @@ import {
   type RunCreateResponse,
   type RunEvent,
   type RunObservabilityResponse,
+  type WorkflowTask,
+  type WorkflowTaskContinuationRequest,
+  type WorkflowTaskListResponse,
+  type WorkflowTaskResponseRequest,
 } from "./backend-schemas";
 import { parseSseJsonPayloads } from "./sse";
 
@@ -122,7 +130,7 @@ export type RequestOptions = {
 };
 
 export type MessageCreateOptions = RequestOptions & {
-  mode?: "deterministic" | "agent";
+  mode?: "deterministic" | "agent" | "workflow_task_continuation";
 };
 
 export type StreamOptions = RequestOptions & {
@@ -471,6 +479,58 @@ export class BackendClient {
       responseSchema: BotProposalConfirmStartResponseSchema,
       ...createOperationOptions(options),
     });
+  }
+
+  listWorkflowTasks(conversationId: string): Promise<WorkflowTaskListResponse> {
+    return this.request(`/v1/conversations/${encodePath(conversationId)}/workflow-tasks`, {
+      responseSchema: WorkflowTaskListResponseSchema,
+    });
+  }
+
+  submitWorkflowTaskResponse(
+    taskId: string,
+    payload: WorkflowTaskResponseRequest,
+    options: RequestOptions = {}
+  ): Promise<WorkflowTask> {
+    return this.request(`/v1/workflow-tasks/${encodePath(taskId)}/responses`, {
+      method: "POST",
+      body: WorkflowTaskResponseRequestSchema.parse(payload),
+      responseSchema: WorkflowTaskSchema,
+      ...createOperationOptions(options),
+    });
+  }
+
+  streamWorkflowTaskContinuation(
+    taskId: string,
+    payload: WorkflowTaskContinuationRequest,
+    options: RequestOptions = {}
+  ): Promise<Response> {
+    return this.streamRequest(
+      `/v1/workflow-tasks/${encodePath(taskId)}/continuations?stream=true`,
+      {
+        method: "POST",
+        body: WorkflowTaskContinuationRequestSchema.parse(payload),
+        signal: options.signal,
+        ...createOperationOptions(options),
+      }
+    );
+  }
+
+  submitWorkflowTaskAction(
+    taskId: string,
+    actionId: string,
+    payload: WorkflowTaskResponseRequest = { values: {}, status: "approved" },
+    options: RequestOptions = {}
+  ): Promise<WorkflowTask> {
+    return this.request(
+      `/v1/workflow-tasks/${encodePath(taskId)}/actions/${encodePath(actionId)}`,
+      {
+        method: "POST",
+        body: WorkflowTaskResponseRequestSchema.parse(payload),
+        responseSchema: WorkflowTaskSchema,
+        ...createOperationOptions(options),
+      }
+    );
   }
 
   startNautilusRuntime(

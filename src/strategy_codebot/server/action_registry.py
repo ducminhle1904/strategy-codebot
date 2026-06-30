@@ -21,14 +21,22 @@ class ActionRegistryEntry:
     artifact_kind: str | None = None
     backend_tool: bool = True
     presentation: dict[str, str] | None = None
+    requires_artifacts: tuple[str, ...] = ()
+    requires_context_signals: tuple[str, ...] = ()
+    requires_workflow_state: tuple[str, ...] = ()
+    required_inputs: tuple[str, ...] = ()
+    disabled_reason_code: str | None = None
+    direct_execution_allowed: bool | None = None
 
     def payload(
         self,
         *,
         available: bool,
         disabled_reason: str | None = None,
+        disabled_reason_code: str | None = None,
         required_inputs: list[str] | None = None,
         risk_level: str | None = None,
+        requirements: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "id": self.action_id,
@@ -44,13 +52,66 @@ class ActionRegistryEntry:
                 risk_level=risk_level or self.risk_level,
             ),
         }
+        if self.direct_execution_allowed is not None:
+            payload["direct_execution_allowed"] = self.direct_execution_allowed
         if self.artifact_kind:
             payload["artifact_kind"] = self.artifact_kind
         if disabled_reason:
             payload["disabled_reason"] = disabled_reason
+        if disabled_reason_code:
+            payload["disabled_reason_code"] = disabled_reason_code
         if required_inputs:
             payload["required_inputs"] = required_inputs
+        if requirements:
+            payload["requirements"] = requirements
         return payload
+
+
+@dataclass(frozen=True)
+class ActionEvidencePacket:
+    artifact_kinds: frozenset[str]
+    context_signals: frozenset[str]
+    web_search: str
+    required_inputs_by_tool: dict[str, tuple[str, ...]]
+    lexical_hints: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class ActionAvailabilityResult:
+    available: bool
+    disabled_reason: str | None = None
+    disabled_reason_code: str | None = None
+    required_inputs: tuple[str, ...] = ()
+    risk_level: str | None = None
+
+
+@dataclass
+class ActionRegistryEvaluation:
+    payload: list[dict[str, Any]]
+    available_tool_ids: set[str]
+
+
+class ActionRegistryRequestCache:
+    def __init__(self) -> None:
+        self._cache: dict[tuple[frozenset[str], str, str], ActionRegistryEvaluation] = {}
+
+    def get(
+        self,
+        *,
+        artifact_kinds: set[str],
+        context_text: str,
+        web_search: str,
+    ) -> ActionRegistryEvaluation:
+        key = (frozenset(artifact_kinds), context_text, web_search)
+        evaluation = self._cache.get(key)
+        if evaluation is None:
+            evaluation = evaluate_action_registry(
+                artifact_kinds=artifact_kinds,
+                context_text=context_text,
+                web_search=web_search,
+            )
+            self._cache[key] = evaluation
+        return evaluation
 
 
 ACTION_REGISTRY: tuple[ActionRegistryEntry, ...] = (
@@ -212,21 +273,122 @@ ACTION_REGISTRY: tuple[ActionRegistryEntry, ...] = (
 )
 
 
+_ACTION_REQUIREMENTS: dict[str, dict[str, tuple[str, ...] | str]] = {
+    "market_research": {
+        "requires_context_signals": ("web_search_enabled",),
+        "disabled_reason_code": "web_search_disabled",
+    },
+    "repair": {
+        "requires_context_signals": ("validation_problem",),
+        "disabled_reason_code": "validation_problem_required",
+    },
+    "create_proposed_intent": {
+        "requires_context_signals": ("bot_boundary_request",),
+        "blocked_by_context_signals": ("has_proposed_intent",),
+        "disabled_reason_code": "bot_boundary_required",
+    },
+    "run_risk_gate": {
+        "requires_any_context_signal": ("bot_boundary_request", "has_proposed_intent", "has_strategy_artifact"),
+        "blocked_by_context_signals": ("has_risk_gate",),
+        "disabled_reason_code": "risk_gate_context_required",
+    },
+    "draft_bot": {
+        "requires_context_signals": ("bot_boundary_request", "has_strategy_artifact"),
+        "disabled_reason_code": "strategy_artifact_and_bot_request_required",
+    },
+    "review_bot_setup": {
+        "requires_context_signals": ("bot_context",),
+        "disabled_reason_code": "bot_context_required",
+    },
+    "get_bot_status": {
+        "requires_context_signals": ("bot_context",),
+        "disabled_reason_code": "bot_context_required",
+    },
+    "stop_bot_requires_confirmation": {
+        "requires_context_signals": ("bot_context",),
+        "disabled_reason_code": "bot_context_required",
+    },
+    "query_backtest_trades": {
+        "requires_context_signals": ("has_backtest_report",),
+        "disabled_reason_code": "backtest_report_required",
+    },
+    "get_backtest_summary": {
+        "requires_context_signals": ("has_backtest_report",),
+        "disabled_reason_code": "backtest_report_required",
+    },
+    "build_robustness_report": {
+        "requires_context_signals": ("has_backtest_report",),
+        "blocked_by_context_signals": ("has_robustness_report",),
+        "disabled_reason_code": "backtest_report_required",
+    },
+    "run_backtest_preview": {
+        "requires_any_context_signal": ("has_strategy_artifact", "has_backtest_config"),
+        "blocked_by_context_signals": ("has_backtest_report",),
+        "disabled_reason_code": "strategy_artifact_or_backtest_config_required",
+    },
+    "run_backtest_variant_lab": {
+        "requires_any_context_signal": ("has_strategy_artifact", "has_backtest_report", "has_backtest_config"),
+        "disabled_reason_code": "strategy_artifact_or_backtest_context_required",
+    },
+    "review_risk": {
+        "requires_any_context_signal": ("has_strategy_artifact", "has_backtest_report"),
+        "disabled_reason_code": "strategy_or_backtest_required",
+    },
+}
+
+
 def action_registry_payload(
     *,
     artifact_kinds: set[str],
     context_text: str,
     web_search: str,
+    context_signals: set[str] | None = None,
+    risk_gate_inputs: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    return [
-        entry.payload(
-            available=_action_available(entry, artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search),
-            disabled_reason=_disabled_reason(entry, artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search),
-            required_inputs=_required_inputs(entry, context_text=context_text),
-            risk_level=_risk_level(entry, context_text=context_text),
+    evidence = build_action_evidence_packet(
+        artifact_kinds=artifact_kinds,
+        context_text=context_text,
+        web_search=web_search,
+        context_signals=context_signals,
+        risk_gate_inputs=risk_gate_inputs,
+    )
+    payloads: list[dict[str, Any]] = []
+    for entry in ACTION_REGISTRY:
+        result = evaluate_action_availability(entry, evidence=evidence)
+        payloads.append(
+            entry.payload(
+                available=result.available,
+                disabled_reason=result.disabled_reason,
+                disabled_reason_code=result.disabled_reason_code,
+                required_inputs=list(result.required_inputs),
+                risk_level=result.risk_level,
+                requirements=_action_requirements_payload(entry),
+            )
         )
-        for entry in ACTION_REGISTRY
-    ]
+    return payloads
+
+
+def evaluate_action_registry(
+    *,
+    artifact_kinds: set[str],
+    context_text: str,
+    web_search: str,
+    context_signals: set[str] | None = None,
+    risk_gate_inputs: set[str] | None = None,
+) -> ActionRegistryEvaluation:
+    payload = action_registry_payload(
+        artifact_kinds=artifact_kinds,
+        context_text=context_text,
+        web_search=web_search,
+        context_signals=context_signals,
+        risk_gate_inputs=risk_gate_inputs,
+    )
+    available_tool_ids = {
+        str(item.get("tool_id"))
+        for item in payload
+        if item.get("available") is True and isinstance(item.get("tool_id"), str)
+    }
+    return ActionRegistryEvaluation(payload=payload, available_tool_ids=available_tool_ids)
 
 
 def action_registry_tool_ids() -> set[str]:
@@ -268,12 +430,135 @@ def _default_action_presentation(entry: ActionRegistryEntry, *, risk_level: str)
     }
 
 
-def available_registry_tool_ids(*, artifact_kinds: set[str], context_text: str, web_search: str) -> set[str]:
+def available_registry_tool_ids(
+    *,
+    artifact_kinds: set[str],
+    context_text: str,
+    web_search: str,
+    context_signals: set[str] | None = None,
+    risk_gate_inputs: set[str] | None = None,
+) -> set[str]:
+    return evaluate_action_registry(
+        artifact_kinds=artifact_kinds,
+        context_text=context_text,
+        web_search=web_search,
+        context_signals=context_signals,
+        risk_gate_inputs=risk_gate_inputs,
+    ).available_tool_ids
+
+
+def build_action_evidence_packet(
+    *,
+    artifact_kinds: set[str],
+    context_text: str,
+    web_search: str,
+    context_signals: set[str] | None = None,
+    risk_gate_inputs: set[str] | None = None,
+) -> ActionEvidencePacket:
+    signals: set[str] = set(context_signals or set())
+    if web_search != "off":
+        signals.add("web_search_enabled")
+    if _has_backtest_report(artifact_kinds):
+        signals.add("has_backtest_report")
+    if ROBUSTNESS_REPORT_ARTIFACT_KIND in artifact_kinds:
+        signals.add("has_robustness_report")
+    if any(kind in artifact_kinds for kind in {"pine_file", "strategy_spec", "backtest_plan"}):
+        signals.add("has_strategy_artifact")
+    if PROPOSED_ORDER_INTENT_ARTIFACT_KIND in artifact_kinds:
+        signals.add("has_proposed_intent")
+    if RISK_GATE_REPORT_ARTIFACT_KIND in artifact_kinds:
+        signals.add("has_risk_gate")
+    lexical_hints = _action_lexical_hints(context_text)
+    return ActionEvidencePacket(
+        artifact_kinds=frozenset(artifact_kinds),
+        context_signals=frozenset(signals),
+        web_search=web_search,
+        required_inputs_by_tool={"run_risk_gate": tuple(_risk_gate_required_inputs(risk_gate_inputs))},
+        lexical_hints=frozenset(lexical_hints),
+    )
+
+
+def evaluate_action_availability(entry: ActionRegistryEntry, *, evidence: ActionEvidencePacket) -> ActionAvailabilityResult:
+    requirements = _ACTION_REQUIREMENTS.get(entry.tool_id, {})
+    required_signals = _tuple_requirement(requirements, "requires_context_signals")
+    missing_signals = [signal for signal in required_signals if signal not in evidence.context_signals]
+    any_signals = _tuple_requirement(requirements, "requires_any_context_signal")
+    missing_any_signal = bool(any_signals) and not any(signal in evidence.context_signals for signal in any_signals)
+    blocked_signals = [
+        signal for signal in _tuple_requirement(requirements, "blocked_by_context_signals") if signal in evidence.context_signals
+    ]
+    required_inputs = evidence.required_inputs_by_tool.get(entry.tool_id, ())
+    reason_code = str(requirements.get("disabled_reason_code") or "required_context_missing")
+    if required_inputs:
+        return ActionAvailabilityResult(
+            available=False,
+            disabled_reason=_disabled_reason_for_code("missing_required_inputs"),
+            disabled_reason_code="missing_required_inputs",
+            required_inputs=required_inputs,
+            risk_level="blocked",
+        )
+    if missing_signals or missing_any_signal or blocked_signals:
+        if blocked_signals:
+            reason_code = _blocked_signal_reason_code(blocked_signals[0])
+        return ActionAvailabilityResult(
+            available=False,
+            disabled_reason=_disabled_reason_for_code(reason_code),
+            disabled_reason_code=reason_code,
+        )
+    return ActionAvailabilityResult(available=True)
+
+
+def _action_requirements_payload(entry: ActionRegistryEntry) -> dict[str, Any] | None:
+    requirements = _ACTION_REQUIREMENTS.get(entry.tool_id)
+    if not requirements:
+        return None
+    payload: dict[str, Any] = {}
+    for key in ("requires_context_signals", "requires_any_context_signal", "blocked_by_context_signals"):
+        values = _tuple_requirement(requirements, key)
+        if values:
+            payload[key] = list(values)
+    if entry.requires_artifacts:
+        payload["requires_artifacts"] = list(entry.requires_artifacts)
+    if entry.requires_workflow_state:
+        payload["requires_workflow_state"] = list(entry.requires_workflow_state)
+    return payload or None
+
+
+def _tuple_requirement(requirements: dict[str, tuple[str, ...] | str], key: str) -> tuple[str, ...]:
+    value = requirements.get(key, ())
+    return value if isinstance(value, tuple) else ()
+
+
+def _blocked_signal_reason_code(signal: str) -> str:
+    if signal == "has_proposed_intent":
+        return "proposed_intent_exists"
+    if signal == "has_risk_gate":
+        return "risk_gate_exists"
+    if signal == "has_robustness_report":
+        return "robustness_report_exists"
+    if signal == "has_backtest_report":
+        return "backtest_report_exists"
+    return "blocked_by_existing_context"
+
+
+def _disabled_reason_for_code(reason_code: str) -> str:
     return {
-        entry.tool_id
-        for entry in ACTION_REGISTRY
-        if _action_available(entry, artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search)
-    }
+        "web_search_disabled": "Web search is disabled.",
+        "validation_problem_required": "A static validation problem is required.",
+        "bot_boundary_required": "A bot or order-intent review prompt is required.",
+        "proposed_intent_exists": "A proposed intent already exists.",
+        "risk_gate_context_required": "A proposed intent or strategy artifact is required.",
+        "risk_gate_exists": "A Risk Gate report already exists.",
+        "strategy_artifact_and_bot_request_required": "A strategy artifact and Bot request are required.",
+        "bot_context_required": "A Bot context is required.",
+        "backtest_report_required": "A completed backtest report is required.",
+        "robustness_report_exists": "A robustness report already exists.",
+        "strategy_artifact_or_backtest_config_required": "A strategy artifact or backtest config is required.",
+        "backtest_report_exists": "A completed backtest report already exists.",
+        "strategy_artifact_or_backtest_context_required": "A strategy artifact or backtest context is required.",
+        "strategy_or_backtest_required": "A strategy artifact or completed backtest report is required.",
+        "missing_required_inputs": "Required Risk Gate inputs are missing.",
+    }.get(reason_code, "Required context is not available.")
 
 
 def _action_available(
@@ -283,38 +568,8 @@ def _action_available(
     context_text: str,
     web_search: str,
 ) -> bool:
-    has_backtest_report = _has_backtest_report(artifact_kinds, context_text)
-    has_robustness_report = ROBUSTNESS_REPORT_ARTIFACT_KIND in artifact_kinds
-    has_strategy_artifact = any(kind in artifact_kinds for kind in {"pine_file", "strategy_spec", "backtest_plan"})
-    has_backtest_config = "backtest_config" in context_text.lower() or "backtest config" in context_text.lower()
-    has_proposed_intent = PROPOSED_ORDER_INTENT_ARTIFACT_KIND in artifact_kinds or "proposed intent" in context_text.lower()
-    has_risk_gate = RISK_GATE_REPORT_ARTIFACT_KIND in artifact_kinds or "risk gate" in context_text.lower()
-    bot_boundary_prompt = _is_bot_boundary_request(context_text)
-    if entry.tool_id == "market_research":
-        return web_search != "off"
-    if entry.tool_id == "repair":
-        return _has_validation_problem(context_text)
-    if entry.tool_id == "create_proposed_intent":
-        return bot_boundary_prompt and not has_proposed_intent
-    if entry.tool_id == "run_risk_gate":
-        return (bot_boundary_prompt or has_proposed_intent or has_strategy_artifact) and not has_risk_gate and not _risk_gate_required_inputs(context_text)
-    if entry.tool_id == "draft_bot":
-        return bot_boundary_prompt and has_strategy_artifact
-    if entry.tool_id in {"review_bot_setup", "get_bot_status", "stop_bot_requires_confirmation"}:
-        return "bot" in context_text.lower() or "runtime" in context_text.lower()
-    if entry.tool_id == "review_assumptions":
-        return True
-    if entry.tool_id in {"query_backtest_trades", "get_backtest_summary"}:
-        return has_backtest_report
-    if entry.tool_id == "build_robustness_report":
-        return has_backtest_report and not has_robustness_report
-    if entry.tool_id == "run_backtest_preview":
-        return (has_strategy_artifact or has_backtest_config) and not has_backtest_report
-    if entry.tool_id == "run_backtest_variant_lab":
-        return has_strategy_artifact or has_backtest_report or has_backtest_config
-    if entry.tool_id == "review_risk":
-        return has_strategy_artifact or has_backtest_report
-    return True
+    evidence = build_action_evidence_packet(artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search)
+    return evaluate_action_availability(entry, evidence=evidence).available
 
 
 def _disabled_reason(
@@ -324,66 +579,57 @@ def _disabled_reason(
     context_text: str,
     web_search: str,
 ) -> str | None:
-    if _action_available(entry, artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search):
-        return None
-    if entry.tool_id == "market_research":
-        return "Web search is disabled."
-    if entry.tool_id == "repair":
-        return "A static validation problem is required."
-    if entry.tool_id == "create_proposed_intent":
-        return "A bot or order-intent review prompt is required."
-    if entry.tool_id == "run_risk_gate":
-        required = _risk_gate_required_inputs(context_text)
-        if required:
-            return "Required Risk Gate inputs are missing."
-        return "A proposed intent or strategy artifact is required."
-    if entry.tool_id == "draft_bot":
-        return "A strategy artifact and Bot request are required."
-    if entry.tool_id in {"review_bot_setup", "get_bot_status", "stop_bot_requires_confirmation"}:
-        return "A Bot context is required."
-    if entry.tool_id in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report"}:
-        return "A completed backtest report is required."
-    if entry.tool_id == "run_backtest_preview":
-        return "A strategy artifact or backtest config is required."
-    return "Required context is not available."
+    evidence = build_action_evidence_packet(artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search)
+    return evaluate_action_availability(entry, evidence=evidence).disabled_reason
 
 
-def _has_backtest_report(artifact_kinds: set[str], context_text: str) -> bool:
-    return bool(
-        artifact_kinds.intersection({BACKTEST_REPORT_ARTIFACT_KIND, BACKTEST_RUN_METADATA_ARTIFACT_KIND, "backtest_dashboard"})
-        or "backtest report" in context_text.lower()
-    )
+def _has_backtest_report(artifact_kinds: set[str]) -> bool:
+    return bool(artifact_kinds.intersection({BACKTEST_REPORT_ARTIFACT_KIND, BACKTEST_RUN_METADATA_ARTIFACT_KIND, "backtest_dashboard"}))
 
 
 def _required_inputs(entry: ActionRegistryEntry, *, context_text: str) -> list[str] | None:
-    if entry.tool_id == "run_risk_gate":
-        return _risk_gate_required_inputs(context_text)
-    return None
+    evidence = build_action_evidence_packet(artifact_kinds=set(), context_text=context_text, web_search="auto")
+    required_inputs = evaluate_action_availability(entry, evidence=evidence).required_inputs
+    return list(required_inputs) if required_inputs else None
 
 
 def _risk_level(entry: ActionRegistryEntry, *, context_text: str) -> str | None:
-    if entry.tool_id == "run_risk_gate" and _risk_gate_required_inputs(context_text):
-        return "blocked"
-    return None
+    evidence = build_action_evidence_packet(artifact_kinds=set(), context_text=context_text, web_search="auto")
+    return evaluate_action_availability(entry, evidence=evidence).risk_level
 
 
-def _has_validation_problem(context_text: str) -> bool:
+def _validation_problem_lexical_hint(context_text: str) -> bool:
     normalized = context_text.lower()
     return any(term in normalized for term in ("validation failed", "static validation failed", "compile error", "validation blocker"))
 
 
-def _is_bot_boundary_request(context_text: str) -> bool:
+def _bot_boundary_lexical_hint(context_text: str) -> bool:
     normalized = context_text.lower()
     return any(term in normalized for term in ("bot", "order", "signal", "trade live", "live trade", "paper trade", "intent"))
 
 
-def _risk_gate_required_inputs(context_text: str) -> list[str]:
+def _action_lexical_hints(context_text: str) -> set[str]:
     normalized = context_text.lower()
+    hints: set[str] = set()
+    if "backtest_config" in normalized or "backtest config" in normalized:
+        hints.add("has_backtest_config")
+    if "proposed intent" in normalized:
+        hints.add("has_proposed_intent")
+    if "risk gate" in normalized:
+        hints.add("has_risk_gate")
+    if _bot_boundary_lexical_hint(context_text):
+        hints.add("bot_boundary_request")
+    if "bot" in normalized or "runtime" in normalized:
+        hints.add("bot_context")
+    if _validation_problem_lexical_hint(context_text):
+        hints.add("validation_problem")
+    return hints
+
+
+def _risk_gate_required_inputs(risk_gate_inputs: set[str] | None) -> list[str]:
+    provided = set(risk_gate_inputs or set())
     required: list[str] = []
-    if not any(term in normalized for term in ("stop", "invalidation", "stop-loss", "stop loss")):
-        required.append("stop_or_invalidation")
-    if not any(term in normalized for term in ("size", "sizing", "risk 1", "risk per trade", "position")):
-        required.append("sizing")
-    if not any(term in normalized for term in ("stale", "expire", "valid for", "timeout")):
-        required.append("stale_after")
+    for field in ("stop_or_invalidation", "sizing", "stale_after"):
+        if field not in provided:
+            required.append(field)
     return required

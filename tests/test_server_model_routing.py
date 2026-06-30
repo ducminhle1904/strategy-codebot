@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+import time
 
 import pytest
 
@@ -7,6 +8,7 @@ from strategy_codebot.server.llm_clients import ProviderConfigurationError
 from strategy_codebot.server.llm_clients import ProviderTimeoutError
 from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
 from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
+from strategy_codebot.server.model_routing import MODEL_STAGE_STRATEGY_CODING
 from strategy_codebot.server.model_routing import PROVIDER_ROUTE_EVENT
 from strategy_codebot.server.model_routing import RegistryRoutedLLMClient
 from strategy_codebot.server.model_routing import load_model_registry
@@ -59,6 +61,23 @@ def test_route_resolver_returns_registry_order() -> None:
     ]
 
 
+def test_route_resolver_accepts_strategy_coding_stage_metadata() -> None:
+    registry = {
+        "model_tiers": {
+            "paid_low": {
+                "routes_by_stage": {
+                    DEFAULT_MODEL_STAGE: ["litellm_proxy/paid_low.strategy_reasoning"],
+                    MODEL_STAGE_STRATEGY_CODING: ["litellm_proxy/paid_low.strategy_coding"],
+                }
+            }
+        }
+    }
+
+    assert resolve_routes(registry, tier="paid.low", stage=MODEL_STAGE_STRATEGY_CODING) == [
+        "litellm_proxy/paid_low.strategy_coding"
+    ]
+
+
 def test_route_resolver_falls_back_to_strategy_reasoning_stage() -> None:
     registry = {
         "model_tiers": {
@@ -83,12 +102,14 @@ class FakeRouteClient:
         error: Exception | None = None,
         events: list[LLMClientEvent] | None = None,
         stream_error: Exception | None = None,
+        delay_seconds: float = 0.0,
     ) -> None:
         self.route = route
         self.model = route.removeprefix("openrouter/").removeprefix("litellm_proxy/")
         self.error = error
         self.events = events
         self.stream_error = stream_error
+        self.delay_seconds = delay_seconds
 
     def ensure_configured(self) -> None:
         if self.error is not None:
@@ -101,6 +122,8 @@ class FakeRouteClient:
         tools: list[dict],
         routing_context: dict | None = None,
     ) -> Iterable[LLMClientEvent]:
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)
         if self.stream_error is not None:
             raise self.stream_error
         if self.events is not None:
@@ -183,6 +206,47 @@ model_tiers:
     assert events[1].arguments["provider_route"] == "openrouter/working-model"
     assert events[1].arguments["fallback_used"] is True
     assert events[1].arguments["fallback_attempts"][0]["error"] == "ProviderTimeoutError"
+
+
+def test_registry_client_hard_route_timeout_falls_back_when_route_hangs(tmp_path) -> None:
+    registry_path = tmp_path / "registry.yaml"
+    registry_path.write_text(
+        """
+model_tiers:
+  free:
+    routes_by_stage:
+      classifier:
+        - openrouter/slow-classifier
+        - openrouter/working-classifier
+""",
+        encoding="utf-8",
+    )
+
+    def factory(route: str, *, timeout_seconds: float | None = None) -> FakeRouteClient:
+        if route == "openrouter/slow-classifier":
+            return FakeRouteClient(route, delay_seconds=0.05)
+        return FakeRouteClient(route)
+
+    client = RegistryRoutedLLMClient(registry_path=registry_path, client_factory=factory)
+
+    events = list(
+        client.stream(
+            messages=[{"role": "user", "content": "classify"}],
+            tools=[],
+            routing_context={
+                "user_tier": "free",
+                "stage": "classifier",
+                "route_timeout_seconds": 0.01,
+                "hard_route_timeout": True,
+            },
+        )
+    )
+
+    route_events = [event for event in events if event.type == PROVIDER_ROUTE_EVENT]
+    assert route_events[0].arguments["provider_route"] == "openrouter/slow-classifier"
+    assert route_events[1].arguments["provider_route"] == "openrouter/working-classifier"
+    assert route_events[1].arguments["fallback_used"] is True
+    assert route_events[1].arguments["fallback_attempts"][0]["error"] == "ProviderTimeoutError"
 
 
 def test_registry_client_falls_back_on_quota_api_error_without_status(tmp_path) -> None:

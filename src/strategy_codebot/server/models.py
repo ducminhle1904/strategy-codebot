@@ -149,6 +149,37 @@ class RunEvent(TenantMixin, Base):
     payload_json: Mapped[dict | None] = mapped_column(JSON)
 
 
+class WorkflowTask(TenantMixin, Base):
+    __tablename__ = "workflow_tasks"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "workflow_id",
+            "task_template_id",
+            name="uq_workflow_tasks_conversation_template",
+        ),
+        Index("ix_workflow_tasks_workspace_owner", "workspace_id", "owner_user_id"),
+        Index("ix_workflow_tasks_conversation_status", "conversation_id", "status"),
+        CheckConstraint(
+            "status IN ('pending_user','blocked','completed','approved','rejected','cancelled')",
+            name="ck_workflow_tasks_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversation_threads.id"), nullable=False, index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("assistant_runs.id"), index=True)
+    workflow_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    task_template_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    step_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    kind: Mapped[str] = mapped_column(String(80), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending_user")
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    response_json: Mapped[dict | None] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class RunJob(TenantMixin, Base):
     __tablename__ = "run_jobs"
     __table_args__ = (

@@ -1,5 +1,8 @@
 import os
+import inspect
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,8 @@ from strategy_codebot.server.llm_clients import ProviderTimeoutError
 from strategy_codebot.server.llm_clients import ResponsesClient
 
 DEFAULT_MODEL_STAGE = "strategy_reasoning"
+MODEL_STAGE_CLASSIFIER = "classifier"
+MODEL_STAGE_STRATEGY_CODING = "strategy_coding"
 MODEL_STAGE_PINE_CODE_GENERATION = "pine_code_generation"
 MODEL_STAGE_BALANCED_REVIEW = "balanced_review"
 MODEL_STAGE_REPAIR = "repair"
@@ -47,7 +52,7 @@ class ModelRouteUnavailable(ProviderConfigurationError):
     pass
 
 
-ClientFactory = Callable[[str], LLMClient]
+ClientFactory = Callable[..., LLMClient]
 
 
 def model_registry_path_from_env() -> Path:
@@ -103,9 +108,9 @@ def gateway_env_report() -> dict[str, Any]:
     return {"available_gateways": available, "missing_gateway_envs": missing}
 
 
-def default_route_client_factory(route: str) -> LLMClient:
+def default_route_client_factory(route: str, *, timeout_seconds: float | None = None) -> LLMClient:
     provider, model = _split_route(route)
-    timeout_seconds = _route_timeout_seconds()
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else _route_timeout_seconds()
     if provider == "litellm_proxy":
         return ChatCompletionsClient(
             model=model,
@@ -174,12 +179,18 @@ class RegistryRoutedLLMClient:
         routes = resolve_routes(registry, tier=tier, stage=stage)
         if not routes:
             raise ProviderConfigurationError(f"No model routes configured for tier={tier} stage={stage}")
+        route_timeout_seconds = _route_timeout_seconds_from_context(context)
+        hard_route_timeout = context.get("hard_route_timeout") is True
 
         failures: list[dict[str, Any]] = []
         for attempt_index, route in enumerate(routes):
             client: LLMClient
             try:
-                client = self._client_factory(route)
+                client = _create_route_client(
+                    self._client_factory,
+                    route,
+                    timeout_seconds=route_timeout_seconds,
+                )
                 client.ensure_configured()
             except Exception as exc:
                 if not _is_fallbackable_provider_error(exc):
@@ -205,7 +216,18 @@ class RegistryRoutedLLMClient:
             yield LLMClientEvent(type=PROVIDER_ROUTE_EVENT, arguments=route_payload, model=client.model)
             emitted_provider_content = False
             try:
-                for event in client.stream(messages=messages, tools=tools, routing_context=context):
+                events = (
+                    _stream_with_hard_route_timeout(
+                        client,
+                        messages=messages,
+                        tools=tools,
+                        routing_context=context,
+                        timeout_seconds=route_timeout_seconds,
+                    )
+                    if hard_route_timeout and route_timeout_seconds is not None
+                    else client.stream(messages=messages, tools=tools, routing_context=context)
+                )
+                for event in events:
                     emitted_provider_content = True
                     yield _with_route_metadata(event, route_payload)
                 return
@@ -221,6 +243,26 @@ class RegistryRoutedLLMClient:
                 )
                 continue
         raise ProviderConfigurationError(f"All model routes failed for tier={tier} stage={stage}: {failures}")
+
+
+def _stream_with_hard_route_timeout(
+    client: LLMClient,
+    *,
+    messages: list[dict[str, str]],
+    tools: list[dict[str, Any]],
+    routing_context: dict[str, Any],
+    timeout_seconds: float,
+) -> list[LLMClientEvent]:
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-route")
+    future = executor.submit(
+        lambda: list(client.stream(messages=messages, tools=tools, routing_context=routing_context))
+    )
+    try:
+        return future.result(timeout=timeout_seconds)
+    except FutureTimeoutError as exc:
+        raise ProviderTimeoutError(f"Provider route timed out after {timeout_seconds:.3f}s") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _with_route_metadata(event: LLMClientEvent, route_payload: dict[str, Any]) -> LLMClientEvent:
@@ -284,6 +326,39 @@ def _route_timeout_seconds() -> float | None:
     except ValueError:
         return DEFAULT_ROUTE_TIMEOUT_SECONDS
     return timeout if timeout > 0 else DEFAULT_ROUTE_TIMEOUT_SECONDS
+
+
+def _route_timeout_seconds_from_context(context: dict[str, Any]) -> float | None:
+    raw = context.get("route_timeout_seconds")
+    if raw is None:
+        return None
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout > 0 else None
+
+
+def _create_route_client(
+    client_factory: ClientFactory,
+    route: str,
+    *,
+    timeout_seconds: float | None,
+) -> LLMClient:
+    if timeout_seconds is None or not _client_factory_accepts_timeout_seconds(client_factory):
+        return client_factory(route)
+    return client_factory(route, timeout_seconds=timeout_seconds)
+
+
+def _client_factory_accepts_timeout_seconds(client_factory: ClientFactory) -> bool:
+    try:
+        parameters = inspect.signature(client_factory).parameters
+    except (TypeError, ValueError):
+        return True
+    timeout_parameter = parameters.get("timeout_seconds")
+    return timeout_parameter is not None or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
 
 
 def _repo_root() -> Path:

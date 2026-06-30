@@ -6,10 +6,14 @@ from typing import Any
 from strategy_codebot.server.workflow_registry_contract import WORKFLOW_COMPONENT_KINDS
 from strategy_codebot.server.workflow_registry_contract import WORKFLOW_DEFINITIONS
 from strategy_codebot.server.workflow_registry_contract import WORKFLOW_SCHEMA_VERSION
+from strategy_codebot.server.workflow_tasks import normalize_workflow_tasks
+from strategy_codebot.server.workflow_tasks import workflow_task_input_requests
+from strategy_codebot.server.workflow_tasks import workflow_task_values
 
 STRATEGY_BOT_WORKFLOW_ID = "strategy_bot_simulation"
 STRATEGY_BOT_WORKFLOW = WORKFLOW_DEFINITIONS[STRATEGY_BOT_WORKFLOW_ID]
 STRATEGY_BOT_WORKFLOW_STEPS = tuple(STRATEGY_BOT_WORKFLOW["steps"])
+STRATEGY_BOT_OPTIONAL_STEPS = frozenset(STRATEGY_BOT_WORKFLOW.get("optional_steps", []))
 STRATEGY_BOT_INPUT_FIELDS = tuple(
     section["fields"]
     for section in STRATEGY_BOT_WORKFLOW["sections"]
@@ -56,6 +60,8 @@ def validate_workflow_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
 
     allowed_fields = set(definition["allowed_fields"])
     completed_steps = [step for step in _string_list(payload.get("completed_steps")) if step in step_ids]
+    skipped_steps = _skipped_steps(payload.get("skipped_steps"), definition, completed_steps, current_step)
+    step_reasons = _step_reasons(payload.get("step_reasons"), skipped_steps)
     required_fields = [field for field in _string_list(payload.get("required_fields")) if field in allowed_fields]
     missing_fields = [field for field in _string_list(payload.get("missing_fields")) if field in allowed_fields]
     artifact_refs = _string_dict(payload.get("artifact_refs"))
@@ -78,6 +84,13 @@ def validate_workflow_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         bot_proposal_id,
         current_step,
     )
+    tasks = normalize_workflow_tasks(
+        workflow_id,
+        payload.get("tasks"),
+        start_allowed=start_allowed,
+        bot_proposal_id=bot_proposal_id,
+    )
+    input_requests = workflow_task_input_requests(workflow_id, payload.get("input_requests"), tasks)
 
     return {
         "schema_version": WORKFLOW_SCHEMA_VERSION,
@@ -85,6 +98,8 @@ def validate_workflow_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         "intent": definition["intent"],
         "current_step": current_step,
         "completed_steps": completed_steps,
+        "skipped_steps": skipped_steps,
+        "step_reasons": step_reasons,
         "blocked_reason": _safe_string(payload.get("blocked_reason")),
         "required_fields": required_fields,
         "missing_fields": missing_fields,
@@ -92,6 +107,9 @@ def validate_workflow_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         "status": deepcopy(status),
         "actions": _actions(payload.get("actions"), definition, start_allowed, bot_proposal_id),
         "sections": _sections(payload.get("sections"), definition),
+        "tasks": tasks,
+        "input_requests": input_requests,
+        "task_values": workflow_task_values(workflow_id, payload.get("task_values"), input_requests, tasks),
         # Compatibility fields for existing clients and tests.
         "evidence_status": status["key"],
         "bot_proposal_id": bot_proposal_id,
@@ -134,6 +152,28 @@ def _actions(
             base["disabled_reason"] = disabled_reason
         selected.append(base)
     return selected or defaults
+
+
+def _skipped_steps(
+    value: Any,
+    definition: dict[str, Any],
+    completed_steps: list[str],
+    current_step: str,
+) -> list[str]:
+    requested = set(_string_list(value))
+    completed = set(completed_steps)
+    optional_steps = set(definition.get("optional_steps", []))
+    return [
+        step
+        for step in definition["steps"]
+        if step in requested and step in optional_steps and step not in completed and step != current_step
+    ]
+
+
+def _step_reasons(value: Any, skipped_steps: list[str]) -> dict[str, str]:
+    reasons = _string_dict(value)
+    skipped = set(skipped_steps)
+    return {step: reason for step, reason in reasons.items() if step in skipped}
 
 
 def _start_allowed(

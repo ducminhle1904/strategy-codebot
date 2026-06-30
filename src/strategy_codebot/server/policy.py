@@ -15,6 +15,29 @@ from strategy_codebot.policy_engine import policy_finding_payload as engine_poli
 
 SAFE_BLOCKED_MESSAGE = "I cannot execute that request because it violates the server-side trading policy."
 MARKET_DATA_REQUIRED_FIELDS = frozenset({"timestamp", "source", "symbol", "interval", "timezone"})
+AGENT_LOOP_ALLOWED_RISK_TIERS = frozenset({"read"})
+AGENT_LOOP_BLOCKED_TOOL_TERMS = frozenset(
+    {
+        "broker",
+        "edit",
+        "exec",
+        "filesystem",
+        "file-system",
+        "fs.",
+        "live",
+        "order",
+        "paper-start",
+        "paper.start",
+        "paper_start",
+        "repo-write",
+        "repo.write",
+        "repo_write",
+        "shell",
+        "start-paper",
+        "start_paper",
+        "write",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -58,6 +81,42 @@ def evaluate_policy(subject: PolicySubject) -> PolicyDecision:
     ]
     findings.extend(_market_data_findings(subject))
     return PolicyDecision(allowed=not findings, findings=tuple(findings))
+
+
+def evaluate_agent_loop_tool_policy(tool_id: str, risk_tier: str | None) -> PolicyDecision:
+    normalized_risk = (risk_tier or "unknown").strip().lower()
+    if normalized_risk not in AGENT_LOOP_ALLOWED_RISK_TIERS:
+        return PolicyDecision(
+            allowed=False,
+            findings=(
+                PolicyFinding(
+                    severity="blocker",
+                    code="agent_loop_tool_risk_blocked",
+                    message=f"{tool_id} is blocked by risk tier {normalized_risk}.",
+                    surface="agent_loop.tool",
+                    evidence_level=EVIDENCE_STRATEGY_IDEA,
+                ),
+            ),
+        )
+
+    normalized_id = tool_id.strip().lower().replace("_", "-")
+    matched_term = next((term for term in sorted(AGENT_LOOP_BLOCKED_TOOL_TERMS) if term in normalized_id), "")
+    if matched_term:
+        return PolicyDecision(
+            allowed=False,
+            findings=(
+                PolicyFinding(
+                    severity="blocker",
+                    code="agent_loop_tool_surface_blocked",
+                    message=f"{tool_id} is blocked for bounded scout loops.",
+                    surface="agent_loop.tool",
+                    evidence_level=EVIDENCE_STRATEGY_IDEA,
+                    matched_text=matched_term,
+                ),
+            ),
+        )
+
+    return PolicyDecision(allowed=True)
 
 
 def policy_finding_payload(finding: PolicyFinding) -> dict[str, str]:

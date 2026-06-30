@@ -25,12 +25,32 @@ def test_tool_registry_contracts_are_valid() -> None:
         "knowledge_snapshot",
         "knowledge_diff",
         "knowledge_audit",
+        "knowledge_check",
         "knowledge_proposal",
         "doctor_check",
         "record_harness_trace",
     }
     for tool in registry["tools"]:
         validate_payload(tool, "tool-contract.schema.json")
+
+
+def test_tool_contract_schema_accepts_provider_metadata() -> None:
+    validate_payload(
+        {
+            "id": "canonical_tool",
+            "capability": "example",
+            "risk_tier": "read",
+            "input_schema_ref": "input",
+            "output_schema_ref": "output",
+            "evidence_required": ["evidence"],
+            "phase_status": "implemented",
+            "backend_handler": "provider_tool",
+            "provider_exposed": True,
+            "aliases": ["legacy_provider_tool"],
+            "presentation": {"card_kind": "summary", "tool_name": "Provider tool"},
+        },
+        "tool-contract.schema.json",
+    )
 
 
 def test_tool_contract_schema_rejects_missing_risk_metadata() -> None:
@@ -61,6 +81,46 @@ def test_tool_registry_check_reports_valid_registry() -> None:
 
     assert report["status"] == "pass"
     assert any(check["name"] == "load_strategy_spec:schema" for check in report["checks"])
+
+
+def test_tool_registry_check_rejects_duplicate_provider_names(tmp_path: Path) -> None:
+    registry_path = tmp_path / "tool-registry.yaml"
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "tools": [
+                    {
+                        "id": "first",
+                        "capability": "one",
+                        "risk_tier": "read",
+                        "input_schema_ref": "input",
+                        "output_schema_ref": "output",
+                        "evidence_required": ["evidence"],
+                        "phase_status": "implemented",
+                        "backend_handler": "same_provider_name",
+                        "provider_exposed": True,
+                    },
+                    {
+                        "id": "second",
+                        "capability": "two",
+                        "risk_tier": "read",
+                        "input_schema_ref": "input",
+                        "output_schema_ref": "output",
+                        "evidence_required": ["evidence"],
+                        "phase_status": "implemented",
+                        "backend_handler": "same_provider_name",
+                        "provider_exposed": True,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = check_tool_registry(registry_path)
+
+    assert report["status"] == "fail"
+    assert any(check["name"] == "second:provider_name:same_provider_name" for check in report["checks"])
 
 
 def test_tool_harness_records_started_and_completed_events() -> None:
@@ -117,6 +177,21 @@ def test_tool_harness_records_failed_event() -> None:
 
     assert harness.events[-1]["event_type"] == "tool.failed"
     assert harness.events[-1]["error"]["type"] == "RuntimeError"
+
+
+def test_tool_harness_records_ordered_blocked_and_completed_events() -> None:
+    harness = ToolHarness(run_id="ordered-tool-events")
+
+    harness.record_blocked_tool("unknown_tool", "Tool is not allowed in this loop.", risk_tier="unknown")
+    harness.call("load_strategy_spec", lambda: {"ok": True})
+
+    assert [event["sequence"] for event in harness.events] == [1, 2, 3, 4]
+    assert [event["event_type"] for event in harness.events] == [
+        "tool.started",
+        "tool.blocked",
+        "tool.started",
+        "tool.completed",
+    ]
 
 
 def test_tool_harness_rejects_unknown_tool_id() -> None:

@@ -1,3 +1,57 @@
+selection_aliases:
+  pine:
+    - pine
+    - tradingview
+    - indicator
+    - strategy
+  mql5:
+    - mql5
+    - mt5
+    - metatrader
+    - expert advisor
+    - both-platform
+    - both platform
+  crypto:
+    - crypto
+    - bitcoin
+    - btc
+    - ethereum
+    - eth
+    - altcoin
+    - perpetual
+    - funding
+    - exchange
+  forex:
+    - forex
+    - fx
+    - eurusd
+    - gbpusd
+    - usdjpy
+    - session
+    - london
+    - new york
+    - rollover
+    - spread
+  review:
+    - review
+    - overfit
+    - backtest
+    - optimize
+    - curve
+    - robust
+    - sample size
+    - position sizing
+    - risk gate
+    - invalidation
+    - price action
+    - lesson
+    - postmortem
+  strategy_general:
+    - trend
+    - mean reversion
+    - breakout
+    - volatility
+    - position sizing
 sources:
   - id: tradingview-pine-welcome
     platform: pine_v6

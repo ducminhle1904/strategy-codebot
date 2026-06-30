@@ -38,6 +38,10 @@ export type StrategyChatRuntime = {
   messages: StrategyChatMessage[];
   status: StrategyChatRuntimeStatus;
   clearError: () => void;
+  continueWorkflowTask: (
+    taskId: string,
+    options?: { body?: Record<string, unknown> }
+  ) => Promise<void>;
   regenerate: (options: { body?: Record<string, unknown>; messageId: string }) => Promise<void>;
   sendMessage: (
     message: { text: string },
@@ -658,6 +662,22 @@ function useCopilotKitStrategyRuntime({
   return {
     clearError: () => setStatus(agent.isRunning ? "streaming" : "ready"),
     configuredRuntime: configuredStrategyChatRuntime(),
+    continueWorkflowTask: async (taskId, options) => {
+      setStatus("submitted");
+      const requestBody = options?.body ?? {};
+      const conversationId =
+        typeof requestBody.conversationId === "string"
+          ? requestBody.conversationId
+          : activeConversationId;
+      await runAgent({
+        ...requestBody,
+        conversationId,
+        language,
+        mode: "workflow_task_continuation",
+        webSearch: webSearchMode,
+        workflowTaskId: taskId,
+      });
+    },
     messages: normalizedMessages,
     regenerate: async (options) => {
       setStatus("submitted");

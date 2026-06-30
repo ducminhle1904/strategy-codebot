@@ -129,6 +129,8 @@ def test_live_run_options_defaults_and_legacy_normalization() -> None:
     assert defaults.prompt_profile == live_module.PROMPT_PROFILE_DEFAULT
     assert defaults.web_search == "auto"
     assert defaults.require_web_search is False
+    assert defaults.response_intent is None
+    assert defaults.current_context_required is False
 
     single = normalize_live_options(model_override="openai/test-model", workflow=WORKFLOW_SINGLE, save_raw_provider=True, knowledge_context="off")
     assert single.model_override == "openai/test-model"
@@ -155,22 +157,39 @@ def test_live_run_options_defaults_and_legacy_normalization() -> None:
         LiveRunOptions(web_search="off", require_web_search=True)
 
 
-def test_web_search_auto_gate_runs_only_for_current_info() -> None:
+def test_web_search_auto_gate_uses_semantic_policy_not_keywords() -> None:
     options = LiveRunOptions()
 
     assert live_module._web_search_decision("Create a price action strategy for BTCUSDT", options) == (
         False,
-        "auto_no_current_info_signal",
+        "auto_policy_blocked",
     )
     assert live_module._web_search_decision("Repair Pine syntax and keep the same strategy", options) == (
         False,
-        "auto_no_current_info_signal",
+        "auto_policy_blocked",
     )
     assert live_module._web_search_decision("Check latest OpenRouter docs for web search support", options) == (
-        True,
-        "auto_current_info:latest",
+        False,
+        "auto_policy_blocked",
     )
-    assert live_module._web_search_decision("Find sources for current Binance risk rules", options)[0] is True
+    assert live_module._web_search_decision(
+        "semantic classifier already validated this request",
+        LiveRunOptions(response_intent="market_snapshot", current_context_required=True),
+    ) == (
+        True,
+        "semantic_current_context",
+    )
+    assert live_module._web_search_decision(
+        "semantic classifier did not require current context",
+        LiveRunOptions(response_intent="market_snapshot"),
+    ) == (
+        False,
+        "auto_no_semantic_current_context",
+    )
+    assert live_module._web_search_decision("Find sources for current Binance risk rules", LiveRunOptions(require_web_search=True)) == (
+        True,
+        "required",
+    )
     assert live_module._web_search_decision("Create a price action strategy", LiveRunOptions(web_search="off")) == (
         False,
         "mode_off",
@@ -662,7 +681,9 @@ def test_generate_live_multi_agent_runs_stages_in_order_and_hands_off_context(mo
         "strategy_codebot_pine_code_generation",
         "strategy_codebot_balanced_review",
     ]
-    coding_context = json.loads(calls[1]["messages"][1]["content"])
+    coding_payload = json.loads(calls[1]["messages"][1]["content"])
+    assert coding_payload["response_contract"]["top_level_schema"]["stage"]["const"] == "strategy_coding"
+    coding_context = coding_payload["context"]
     assert "stage_outputs" not in coding_context
     assert coding_context["previous_stage_output"]["stage"] == "strategy_reasoning"
     assert result.workflow == WORKFLOW_MULTI_AGENT
@@ -741,7 +762,12 @@ def test_generate_live_market_research_runs_before_reasoning(monkeypatch: pytest
     result = generate_live(
         "Look up current OpenRouter web search docs and create a Pine strategy",
         Path("configs/model-registry.example.yaml"),
-        live_options=LiveRunOptions(knowledge_context="off", user_tier="paid_low"),
+        live_options=LiveRunOptions(
+            knowledge_context="off",
+            user_tier="paid_low",
+            response_intent="docs_research",
+            current_context_required=True,
+        ),
     )
 
     names = [call["response_format"]["json_schema"]["name"] for call in calls]
@@ -756,7 +782,7 @@ def test_generate_live_market_research_runs_before_reasoning(monkeypatch: pytest
     assert all("tools" not in call for call in calls[1:])
     assert result.market_research["web_search_enabled"] is True
     assert result.market_research["web_search_decision"] == "run"
-    assert result.market_research["web_search_decision_reason"] == "auto_current_info:current"
+    assert result.market_research["web_search_decision_reason"] == "semantic_current_context"
     assert result.market_research["source_count"] == 1
     assert result.workflow_trace["stages"][0]["stage"] == "market_research"
     events = result.workflow_trace["lifecycle_events"]
@@ -1605,6 +1631,21 @@ def test_generate_live_review_failure_runs_repair_loop(monkeypatch: pytest.Monke
     assert "balanced_review" in result.raw_response["stages"]
     assert "balanced_review_2" in result.raw_response["stages"]
     assert "repair_1" in result.raw_response["stages"]
+    summary = result.metadata()["evaluator_optimizer_summary"]
+    assert summary["stop_reason"] == "production_gate_passed"
+    assert summary["repair_count"] == 1
+    assert summary["repair_source_mix"]["llm"] == 1
+    assert summary["final_validation_status"] == "pass"
+    assert summary["final_review_status"] == "pass"
+    assert summary["budget_exhausted"] is False
+    assert result.workflow_trace["final_decision"]["evaluator_optimizer_summary"] == summary
+    evaluator_event = next(
+        event
+        for event in result.workflow_trace["lifecycle_events"]
+        if event["event_type"] == "evaluator_optimizer.summary"
+    )
+    assert evaluator_event["stop_reason"] == "production_gate_passed"
+    assert evaluator_event["repair_count"] == 1
 
 
 def test_generate_live_uses_static_review_when_validation_blocks_before_review(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -1689,6 +1730,21 @@ def test_generate_live_allows_review_warnings_when_static_validation_passes(monk
     assert result.repair_count == 1
     assert result.llm_repair_count == 1
     assert result.repair_budget_exhausted is True
+    summary = result.metadata()["evaluator_optimizer_summary"]
+    assert summary["stop_reason"] == "repair_budget_exhausted"
+    assert summary["repair_count"] == 1
+    assert summary["repair_source_mix"] == {"llm": 1, "deterministic": 0, "unknown": 0}
+    assert summary["final_validation_status"] == "pass"
+    assert summary["final_review_status"] == "needs_fix"
+    assert summary["budget_exhausted"] is True
+    assert result.workflow_trace["final_decision"]["evaluator_optimizer_summary"] == summary
+    evaluator_event = next(
+        event
+        for event in result.workflow_trace["lifecycle_events"]
+        if event["event_type"] == "evaluator_optimizer.summary"
+    )
+    assert evaluator_event["stop_reason"] == "repair_budget_exhausted"
+    assert evaluator_event["budget_exhausted"] is True
     assert "repair_2" not in result.raw_response["stages"]
 
 

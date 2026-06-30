@@ -47,6 +47,18 @@ def test_policy_engine_allow_pattern_does_not_hide_later_contrast_claim() -> Non
     assert decision.blocked_finding.rule_id == "broker_execution"
 
 
+def test_policy_engine_allows_broker_execution_boundary_phrase() -> None:
+    decision = evaluate_engine_policy(
+        EnginePolicySubject(
+            surface="user_prompt",
+            payload="Bot chỉ là paper simulation, không broker execution, không tự start runtime.",
+            evidence_level=EVIDENCE_GENERATED_ARTIFACT,
+        )
+    )
+
+    assert decision.allowed
+
+
 def test_server_policy_and_tool_runtime_share_blocking_decision() -> None:
     text = "This strategy has guaranteed profit in live trading."
     server_decision = evaluate_server_policy(

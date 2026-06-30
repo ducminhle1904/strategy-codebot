@@ -13,6 +13,12 @@ import yaml
 
 from strategy_codebot import __version__
 from strategy_codebot.agent_harness import failure_from_attempt, inspect_run, write_combined_otel_export
+from strategy_codebot.evaluator_optimizer import evaluator_review_status
+from strategy_codebot.evaluator_optimizer import evaluator_stop_reason as _evaluator_optimizer_stop_reason
+from strategy_codebot.evaluator_optimizer import nonnegative_int as _nonnegative_int
+from strategy_codebot.evaluator_optimizer import repair_source_mix as _repair_source_mix_from_history
+from strategy_codebot.evaluator_optimizer import validation_allows_artifact as _validation_allows_artifact
+from strategy_codebot.evaluator_optimizer import validation_failures as _validation_failures
 from strategy_codebot.harness_types import FAILURE_ARTIFACT_MISSING, FAILURE_POLICY_VIOLATION, FAILURE_PROVIDER_TIMEOUT, FAILURE_TOOL_ERROR, STATUS_FAIL, STATUS_PASS, STATUS_SKIPPED
 from strategy_codebot.knowledge_base import KNOWLEDGE_DATABASE_URL_ENV, propose_failure_candidate
 from strategy_codebot.knowledge_context import KNOWLEDGE_CONTEXT_AUTO, KNOWLEDGE_CONTEXT_PATH, build_knowledge_context, knowledge_metadata
@@ -184,6 +190,7 @@ def _build_live_eval_report(
     completed_case_ids = [str(case.get("id")) for case in case_reports if case.get("id")]
     missing_case_ids = [case_id for case_id in expected_case_ids if case_id not in completed_case_ids]
     status = status_override or ("running" if not is_complete else STATUS_FAIL if failed else STATUS_PASS)
+    evaluator_optimizer_summary = _build_eval_evaluator_optimizer_summary(case_reports)
     return {
         "suite": suite.get("name", suite_path.stem),
         "suite_path": str(suite_path),
@@ -216,6 +223,7 @@ def _build_live_eval_report(
         "production_failed": len(production_failed),
         "knowledge_candidate_count": len(knowledge_candidate_ids),
         "knowledge_candidate_ids": knowledge_candidate_ids,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "cases": case_reports,
     }
 
@@ -488,6 +496,7 @@ def _base_failed_case_report(case_input: dict[str, Any], *, outcome: str, failur
         "safety_gate": {},
         "generation_gate": {},
         "production_gate": {},
+        "evaluator_optimizer_summary": {},
         "knowledge_candidate_count": 0,
         "knowledge_candidate_ids": [],
         "knowledge_candidate_error": None,
@@ -618,6 +627,7 @@ def _run_case(
         )
         validation = load_json(out_dir / "validation-report.json")
         metadata = load_json(out_dir / "live-metadata.json")
+        workflow_trace = load_json(out_dir / LIVE_WORKFLOW_TRACE_PATH) if (out_dir / LIVE_WORKFLOW_TRACE_PATH).exists() else {}
         quality_report = load_json(out_dir / QUALITY_REPORT_PATH) if (out_dir / QUALITY_REPORT_PATH).exists() else metadata.get("quality_report", {})
         report.update(
             {
@@ -684,6 +694,28 @@ def _run_case(
                     "status": STATUS_FAIL,
                     "review_decision": report["review_decision"],
                 }
+        else:
+            review = None
+        report["evaluator_optimizer_summary"] = _evaluator_optimizer_summary_from_artifacts(
+            metadata=metadata,
+            workflow_trace=workflow_trace if isinstance(workflow_trace, dict) else {},
+            diagnostics={},
+            validation=validation,
+            production_gate=report.get("production_gate", {}),
+            review_report=review if isinstance(review, dict) else None,
+        )
+        evaluator_event = _ensure_evaluator_optimizer_lifecycle_event(
+            workflow_trace,
+            report["evaluator_optimizer_summary"],
+            policy=policy,
+            run_id=out_dir.name,
+            workflow=metadata.get("workflow") or workflow,
+            user_tier=metadata.get("user_tier") or case_options.user_tier,
+        )
+        if evaluator_event is not None:
+            report["evaluator_optimizer_event"] = evaluator_event
+            if (out_dir / LIVE_WORKFLOW_TRACE_PATH).exists():
+                write_json(out_dir / LIVE_WORKFLOW_TRACE_PATH, workflow_trace)
         generation_passed = report.get("generation_gate", {}).get("status") == STATUS_PASS
         if report["failure_attribution"] and not generation_passed:
             report["failure_reason"] = "live harness gate failed"
@@ -831,6 +863,14 @@ def _enrich_failure_report(report: dict[str, Any], out_dir: Path, error_report: 
     report["generation_gate"] = metadata.get("generation_gate") or diagnostics.get("generation_gate", {})
     report["production_gate"] = metadata.get("production_gate") or diagnostics.get("production_gate", {})
     validation = diagnostics.get("validation") or metadata.get("validation") or {}
+    report["evaluator_optimizer_summary"] = _evaluator_optimizer_summary_from_artifacts(
+        metadata=metadata,
+        workflow_trace=workflow_trace,
+        diagnostics=diagnostics,
+        validation=validation,
+        production_gate=report.get("production_gate", {}),
+        review_report=None,
+    )
     report["validation_status"] = validation.get("status") or final_decision.get("validation_status")
     report["validation_failures"] = diagnostics.get("validation_failures") or metadata.get("validation_failures") or _validation_failures(validation)
     report["validation_warnings"] = diagnostics.get("validation_warnings") or metadata.get("validation_warnings") or validation.get("warnings", [])
@@ -846,15 +886,6 @@ def _enrich_failure_report(report: dict[str, Any], out_dir: Path, error_report: 
     report["artifact_refs"] = refs
     if (out_dir / "live-provider-response.json").exists():
         report["raw_provider_response_ref"] = "live-provider-response.json"
-
-
-def _validation_failures(validation: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {"name": check.get("name"), "status": check.get("status"), "details": check.get("details")}
-        for check in validation.get("checks", [])
-        if check.get("status") not in {STATUS_PASS, STATUS_SKIPPED}
-    ]
-
 
 def _generation_gate_from_validation(validation: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -880,18 +911,191 @@ def _gate_status(case: dict[str, Any], gate_name: str, *, fallback: Any = None) 
     return fallback
 
 
+def _build_eval_evaluator_optimizer_summary(case_reports: list[dict[str, Any]]) -> dict[str, Any]:
+    summaries = [
+        summary
+        for case in case_reports
+        if isinstance((summary := case.get("evaluator_optimizer_summary")), dict) and summary
+    ]
+    repair_source_mix = {"llm": 0, "deterministic": 0, "unknown": 0}
+    for summary in summaries:
+        source_mix = summary.get("repair_source_mix", {})
+        if not isinstance(source_mix, dict):
+            continue
+        for source in repair_source_mix:
+            repair_source_mix[source] += _nonnegative_int(source_mix.get(source))
+    return {
+        "case_count": len(summaries),
+        "repair_count": sum(_nonnegative_int(summary.get("repair_count")) for summary in summaries),
+        "repair_source_mix": repair_source_mix,
+        "budget_exhausted_count": sum(1 for summary in summaries if summary.get("budget_exhausted") is True),
+        "stop_reasons": _count_summary_values(summaries, "stop_reason"),
+        "final_validation_statuses": _count_summary_values(summaries, "final_validation_status"),
+        "final_review_statuses": _count_summary_values(summaries, "final_review_status"),
+    }
+
+
+def _evaluator_optimizer_summary_from_artifacts(
+    *,
+    metadata: dict[str, Any],
+    workflow_trace: dict[str, Any],
+    diagnostics: dict[str, Any],
+    validation: dict[str, Any],
+    production_gate: dict[str, Any],
+    review_report: dict[str, Any] | None,
+) -> dict[str, Any]:
+    summary = _existing_evaluator_optimizer_summary(metadata, workflow_trace, diagnostics)
+    if summary:
+        return summary
+
+    final_decision = workflow_trace.get("final_decision", {}) if isinstance(workflow_trace.get("final_decision"), dict) else {}
+    if not final_decision and isinstance(diagnostics.get("final_decision"), dict):
+        final_decision = diagnostics["final_decision"]
+    repair_history = _repair_history_from_artifacts(metadata, workflow_trace, diagnostics)
+    repair_count = _nonnegative_int(metadata.get("repair_count", final_decision.get("repair_count", len(repair_history))))
+    repair_source_mix = _repair_source_mix_from_history(
+        repair_history,
+        repair_count=repair_count,
+        llm_repair_count=metadata.get("llm_repair_count", final_decision.get("llm_repair_count")),
+        deterministic_repair_count=metadata.get("deterministic_repair_count", final_decision.get("deterministic_repair_count")),
+    )
+    final_review_status = _final_review_status_from_artifacts(review_report, production_gate, final_decision)
+    budget_exhausted = bool(
+        metadata.get("repair_budget_exhausted")
+        or production_gate.get("repair_budget_exhausted")
+        or final_decision.get("repair_budget_exhausted")
+    )
+    policy_findings = _evaluator_optimizer_policy_findings(metadata, workflow_trace, diagnostics, production_gate, final_decision)
+    return {
+        "stop_reason": _evaluator_optimizer_stop_reason(
+            validation=validation,
+            final_review_status=final_review_status,
+            production_gate=production_gate,
+            policy_findings=policy_findings,
+            budget_exhausted=budget_exhausted,
+        ),
+        "repair_count": repair_count,
+        "repair_source_mix": repair_source_mix,
+        "final_validation_status": validation.get("status") or production_gate.get("validation_status") or final_decision.get("validation_status"),
+        "final_review_status": final_review_status,
+        "budget_exhausted": budget_exhausted,
+    }
+
+
+def _existing_evaluator_optimizer_summary(
+    metadata: dict[str, Any],
+    workflow_trace: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> dict[str, Any]:
+    sources = [metadata, diagnostics]
+    final_decision = workflow_trace.get("final_decision", {}) if isinstance(workflow_trace.get("final_decision"), dict) else {}
+    sources.extend([workflow_trace, final_decision])
+    for source in sources:
+        summary = source.get("evaluator_optimizer_summary") if isinstance(source, dict) else None
+        if isinstance(summary, dict) and summary:
+            return summary
+    return {}
+
+
+def _ensure_evaluator_optimizer_lifecycle_event(
+    workflow_trace: dict[str, Any],
+    summary: dict[str, Any],
+    *,
+    policy: str,
+    run_id: str,
+    workflow: str | None,
+    user_tier: str | None,
+) -> dict[str, Any] | None:
+    if not isinstance(workflow_trace, dict) or not summary:
+        return None
+    lifecycle_events = workflow_trace.setdefault("lifecycle_events", [])
+    if not isinstance(lifecycle_events, list):
+        lifecycle_events = []
+        workflow_trace["lifecycle_events"] = lifecycle_events
+    existing = next(
+        (
+            event
+            for event in lifecycle_events
+            if isinstance(event, dict) and event.get("event_type") == "evaluator_optimizer.summary"
+        ),
+        None,
+    )
+    if existing is not None:
+        return existing
+    event = {
+        "event_id": f"evt-{len(lifecycle_events) + 1}",
+        "sequence": len(lifecycle_events) + 1,
+        "created_at": datetime.now(UTC).isoformat(),
+        "run_id": workflow_trace.get("run_id") or run_id,
+        "workflow": workflow or workflow_trace.get("workflow"),
+        "user_tier": user_tier or workflow_trace.get("user_tier"),
+        "event_type": "evaluator_optimizer.summary",
+        "policy_mode": policy,
+        "status": STATUS_PASS,
+        "stage": "evaluator_optimizer",
+        "agent_role": "evaluator_optimizer",
+        "stop_reason": summary.get("stop_reason"),
+        "repair_count": summary.get("repair_count"),
+        "repair_source_mix": summary.get("repair_source_mix"),
+        "final_validation_status": summary.get("final_validation_status"),
+        "final_review_status": summary.get("final_review_status"),
+        "budget_exhausted": summary.get("budget_exhausted"),
+        "output_summary": summary.get("stop_reason"),
+    }
+    lifecycle_events.append({key: value for key, value in event.items() if value is not None})
+    return lifecycle_events[-1]
+
+
+def _repair_history_from_artifacts(
+    metadata: dict[str, Any],
+    workflow_trace: dict[str, Any],
+    diagnostics: dict[str, Any],
+) -> list[dict[str, Any]]:
+    for source in (diagnostics, workflow_trace, metadata):
+        history = source.get("repair_history") if isinstance(source, dict) else None
+        if isinstance(history, list):
+            return [entry for entry in history if isinstance(entry, dict)]
+    return []
+
+
+def _final_review_status_from_artifacts(
+    review_report: dict[str, Any] | None,
+    production_gate: dict[str, Any],
+    final_decision: dict[str, Any],
+) -> str | None:
+    return evaluator_review_status(
+        review_report=review_report,
+        production_gate=production_gate,
+        final_decision=final_decision,
+    )
+
+
+def _evaluator_optimizer_policy_findings(*sources: dict[str, Any]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for source in sources:
+        source_findings = source.get("policy_findings") if isinstance(source, dict) else None
+        if isinstance(source_findings, list):
+            findings.extend(finding for finding in source_findings if isinstance(finding, dict))
+    return findings
+
+
+def _count_summary_values(summaries: list[dict[str, Any]], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for summary in summaries:
+        value = summary.get(field)
+        if value is None:
+            continue
+        key = str(value)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
 def _is_expected_blocked(case: dict[str, Any]) -> bool:
     return case.get("expected_outcome") == "blocked"
 
 
 def _review_decision_blocks_production(review_decision: str | None) -> bool:
     return str(review_decision).lower() in {STATUS_FAIL, "fail", "failed", "reject", "rejected", "block", "blocked"}
-
-
-def _validation_allows_artifact(validation: dict[str, Any]) -> bool:
-    return validation.get("status") == STATUS_PASS or (
-        validation.get("status") == "manual_required" and not _validation_failures(validation)
-    )
 
 
 def _case_id(case: dict[str, Any]) -> str:

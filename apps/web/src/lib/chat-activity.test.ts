@@ -55,6 +55,24 @@ describe("chat activity mapper", () => {
     expect(activities.every((activity) => activity.toolName !== "reasoning")).toBe(true);
   });
 
+  it("prefers backend presentation metadata over event-name factories", () => {
+    const activities = mapRunEventsToChatActivities([
+      runEvent("tool.started", {
+        activity_label: "Registry activity label",
+        activity_state: "running",
+        label: "Old tool label",
+        tool_id: "generate_pine",
+        tool_name: "registry_tool",
+      }),
+    ]);
+
+    expect(activities[0]).toMatchObject({
+      state: "input-available",
+      title: "Registry activity label",
+      toolName: "registry_tool",
+    });
+  });
+
   it("renders run failures as error activities", () => {
     expect(
       mapRunEventsToChatActivities([
@@ -212,11 +230,15 @@ describe("chat activity mapper", () => {
     expect(activities).toHaveLength(1);
     expect(activities[0]).toMatchObject({
       description: "Checked knowledge context: 1 internal docs, 2 retrieved chunks, 1 external refs.",
+      details: [
+        { label: "Status", value: "Complete" },
+        { label: "Tool", value: "Check knowledge context" },
+      ],
       state: "output-available",
       title: "Check knowledge context",
       toolName: "knowledge_check",
     });
-    expect(activities[0]).not.toHaveProperty("details");
+    expect(JSON.stringify(activities[0].details)).not.toContain("postgres://internal");
   });
 
   it("uses backend registry labels for tool activity fallback copy", () => {
@@ -461,6 +483,10 @@ describe("chat activity mapper", () => {
 
     expect(activities).toHaveLength(1);
     expect(activities[0].title).toBe("Review artifact ready");
+    expect(activities[0].artifactLinks).toEqual([
+      { artifactId: "artifact_1", label: "strategy.pine" },
+      { artifactId: "artifact_2", label: "validation.json" },
+    ]);
   });
 
   it("keeps every known event type mapped or explicitly ignored", () => {
@@ -479,15 +505,26 @@ describe("chat activity mapper", () => {
         model: "paid-high-secret-alias",
         provider_route: "litellm_proxy/paid_high.pine_code_generation",
       }),
+      runEvent("classifier.route", {
+        classifier_name: "chat_intent_decision",
+        model: "paid-low-secret-alias",
+        provider: "litellm_proxy",
+        provider_route: "litellm_proxy/paid_low.strategy_reasoning_gemini_lite",
+        stage: "classifier",
+        status: "route",
+      }),
       runEvent("model.usage", { total_tokens: 42 }),
     ]);
 
     expect(activities.map((activity) => activity.title)).toEqual([
       "Trying fallback route",
+      "Classifier route selected",
       "Model usage recorded",
     ]);
     expect(JSON.stringify(activities)).not.toContain("paid_high");
+    expect(JSON.stringify(activities)).not.toContain("paid_low");
     expect(JSON.stringify(activities)).not.toContain("paid-high-secret-alias");
+    expect(JSON.stringify(activities)).not.toContain("paid-low-secret-alias");
     expect(JSON.stringify(activities)).not.toContain("litellm_proxy");
   });
 

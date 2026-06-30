@@ -17,10 +17,13 @@ import { cn } from "@/lib/utils";
 
 type ToolStatus = "complete" | "executing" | "failed" | "inProgress" | "skipped" | string;
 
+type ToolCardDetail = { label: string; value: string };
+
 export function AgentToolCard({
   action,
   children,
   description,
+  details,
   icon,
   status,
   title,
@@ -28,6 +31,7 @@ export function AgentToolCard({
   action?: ReactNode;
   children?: ReactNode;
   description: string;
+  details?: ToolCardDetail[];
   icon?: ReactNode;
   status: ToolStatus;
   title: string;
@@ -43,6 +47,16 @@ export function AgentToolCard({
             <div>
               <p className="text-sm font-medium text-foreground">{title}</p>
               <p className="mt-0.5 text-xs leading-5 text-muted-foreground">{description}</p>
+              {details && details.length > 0 ? (
+                <dl className="mt-2 grid gap-1 text-xs">
+                  {details.map((detail) => (
+                    <div className="grid grid-cols-[4.5rem_minmax(0,1fr)] gap-2" key={detail.label}>
+                      <dt className="text-muted-foreground">{detail.label}</dt>
+                      <dd className="truncate text-foreground">{detail.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              ) : null}
             </div>
             <ToolStatusBadge status={status} />
           </div>
@@ -55,16 +69,7 @@ export function AgentToolCard({
 }
 
 export function ToolStatusBadge({ status }: { status: ToolStatus }) {
-  const label =
-    status === "complete"
-      ? "Done"
-      : status === "executing"
-        ? "Running"
-        : status === "failed"
-          ? "Failed"
-          : status === "skipped"
-            ? "Skipped"
-          : "Needs input";
+  const label = toolStatusLabel(status);
   return (
     <span
       className={cn(
@@ -307,6 +312,7 @@ export function ArtifactToolCard({ status }: { status: ToolStatus }) {
   return (
     <AgentToolCard
       description="Review artifact is available in the workspace."
+      details={[{ label: "Status", value: toolStatusLabel(status) }]}
       icon={<FileCode2 className="size-4" />}
       status={status}
       title="Artifact ready"
@@ -318,6 +324,7 @@ export function UnknownToolCard({ status }: { status: ToolStatus }) {
   return (
     <AgentToolCard
       description="A background agent step is running."
+      details={[{ label: "Status", value: toolStatusLabel(status) }]}
       icon={<AlertTriangle className="size-4" />}
       status={status}
       title="Agent step"
@@ -332,4 +339,20 @@ export function CompletedInline({ children }: { children: ReactNode }) {
       {children}
     </span>
   );
+}
+
+function toolStatusLabel(status: ToolStatus) {
+  if (status === "complete") {
+    return "Done";
+  }
+  if (status === "executing") {
+    return "Running";
+  }
+  if (status === "failed") {
+    return "Failed";
+  }
+  if (status === "skipped") {
+    return "Skipped";
+  }
+  return "Needs input";
 }

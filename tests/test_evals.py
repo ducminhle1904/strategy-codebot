@@ -5,9 +5,10 @@ import time
 
 import yaml
 
+from strategy_codebot import evals as evals_module
 from strategy_codebot.evals import run_live_eval
 from strategy_codebot.live import LiveProviderError, LiveRunOptions
-from strategy_codebot.schemas import load_json, write_json
+from strategy_codebot.schemas import load_json, validate_payload, write_json
 from strategy_codebot.tool_runtime import ToolBlockedError
 
 
@@ -27,6 +28,14 @@ def test_live_eval_writes_report_for_mocked_runs(monkeypatch, tmp_path: Path) ->
     )
 
     captured = []
+    evaluator_summary = {
+        "stop_reason": "production_gate_passed",
+        "repair_count": 1,
+        "repair_source_mix": {"llm": 1, "deterministic": 0, "unknown": 0},
+        "final_validation_status": "pass",
+        "final_review_status": "pass",
+        "budget_exhausted": False,
+    }
 
     def fake_run_strategy(**kwargs):
         captured.append(kwargs)
@@ -63,6 +72,7 @@ def test_live_eval_writes_report_for_mocked_runs(monkeypatch, tmp_path: Path) ->
                 "external_source_ids": ["tradingview-pine-strategies"],
                 "stages": [{"stage": "balanced_review", "model": "openai/test", "provider": "openai"}],
                 "attempts": [],
+                "evaluator_optimizer_summary": evaluator_summary,
             },
         )
         write_json(out_dir / "knowledge-context.json", {"internal_docs": [{"id": "pine_v6_rules"}, {"id": "risk_policy"}], "external_refs": [{"id": "tradingview-pine-strategies"}]})
@@ -101,6 +111,19 @@ def test_live_eval_writes_report_for_mocked_runs(monkeypatch, tmp_path: Path) ->
     assert report["cases"][0]["knowledge_doc_ids"] == ["pine_v6_rules", "risk_policy"]
     assert report["cases"][0]["external_source_ids"] == ["tradingview-pine-strategies"]
     assert report["cases"][0]["stages"][0]["stage"] == "balanced_review"
+    assert report["cases"][0]["evaluator_optimizer_summary"] == evaluator_summary
+    assert report["cases"][0]["evaluator_optimizer_event"]["event_type"] == "evaluator_optimizer.summary"
+    assert report["cases"][0]["evaluator_optimizer_event"]["stop_reason"] == "production_gate_passed"
+    validate_payload(report["cases"][0]["evaluator_optimizer_event"], "tool-event.schema.json")
+    workflow_trace = load_json(tmp_path / "eval" / "cases" / "good" / "live-workflow-trace.json")
+    assert any(
+        event.get("event_type") == "evaluator_optimizer.summary"
+        for event in workflow_trace["lifecycle_events"]
+    )
+    assert report["evaluator_optimizer_summary"]["case_count"] == 1
+    assert report["evaluator_optimizer_summary"]["repair_count"] == 1
+    assert report["evaluator_optimizer_summary"]["repair_source_mix"]["llm"] == 1
+    assert report["evaluator_optimizer_summary"]["stop_reasons"] == {"production_gate_passed": 1}
     assert len(captured) == 1
     assert captured[0]["live_options"].model_stage_overrides == {"balanced_review": "openrouter/qwen/qwen3.6-plus-preview"}
     assert captured[0]["live_options"].prompt_profile == "optimized_v1"
@@ -120,6 +143,26 @@ def test_live_eval_writes_report_for_mocked_runs(monkeypatch, tmp_path: Path) ->
     assert isinstance(report["cases"][1]["case_duration_ms"], int)
     assert (tmp_path / "eval" / "eval-report.json").exists()
     assert (tmp_path / "eval" / "cases" / "good" / "case-eval.json").exists()
+
+
+def test_evaluator_optimizer_summary_prefers_policy_block_stop_reason() -> None:
+    summary = evals_module._evaluator_optimizer_summary_from_artifacts(
+        metadata={},
+        workflow_trace={
+            "final_decision": {
+                "policy_findings": [
+                    {"code": "live_trading_not_allowed", "severity": "block"},
+                ],
+                "status": "fail",
+            }
+        },
+        diagnostics={},
+        validation={"status": "pass"},
+        production_gate={"status": "fail"},
+        review_report=None,
+    )
+
+    assert summary["stop_reason"] == "policy_blocked"
 
 
 def test_live_eval_checkpoints_report_after_each_sequential_case(monkeypatch, tmp_path: Path) -> None:
@@ -507,6 +550,7 @@ def test_live_eval_concurrency_preserves_suite_order(monkeypatch, tmp_path: Path
             },
         )
         write_json(out_dir / "live-workflow-trace.json", {"workflow": "multi-agent", "stages": [], "final_decision": {"status": "pass"}})
+        write_json(out_dir / "review-report.json", {"decision": "approve", "run_status": "completed"})
         return {"status": "pass", "out_dir": str(out_dir), "run_id": out_dir.name}
 
     monkeypatch.setattr("strategy_codebot.evals.run_strategy", fake_run_strategy)
@@ -515,6 +559,11 @@ def test_live_eval_concurrency_preserves_suite_order(monkeypatch, tmp_path: Path
 
     assert completion_order == ["fast", "slow"]
     assert [case["id"] for case in report["cases"]] == ["slow", "fast"]
+    assert report["cases"][0]["evaluator_optimizer_summary"]["stop_reason"] == "production_gate_passed"
+    assert report["cases"][0]["evaluator_optimizer_summary"]["final_review_status"] == "approve"
+    assert report["evaluator_optimizer_summary"]["case_count"] == 2
+    assert report["evaluator_optimizer_summary"]["final_validation_statuses"] == {"pass": 2}
+    assert report["evaluator_optimizer_summary"]["final_review_statuses"] == {"approve": 2}
     assert report["status"] == "pass"
 
 

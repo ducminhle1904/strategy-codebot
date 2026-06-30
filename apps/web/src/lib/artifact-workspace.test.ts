@@ -603,6 +603,25 @@ describe("artifact workspace helpers", () => {
     });
   });
 
+  it("uses presentation metadata to identify backtest live status events", () => {
+    const status = backtestLiveStatusFromRunEvents([
+      runEvent(1, "workflow.gate.updated", {
+        card_kind: "backtest_live_status",
+        stage: "reporting",
+        status: "running",
+        progress_pct: 88,
+        message: "Preparing review-only report.",
+      }),
+    ]);
+
+    expect(status).toMatchObject({
+      message: "Preparing review-only report.",
+      progressPct: 88,
+      stage: "reporting",
+      status: "running",
+    });
+  });
+
   it("falls back to approval and queued events before heartbeat arrives", () => {
     expect(
       backtestLiveStatusFromRunEvents([

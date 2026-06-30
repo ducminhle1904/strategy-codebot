@@ -26,6 +26,7 @@ defaults:
   request_timeout_seconds: 60
   require_structured_output: true
 stage_timeouts:
+  classifier: 15
   compact_free: 45
   market_research: 45
   strategy_reasoning: 60
@@ -65,6 +66,10 @@ model_tiers:
     max_repair_loops: 1
     allow_tier_escalation: false
     routes_by_stage:
+      classifier:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       strategy_reasoning:
         - openrouter/meta-llama/llama-3.3-70b-instruct:free
         - openrouter/nex-agi/nex-n2-pro:free
@@ -94,6 +99,10 @@ model_tiers:
     max_repair_loops: 1
     allow_tier_escalation: false
     routes_by_stage:
+      classifier:
+        - openrouter/meta-llama/llama-3.3-70b-instruct:free
+        - openrouter/nex-agi/nex-n2-pro:free
+        - openrouter/nvidia/nemotron-3-ultra-550b-a55b:free
       strategy_reasoning:
         - openrouter/meta-llama/llama-3.3-70b-instruct:free
         - openrouter/nex-agi/nex-n2-pro:free
@@ -126,6 +135,11 @@ model_tiers:
     allow_deterministic_repair_after_budget: true
     allow_tier_escalation: false
     routes_by_stage:
+      classifier:
+        - litellm_proxy/paid_low.strategy_reasoning_gemini_lite
+        - litellm_proxy/paid_low.strategy_reasoning
+        - litellm_proxy/paid_low.strategy_reasoning_vercel
+        - litellm_proxy/paid_medium.strategy_reasoning
       strategy_reasoning:
         - litellm_proxy/paid_low.strategy_reasoning
         - litellm_proxy/paid_low.strategy_reasoning_vercel
@@ -161,6 +175,8 @@ model_tiers:
     max_repair_loops: 2
     allow_tier_escalation: false
     routes_by_stage:
+      classifier:
+        - litellm_proxy/paid_medium.strategy_reasoning
       strategy_reasoning:
         - litellm_proxy/paid_medium.strategy_reasoning
       strategy_coding:
@@ -178,6 +194,8 @@ model_tiers:
     max_repair_loops: 2
     allow_tier_escalation: false
     routes_by_stage:
+      classifier:
+        - litellm_proxy/paid_high.strategy_reasoning
       strategy_reasoning:
         - litellm_proxy/paid_high.strategy_reasoning
       strategy_coding:

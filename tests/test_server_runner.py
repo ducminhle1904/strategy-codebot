@@ -111,7 +111,13 @@ def test_run_mode_constants_match_capability_response(tmp_path: Path) -> None:
     response = client.get("/v1/me", headers=AUTH_A)
 
     assert response.status_code == 200
-    assert response.json()["capability"]["allowed_run_modes"] == list(RUN_MODES)
+    capability = response.json()["capability"]
+    assert capability["allowed_run_modes"] == list(RUN_MODES)
+    assert [
+        mode
+        for mode in RUN_MODES
+        if capability["capability_matrix"][mode]["status"] in {"available", "degraded"}
+    ] == capability["allowed_run_modes"]
 
 
 def test_backtest_preview_requires_backtest_config() -> None:

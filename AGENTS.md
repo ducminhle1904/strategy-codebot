@@ -22,3 +22,15 @@ This repo uses a repository harness. Keep this file short: it is a map, not the 
 - If `agent-start` is unavailable, run both `strategy-codebot harness preflight --latest 10` and `strategy-codebot harness session-start --summary ...`, then record `--preflight-applied` in `dev-trace`.
 - For non-trivial research, investigation, implementation, verification, or blocker sessions, record a repository trace with `strategy-codebot harness dev-trace` before the final response.
 - After non-trivial trace-related work, run `strategy-codebot harness audit-traces --latest 1`.
+
+## Product Trace Lessons
+
+- Treat chat, workflow rail, task events, skipped/not-applicable steps, and render timing as one product contract across backend events, frontend normalizers, panels, and tests.
+- Strategy-to-Paper-Bot and Nautilus runtime work is not complete at code/tests only; verify rebuilt containers, SSE/API state, persisted runtime/session state, stop/finalization behavior, and the audit path.
+- Model/provider routing is user-facing product behavior: surface timeouts, rate limits, malformed responses, free/paid route limits, policy rejection, and fallback state explicitly.
+- Prefer registry-first product contracts for intents, actions, workflow steps, KB selection, and event presentation; avoid hardcoded FE/BE heuristics unless a trace-backed decision says otherwise.
+- Do not fix intent or policy false positives by growing multilingual keyword allowlists. Deterministic checks should only be high-confidence prechecks/evidence; semantic LLM classifiers may propose intent/polarity, and registry/backend validators decide the final state.
+- Workflow UI state must come from structured backend events and durable task records, not assistant prose. The rail is progress/info; blocking human-in-the-loop questions belong in typed task prompts that hide the composer until resolved.
+- Risky transitions require canonical audit events in `run_events`: model proposal, backend validation/rejection, user gate, and execution decision. Next.js logs are bridge/operational evidence, not the durable source of truth.
+- Treat artifacts and knowledge-base freshness as product behavior: preserve artifact ordering, required-source promotion, stale-chunk pruning, and suppression of raw or empty validation/trade/plan reports.
+- When Clerk or browser auth blocks direct UI proof, verify product behavior through backend stream/state checks plus focused frontend tests, and record the auth blocker clearly.

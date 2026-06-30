@@ -24,23 +24,50 @@
         "guardrail.blocked",
         "repair.started",
         "repair.completed",
-        "agent.completed"
+        "agent.completed",
+        "evaluator_optimizer.summary",
+        "agent_loop.started",
+        "agent_loop.llm_completed",
+        "agent_loop.tool_checked",
+        "agent_loop.completed"
       ]
     },
     "case_id": { "type": "string" },
     "workflow": { "type": "string" },
+    "user_tier": { "type": "string" },
     "cost_profile": { "type": "string" },
     "stage": { "type": "string" },
     "agent_role": { "type": "string" },
     "model": { "type": "string" },
     "provider": { "type": "string" },
+    "model_stage": { "type": "string" },
+    "provider_route": { "type": "string" },
     "attempt": { "type": "integer", "minimum": 1 },
+    "iteration": { "type": "integer", "minimum": 0 },
     "parent_event_id": { "type": "string" },
     "latency_ms": { "type": "integer", "minimum": 0 },
     "usage": {
       "type": "object",
       "additionalProperties": true
     },
+    "gate": { "type": "string" },
+    "decision": { "type": "string" },
+    "reason_code": { "type": "string" },
+    "tool_call_count": { "type": "integer", "minimum": 0 },
+    "budget_exhausted": {
+      "oneOf": [
+        { "type": "boolean" },
+        { "type": "string" }
+      ]
+    },
+    "stop_reason": { "type": "string" },
+    "repair_count": { "type": "integer", "minimum": 0 },
+    "repair_source_mix": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "final_validation_status": { "type": "string" },
+    "final_review_status": { "type": "string" },
     "status": {
       "type": "string",
       "enum": ["started", "pass", "fail", "blocked", "skipped"]

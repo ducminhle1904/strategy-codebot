@@ -1,5 +1,9 @@
 import type { BackendApiError } from "@/lib/backend-client";
 import type { MessageMode, WebSearchMode } from "@/lib/backend-schemas";
+import {
+  isChatResponseIntent,
+  type ChatResponseIntent,
+} from "@/lib/chat-intent-registry-contract";
 import { normalizeLanguage, type LanguagePreference } from "@/lib/i18n";
 import { parseSseMessages } from "@/lib/sse";
 import {
@@ -40,14 +44,7 @@ export type ChatSource = {
   url?: string;
 };
 
-export type ResponseIntent =
-  | "artifact_generation"
-  | "capability_help"
-  | "docs_research"
-  | "general_chat"
-  | "market_research"
-  | "market_snapshot"
-  | "strategy_building";
+export type ResponseIntent = ChatResponseIntent;
 
 export type MarketSnapshot = {
   approximate: boolean;
@@ -429,18 +426,7 @@ function sourceNumber(value: unknown): number | null {
 }
 
 function normalizeResponseIntent(value: unknown): ResponseIntent | null {
-  const intents = new Set<ResponseIntent>([
-    "artifact_generation",
-    "capability_help",
-    "docs_research",
-    "general_chat",
-    "market_research",
-    "market_snapshot",
-    "strategy_building",
-  ]);
-  return typeof value === "string" && intents.has(value as ResponseIntent)
-    ? (value as ResponseIntent)
-    : null;
+  return isChatResponseIntent(value) ? value : null;
 }
 
 function normalizeSuggestionContext(value: unknown): ChatSuggestionsPayload["context"] {

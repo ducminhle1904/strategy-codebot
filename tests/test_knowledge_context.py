@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from strategy_codebot.knowledge_context import build_knowledge_context, compact_knowledge_context
+import pytest
+
+from strategy_codebot.knowledge_context import KnowledgeSelectionSignals, build_knowledge_context, compact_knowledge_context
 from strategy_codebot.knowledge_context import knowledge_metadata
 from strategy_codebot.knowledge_base import build_knowledge_index
 from strategy_codebot.live import _messages
@@ -76,6 +78,49 @@ def test_knowledge_context_selects_crypto_playbook_and_trusted_refs(monkeypatch,
     assert "babypips-school-of-pipsology" not in source_ids
     assert context["selection_reasons"]["crypto_context"] is True
     assert all("excerpt" not in source for source in context["external_refs"])
+
+
+def test_knowledge_context_uses_source_registry_selection_aliases(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_KNOWLEDGE_INDEX", str(tmp_path / "missing.json"))
+    registry_path = tmp_path / "source-registry.yaml"
+    registry_path.write_text(
+        "\n".join(
+            [
+                "selection_aliases:",
+                "  crypto: [xbt]",
+                "  pine: [pine, strategy]",
+                "  mql5: [mql5]",
+                "  forex: [forex]",
+                "  review: [review]",
+                "  strategy_general: [breakout]",
+                "sources: []",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    context = build_knowledge_context("Create an XBT breakout strategy", source_registry_path=registry_path)
+
+    doc_ids = [doc["id"] for doc in context["internal_docs"]]
+    assert "crypto_playbook" in doc_ids
+    assert context["selection_reasons"]["crypto_context"] is True
+
+
+def test_structured_knowledge_signals_override_prompt_aliases(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_KNOWLEDGE_INDEX", str(tmp_path / "missing.json"))
+
+    context = build_knowledge_context(
+        "Create a crypto BTC perpetual strategy with forex session risk",
+        selection_signals=KnowledgeSelectionSignals(pine_context=True, strategy_general_context=True),
+    )
+
+    doc_ids = [doc["id"] for doc in context["internal_docs"]]
+    assert "crypto_playbook" not in doc_ids
+    assert "forex_playbook" not in doc_ids
+    assert "strategy_patterns" in doc_ids
+    assert context["selection_reasons"]["crypto_context"] is False
+    assert context["selection_reasons"]["forex_context"] is False
+    assert context["selection_reasons"]["selection_source"] == "structured"
 
 
 def test_knowledge_context_selects_forex_playbook_and_trusted_refs(monkeypatch, tmp_path: Path) -> None:

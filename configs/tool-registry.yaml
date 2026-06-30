@@ -15,6 +15,8 @@ tools:
     evidence_required:
       - pine/strategy.pine
     phase_status: implemented
+    backend_handler: generate_pine
+    provider_exposed: true
   - id: generate_live_strategy
     capability: live-llm-strategy-generation
     risk_tier: code_generation
@@ -58,6 +60,10 @@ tools:
     evidence_required:
       - validation-report.json
     phase_status: implemented
+    backend_handler: static_validate
+    provider_exposed: true
+    aliases:
+      - static_validate
   - id: write_manual_checklist
     capability: pine-manual-checklist
     risk_tier: documentation
@@ -74,6 +80,10 @@ tools:
     evidence_required:
       - mql5/runner-design.md
     phase_status: implemented
+    backend_handler: create_mql5_design
+    provider_exposed: true
+    aliases:
+      - create_mql5_design
   - id: validate_nautilus_contract
     capability: nautilus-static-contract-validation
     risk_tier: validation
@@ -92,6 +102,10 @@ tools:
     evidence_required:
       - review-report.json
     phase_status: implemented
+    backend_handler: parallel_review
+    provider_exposed: true
+    aliases:
+      - parallel_review
   - id: create_backtest_plan
     capability: backtest-plan-generation
     risk_tier: validation
@@ -100,6 +114,8 @@ tools:
     evidence_required:
       - backtest/backtest-plan.json
     phase_status: implemented
+    backend_handler: create_backtest_plan
+    provider_exposed: true
   - id: run_backtest_preview
     capability: backtest-preview-queue
     risk_tier: validation
@@ -108,6 +124,8 @@ tools:
     evidence_required:
       - backtest.queued run event
     phase_status: implemented
+    backend_handler: run_backtest_preview
+    provider_exposed: true
   - id: run_backtest_variant_lab
     capability: backtest-variant-lab
     risk_tier: validation
@@ -117,6 +135,48 @@ tools:
       - backtest/variant-lab-*.json
       - backtest.queued run events
     phase_status: implemented
+    backend_handler: run_backtest_variant_lab
+    provider_exposed: true
+  - id: get_backtest_summary
+    capability: backtest-summary-read
+    risk_tier: read
+    input_schema_ref: run_id
+    output_schema_ref: backtest/backtest-report-summary.json
+    evidence_required:
+      - backtest.report summary
+    phase_status: implemented
+    backend_handler: get_backtest_summary
+    provider_exposed: true
+  - id: query_backtest_trades
+    capability: backtest-trades-read
+    risk_tier: read
+    input_schema_ref: run_id + bucket + limit
+    output_schema_ref: backtest/trades-sample.json
+    evidence_required:
+      - backtest.trades sample
+    phase_status: implemented
+    backend_handler: query_backtest_trades
+    provider_exposed: true
+  - id: get_equity_curve_sample
+    capability: backtest-equity-curve-read
+    risk_tier: read
+    input_schema_ref: run_id
+    output_schema_ref: backtest/equity-curve-sample.json
+    evidence_required:
+      - backtest.equity curve sample
+    phase_status: implemented
+    backend_handler: get_equity_curve_sample
+    provider_exposed: true
+  - id: build_robustness_report
+    capability: backtest-robustness-review
+    risk_tier: review
+    input_schema_ref: run_id
+    output_schema_ref: backtest/robustness-report.json
+    evidence_required:
+      - backtest/robustness-report.json
+    phase_status: implemented
+    backend_handler: build_robustness_report
+    provider_exposed: true
   - id: knowledge_registry_check
     capability: knowledge-refresh
     risk_tier: read
@@ -149,6 +209,16 @@ tools:
     evidence_required:
       - reports/knowledge-audit.json
     phase_status: implemented
+  - id: knowledge_check
+    capability: knowledge-context-read
+    risk_tier: read
+    input_schema_ref: prompt
+    output_schema_ref: knowledge-context-summary.json
+    evidence_required:
+      - knowledge.context summary
+    phase_status: implemented
+    backend_handler: knowledge_check
+    provider_exposed: true
   - id: knowledge_proposal
     capability: knowledge-improvement-proposal
     risk_tier: documentation
@@ -157,6 +227,48 @@ tools:
     evidence_required:
       - knowledge/proposals/*.json
     phase_status: implemented
+    backend_handler: knowledge_proposal
+    provider_exposed: true
+  - id: draft_bot
+    capability: paper-bot-proposal-draft
+    risk_tier: review
+    input_schema_ref: strategy_id + setup fields
+    output_schema_ref: bot-proposal.json
+    evidence_required:
+      - bot.proposal
+    phase_status: implemented
+    backend_handler: draft_bot
+    provider_exposed: true
+  - id: get_bot_status
+    capability: paper-bot-status-read
+    risk_tier: read
+    input_schema_ref: bot_id
+    output_schema_ref: bot-status.json
+    evidence_required:
+      - bot.status
+    phase_status: implemented
+    backend_handler: get_bot_status
+    provider_exposed: true
+  - id: list_bots
+    capability: paper-bot-list-read
+    risk_tier: read
+    input_schema_ref: conversation_id
+    output_schema_ref: bot-list.json
+    evidence_required:
+      - bot.list
+    phase_status: implemented
+    backend_handler: list_bots
+    provider_exposed: true
+  - id: list_bot_events
+    capability: paper-bot-events-read
+    risk_tier: read
+    input_schema_ref: bot_id
+    output_schema_ref: bot-events.json
+    evidence_required:
+      - bot.events
+    phase_status: implemented
+    backend_handler: list_bot_events
+    provider_exposed: true
   - id: doctor_check
     capability: product-doctor
     risk_tier: read

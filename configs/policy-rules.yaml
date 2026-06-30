@@ -47,10 +47,9 @@ rules:
     code: policy_violation
     message: "Blocked trading action or arbitrary IO request: {matched_text}"
     block_patterns:
-      - "\\bbroker\\s+execution\\b"
-      - "\\bexchange\\s+execution\\b"
+      # Noun phrase-only broker/exchange execution copy is classified by
+      # policy_semantic_gate; hard rules stay limited to affirmative actions.
       - "\\b(connect|integrate|deploy)\\b.{0,80}\\b(broker|exchange)\\b"
-      - "\\bbroker\\s+(integration|deployment)\\b"
       - "\\bconnects\\s+to\\s+my\\s+broker\\b"
     allow_patterns:
       - "\\b(no|without|do not|does not|don't|never|must not|should not|avoid|avoids|avoiding|exclude|excludes|excluded|excluding|constraints against|not for|not used for|not be used for)\\b.{0,140}\\b(?:broker\\s+execution|exchange\\s+execution|broker\\s+integration|broker\\s+deployment|broker|exchange)\\b"

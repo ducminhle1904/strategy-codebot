@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { BackendClient, buildBackendHeaders, parseBackendSseEvents } from "./backend-client";
 import {
+  AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES,
   BACKTEST_RUN_EVENT_TYPES,
   BOT_PROPOSAL_STATUSES,
   BacktestApprovalDecisionRequestSchema,
@@ -10,6 +11,7 @@ import {
   ConversationStateResponseSchema,
   KNOWN_RUN_EVENT_TYPES,
   RunCreateSchema,
+  WORKFLOW_CONTINUATION_EVENT_TYPES,
 } from "./backend-schemas";
 import type { StrategySpec } from "./backend-schemas";
 
@@ -48,6 +50,32 @@ describe("BackendClient", () => {
     );
     expect(BacktestApprovalDecisionRequestSchema.parse({ decision: "approved" }).decision).toBe(
       "approved"
+    );
+  });
+
+  it("keeps canonical model workflow audit events in the known event contract", () => {
+    expect(KNOWN_RUN_EVENT_TYPES).toEqual(
+      expect.arrayContaining([
+        "classifier.started",
+        "classifier.route",
+        "classifier.completed",
+        "classifier.timeout",
+        "classifier.failed",
+        "model_action.proposed",
+        "model_action.validated",
+        "model_action.rejected",
+        "model_action.executed",
+        "workflow.gate.required",
+        "workflow.gate.confirmed",
+        "workflow.gate.rejected",
+        ...WORKFLOW_CONTINUATION_EVENT_TYPES,
+      ])
+    );
+  });
+
+  it("keeps agent workflow observability events in the known event contract", () => {
+    expect(KNOWN_RUN_EVENT_TYPES).toEqual(
+      expect.arrayContaining([...AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES])
     );
   });
 

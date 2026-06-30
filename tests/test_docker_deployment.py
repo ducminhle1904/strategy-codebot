@@ -41,6 +41,18 @@ def test_workflow_registry_contract_generated_files_are_current() -> None:
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_chat_intent_registry_contract_generated_files_are_current() -> None:
+    result = subprocess.run(
+        ["python", "scripts/sync-chat-intent-registry.py", "--check"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_backtest_contract_covers_runtime_vocab_and_bounds() -> None:
     contract = backtest_ohlcv_contract()
 
@@ -343,6 +355,15 @@ def test_paid_registry_routes_use_litellm_proxy_aliases_and_free_stays_direct() 
                     "litellm_proxy/paid_low.strategy_reasoning_gemini_lite",
                     "litellm_proxy/paid_medium.strategy_reasoning",
                 ]
+            elif tier == "paid_low" and stage == "classifier":
+                assert routes == [
+                    "litellm_proxy/paid_low.strategy_reasoning_gemini_lite",
+                    "litellm_proxy/paid_low.strategy_reasoning",
+                    "litellm_proxy/paid_low.strategy_reasoning_vercel",
+                    "litellm_proxy/paid_medium.strategy_reasoning",
+                ]
+            elif tier in {"paid_medium", "paid_high"} and stage == "classifier":
+                assert routes == [f"litellm_proxy/{tier}.strategy_reasoning"]
             elif tier == "paid_low" and stage == "strategy_coding":
                 assert routes == [
                     "litellm_proxy/paid_low.strategy_coding",

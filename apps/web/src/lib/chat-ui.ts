@@ -23,11 +23,16 @@ import type {
 import {
   marketSnapshotFromPythonEvent,
   normalizeWorkflowState,
+  reasoningSummaryFromPythonEvent,
   normalizeSuggestionsPayload,
   responseIntentFromPythonEvent,
   strategyWorkflowFromPythonEvent,
   suggestionsFromPythonEvent,
 } from "@/lib/chat-stream";
+import {
+  isChatResponseIntent,
+  shouldShowStrategyProfileForIntent,
+} from "@/lib/chat-intent-registry-contract";
 import {
   parseBacktestArtifactPreview,
   type BacktestArtifactCardModel,
@@ -266,6 +271,18 @@ function metadataPatchFromRunEvent(
   if (workflow) {
     return { workflow };
   }
+  const reasoning = reasoningSummaryFromPythonEvent(pythonEvent);
+  if (reasoning) {
+    return {
+      reasoningSummaries: [
+        {
+          id: event.event_id,
+          state: "done",
+          text: reasoning.text,
+        },
+      ],
+    };
+  }
   return null;
 }
 
@@ -431,7 +448,7 @@ export function getMessageText(message: StrategyChatMessage): string {
 }
 
 export function shouldShowStrategyProfile(intent: ResponseIntent | null): boolean {
-  return intent === "strategy_building" || intent === "artifact_generation";
+  return shouldShowStrategyProfileForIntent(intent);
 }
 
 export function isRenderableMessage(message: StrategyChatMessage): boolean {
@@ -442,7 +459,8 @@ export function isRenderableMessage(message: StrategyChatMessage): boolean {
     message.sources.length > 0 ||
     Boolean(message.backtestReport) ||
     Boolean(message.marketSnapshot) ||
-    Boolean(message.suggestions)
+    Boolean(message.suggestions) ||
+    Boolean(message.workflow)
   );
 }
 
@@ -722,13 +740,5 @@ function agUiMessageText(message: AgUiMessage): string {
 }
 
 function isResponseIntent(value: unknown): value is ResponseIntent {
-  return (
-    value === "artifact_generation" ||
-    value === "capability_help" ||
-    value === "docs_research" ||
-    value === "general_chat" ||
-    value === "market_research" ||
-    value === "market_snapshot" ||
-    value === "strategy_building"
-  );
+  return isChatResponseIntent(value);
 }

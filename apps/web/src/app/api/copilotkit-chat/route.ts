@@ -13,7 +13,12 @@ import {
 } from "@/lib/chat-stream";
 import { agentLog } from "@/lib/agent-log";
 import { backtestTradesTableFromToolOutput } from "@/lib/backtest-trades-inline-table";
-import { MessageModeSchema, WebSearchModeSchema } from "@/lib/backend-schemas";
+import {
+  AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES,
+  MessageModeSchema,
+  WebSearchModeSchema,
+  WORKFLOW_CONTINUATION_EVENT_TYPES,
+} from "@/lib/backend-schemas";
 import { workflowToolEventConfig } from "@/lib/copilot-workflow-events";
 import { normalizeLanguage, type LanguagePreference } from "@/lib/i18n";
 import { createServerBackendClient } from "@/lib/server-auth";
@@ -41,11 +46,20 @@ const LOGGABLE_BACKEND_SSE_EVENTS = new Set([
   "knowledge.candidate.rejected",
   "knowledge.learning.completed",
   "knowledge.learning.failed",
+  "model_action.proposed",
+  "model_action.validated",
+  "model_action.rejected",
+  "model_action.executed",
+  ...AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES,
   "run.completed",
   "run.failed",
   "tool.completed",
   "tool.failed",
   "tool.started",
+  "workflow.gate.required",
+  "workflow.gate.confirmed",
+  "workflow.gate.rejected",
+  ...WORKFLOW_CONTINUATION_EVENT_TYPES,
 ]);
 
 type AgUiRunInput = {
@@ -67,11 +81,24 @@ type CopilotSingleEndpointEnvelope = {
 };
 
 type CopilotStreamState = {
+  agentLoopBlockedToolCount?: number;
+  agentLoopToolCount?: number;
+  evaluatorStopReason?: string;
+  promptChainFallbackCount?: number;
+  promptChainStageCount?: number;
   reasoningId?: string;
   reasoningOpen?: boolean;
+  runEventSequence?: number;
   textId?: string;
   textOpen?: boolean;
   toolCallIds?: Map<string, string>;
+};
+
+type CopilotStreamContext = {
+  conversationId: string;
+  requestId: string;
+  runId: string;
+  traceId: string;
 };
 
 const SAFE_TOOL_PAYLOAD_FIELDS = [
@@ -104,8 +131,38 @@ const SAFE_RUN_EVENT_PAYLOAD_FIELDS = [
   "quality_score",
   "rejected_count",
   "review_required_reason",
+  "agent_role",
+  "activity_label",
+  "activity_state",
+  "budget_exhausted",
+  "card_kind",
+  "error_class",
+  "fallback_reason",
+  "final_review_status",
+  "final_validation_status",
+  "gate",
+  "handoff_status",
+  "iteration",
+  "latency_ms",
+  "lifecycle_phase",
+  "model_stage",
+  "preferred_artifact_kind",
+  "provider_route",
+  "reason_code",
+  "repair_count",
+  "response_intent",
+  "risk_tier",
+  "source_payload_path",
+  "stage",
+  "stage_count",
+  "stop_reason",
+  "tool_call_count",
   "tool_id",
   "tool_name",
+  "task_id",
+  "task_template_id",
+  "workflow",
+  "workflow_id",
 ] as const;
 
 export async function POST(request: Request) {
@@ -127,6 +184,7 @@ export async function POST(request: Request) {
     stringValue(forwardedProps.conversationId) ?? conversationIdFromThreadId(body.threadId);
   const content = extractLastAgUiUserText(body.messages ?? []);
   const mode = modeValue(forwardedProps.mode);
+  const workflowTaskId = stringValue(forwardedProps.workflowTaskId);
   const webSearch = webSearchValue(forwardedProps.webSearch);
   const clientRequestId = stringValue(forwardedProps.clientRequestId);
   const headerTraceId = stringValue(request.headers.get("X-Trace-Id"));
@@ -163,6 +221,8 @@ export async function POST(request: Request) {
     text_len: content.length,
     thread_id: threadId,
     trace_id: traceId,
+    workflow_task_id: workflowTaskId ?? null,
+    mode,
     web_search: webSearch,
   });
 
@@ -239,24 +299,39 @@ export async function POST(request: Request) {
         if (!conversationId) {
           throw new Error("conversationId is required.");
         }
-        if (!content.trim()) {
+        if (mode !== "workflow_task_continuation" && !content.trim()) {
           throw new Error(
             language === "vi" ? "Nội dung tin nhắn là bắt buộc." : "Message content is required."
           );
         }
+        if (mode === "workflow_task_continuation" && !workflowTaskId) {
+          throw new Error("workflowTaskId is required for workflow task continuation.");
+        }
 
         const client = await createServerBackendClient();
-        const response = await client.streamMessage(
-          conversationId,
-          { content, language, web_search: webSearch },
-          {
-            idempotencyKey,
-            mode,
-            requestId,
-            signal: request.signal,
-            traceId,
-          }
-        );
+        const response =
+          mode === "workflow_task_continuation"
+            ? await client.streamWorkflowTaskContinuation(
+                workflowTaskId!,
+                { language, web_search: webSearch },
+                {
+                  idempotencyKey,
+                  requestId,
+                  signal: request.signal,
+                  traceId,
+                }
+              )
+            : await client.streamMessage(
+                conversationId,
+                { content, language, web_search: webSearch },
+                {
+                  idempotencyKey,
+                  mode,
+                  requestId,
+                  signal: request.signal,
+                  traceId,
+                }
+              );
         if (!response.body) {
           throw new Error("Backend did not return a stream.");
         }
@@ -276,6 +351,31 @@ export async function POST(request: Request) {
         let shouldCancelReader = false;
         let eventCount = 0;
         const streamStartedAt = Date.now();
+        const handlePythonEvent = (event: PythonSseEvent) => {
+          eventCount += 1;
+          recordPythonStreamEvent(event, pythonEventTypes, state);
+          logPythonLifecycleEvent(event, {
+            conversationId,
+            requestId,
+            runId,
+            threadId,
+            traceId,
+          });
+          logAgUiServerDebug("received Python SSE event", {
+            event: pythonEventSummary(event),
+            runId,
+            threadId,
+          });
+          if (event.event === "run.failed") {
+            backendRunFailed = true;
+          }
+          writePythonEventAsAgUi(write, event, state, language, {
+            conversationId,
+            requestId,
+            runId,
+            traceId,
+          });
+        };
         try {
           while (true) {
             const timeoutMs = eventCount === 0 ? FIRST_EVENT_TIMEOUT_MS : IDLE_EVENT_TIMEOUT_MS;
@@ -306,46 +406,12 @@ export async function POST(request: Request) {
             buffer = split.remaining;
             for (const frame of split.frames) {
               for (const event of parseSseFrames(frame)) {
-                eventCount += 1;
-                recordPythonStreamEvent(event, pythonEventTypes);
-                logPythonLifecycleEvent(event, {
-                  conversationId,
-                  requestId,
-                  runId,
-                  threadId,
-                  traceId,
-                });
-                logAgUiServerDebug("received Python SSE event", {
-                  event: pythonEventSummary(event),
-                  runId,
-                  threadId,
-                });
-                if (event.event === "run.failed") {
-                  backendRunFailed = true;
-                }
-                writePythonEventAsAgUi(write, event, state, language);
+                handlePythonEvent(event);
               }
             }
           }
           for (const event of parseSseFrames(buffer)) {
-            eventCount += 1;
-            recordPythonStreamEvent(event, pythonEventTypes);
-            logPythonLifecycleEvent(event, {
-              conversationId,
-              requestId,
-              runId,
-              threadId,
-              traceId,
-            });
-            logAgUiServerDebug("received Python SSE event", {
-              event: pythonEventSummary(event),
-              runId,
-              threadId,
-            });
-            if (event.event === "run.failed") {
-              backendRunFailed = true;
-            }
-            writePythonEventAsAgUi(write, event, state, language);
+            handlePythonEvent(event);
           }
         } finally {
           if (request.signal.aborted || shouldCancelReader) {
@@ -376,6 +442,7 @@ export async function POST(request: Request) {
             requestId,
             routeStartedAt,
             runId,
+            state,
             textDeltaCount,
             threadId,
             traceId,
@@ -400,6 +467,7 @@ export async function POST(request: Request) {
             requestId,
             routeStartedAt,
             runId,
+            state,
             textDeltaCount,
             threadId,
             traceId,
@@ -524,12 +592,15 @@ function terminalCopilotLogFields(input: {
   requestId: string;
   routeStartedAt: number;
   runId: string;
+  state: CopilotStreamState;
   textDeltaCount: number;
   threadId: string;
   traceId: string;
 }) {
   return {
     agui_events: input.agUiEventCount,
+    agent_loop_blocked_tool_count: input.state.agentLoopBlockedToolCount ?? 0,
+    agent_loop_tool_count: input.state.agentLoopToolCount ?? 0,
     backend_run_failed: input.backendRunFailed,
     component: "copilotkit",
     conversation_id: input.conversationId,
@@ -537,8 +608,11 @@ function terminalCopilotLogFields(input: {
     custom_event_count: input.customEventCount,
     custom_event_names: countMapSummary(input.customEventNames),
     duration_ms: Date.now() - input.routeStartedAt,
+    evaluator_stop_reason: input.state.evaluatorStopReason,
     finished: input.finished,
     market_symbols: [...input.marketSnapshotSymbols].join(","),
+    chain_fallback_count: input.state.promptChainFallbackCount ?? 0,
+    chain_stage_count: input.state.promptChainStageCount ?? 0,
     python_event_types: countMapSummary(input.pythonEventTypes),
     request_id: input.requestId,
     text_deltas: input.textDeltaCount,
@@ -584,6 +658,7 @@ function logPythonLifecycleEvent(
   const confidence =
     typeof payload.confidence === "number" ? Math.round(payload.confidence * 1000) / 1000 : undefined;
   agentLog("info", "backend.sse.event", {
+    actor: stringValue(payload.actor),
     artifact_kind: artifactKind,
     backend_run_id: backendRunId,
     component: "copilotkit",
@@ -591,16 +666,32 @@ function logPythonLifecycleEvent(
     conversation_id: context.conversationId,
     copilot_run_id: context.runId,
     decision,
-    error_class: stringValue(payload.error),
+    error_class: stringValue(payload.error_class) ?? stringValue(payload.error),
     event_type: eventType,
     failure_code: eventType === "run.failed" ? failureCode : undefined,
     failure_message: eventType === "run.failed" ? stringValue(payload.message) : undefined,
+    fallback_reason: stringValue(payload.fallback_reason),
+    gate: stringValue(payload.gate),
+    handoff_status: stringValue(payload.handoff_status),
+    latency_ms: typeof payload.latency_ms === "number" ? payload.latency_ms : undefined,
+    model_stage: stringValue(payload.model_stage),
     output_status: stringValue(payload.output_status),
+    proposal_id: stringValue(payload.proposal_id),
+    provider_route: stringValue(payload.provider_route),
     request_id: context.requestId,
+    reason_code: stringValue(payload.reason_code),
+    risk_level: stringValue(payload.risk_level),
+    risk_tier: stringValue(payload.risk_tier),
+    source: stringValue(payload.source),
+    stage: stringValue(payload.stage),
     status,
+    stop_reason: stringValue(payload.stop_reason),
+    task_id: stringValue(payload.task_id),
     thread_id: context.threadId,
     tool_id: toolId,
     trace_id: backendTraceId ?? context.traceId,
+    workflow: stringValue(payload.workflow),
+    workflow_id: stringValue(payload.workflow_id),
   });
 }
 
@@ -664,9 +755,32 @@ function pythonEventSummary(event: PythonSseEvent) {
 
 function recordPythonStreamEvent(
   event: PythonSseEvent,
-  pythonEventTypes: Map<string, number>
+  pythonEventTypes: Map<string, number>,
+  state: CopilotStreamState
 ) {
-  incrementCount(pythonEventTypes, event.event || "unknown");
+  const eventType = event.event || "unknown";
+  incrementCount(pythonEventTypes, eventType);
+  const payload = eventPayload(event);
+  if (eventType === "prompt_chain.stage_completed") {
+    state.promptChainStageCount = (state.promptChainStageCount ?? 0) + 1;
+  }
+  if (eventType === "prompt_chain.fallback") {
+    state.promptChainFallbackCount = (state.promptChainFallbackCount ?? 0) + 1;
+  }
+  if (eventType === "evaluator_optimizer.summary") {
+    state.evaluatorStopReason = stringValue(payload.stop_reason) ?? state.evaluatorStopReason;
+  }
+  if (eventType === "agent_loop.tool_checked") {
+    const toolCallCount = numberValue(payload.tool_call_count);
+    if (toolCallCount !== undefined) {
+      state.agentLoopToolCount = Math.max(state.agentLoopToolCount ?? 0, toolCallCount);
+    } else if (stringValue(payload.gate) === "policy") {
+      state.agentLoopToolCount = (state.agentLoopToolCount ?? 0) + 1;
+    }
+    if (stringValue(payload.decision) === "blocked") {
+      state.agentLoopBlockedToolCount = (state.agentLoopBlockedToolCount ?? 0) + 1;
+    }
+  }
 }
 
 function marketSnapshotSymbol(value: unknown) {
@@ -681,7 +795,8 @@ function writePythonEventAsAgUi(
   write: (event: Record<string, unknown>) => void,
   event: PythonSseEvent,
   state: CopilotStreamState,
-  language: LanguagePreference
+  language: LanguagePreference,
+  context: CopilotStreamContext
 ) {
   const reasoning = reasoningSummaryFromPythonEvent(event);
   writePythonEventActivityAsAgUi(write, event);
@@ -689,11 +804,13 @@ function writePythonEventAsAgUi(
   writePythonEventMetadataAsAgUi(write, event);
 
   if (event.event !== "message.delta" && !reasoning) {
+    const sequence = state.runEventSequence ?? 0;
+    state.runEventSequence = sequence + 1;
     write({
       name: "strategy.runEvent",
       timestamp: Date.now(),
       type: "CUSTOM",
-      value: userSafeRunEventValue(event),
+      value: userSafeRunEventValue(event, context, sequence),
     });
   }
 
@@ -786,7 +903,7 @@ function writePythonToolEventAsAgUi(
   event: PythonSseEvent,
   state: CopilotStreamState
 ) {
-  const phase = toolEventPhase(event.event);
+  const phase = toolEventPhase(event);
   if (!phase) {
     return;
   }
@@ -904,7 +1021,13 @@ function inlineTableCustomValue(toolName: string, payload: Record<string, unknow
   return backtestTradesTableFromToolOutput(payload.output);
 }
 
-function toolEventPhase(eventType: string): "completed" | "failed" | "started" | null {
+function toolEventPhase(event: PythonSseEvent): "completed" | "failed" | "started" | null {
+  const eventType = event.event;
+  const payload = eventPayload(event);
+  const metadataPhase = stringValue(payload.lifecycle_phase);
+  if (metadataPhase === "completed" || metadataPhase === "failed" || metadataPhase === "started") {
+    return metadataPhase;
+  }
   if (eventType === "tool.started") {
     return "started";
   }
@@ -1067,6 +1190,10 @@ function stringValue(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 class ChatStreamTimeoutError extends Error {
@@ -1237,6 +1364,10 @@ function userSafeActivityLabel(event: PythonSseEvent) {
 function activityStatus(event: PythonSseEvent) {
   const eventType = event.event;
   const payload = eventPayload(event);
+  const metadataState = stringValue(payload.activity_state);
+  if (metadataState === "complete" || metadataState === "failed" || metadataState === "running") {
+    return metadataState;
+  }
   if (
     eventType === "tool.completed" &&
     (payload.status === "failed" || payload.status === "error")
@@ -1256,20 +1387,34 @@ function activityStatus(event: PythonSseEvent) {
   return "complete";
 }
 
-function userSafeRunEventValue(event: PythonSseEvent) {
+function userSafeRunEventValue(
+  event: PythonSseEvent,
+  context: CopilotStreamContext,
+  fallbackSequence: number
+) {
+  const data = event.data && typeof event.data === "object" ? event.data : {};
   const value: Record<string, unknown> = {
     event: event.event,
+    event_id: stringValue((data as Record<string, unknown>).event_id) ?? event.id ?? `evt_${crypto.randomUUID()}`,
+    conversation_id:
+      stringValue((data as Record<string, unknown>).conversation_id) ?? context.conversationId,
+    created_at:
+      stringValue((data as Record<string, unknown>).created_at) ?? new Date().toISOString(),
+    request_id:
+      stringValue((data as Record<string, unknown>).request_id) ?? context.requestId,
+    run_id: stringValue((data as Record<string, unknown>).run_id) ?? context.runId,
+    sequence:
+      typeof (data as Record<string, unknown>).sequence === "number"
+        ? (data as Record<string, unknown>).sequence
+        : fallbackSequence,
+    trace_id:
+      stringValue((data as Record<string, unknown>).trace_id) ?? context.traceId,
+    type: stringValue((data as Record<string, unknown>).type) ?? event.event,
   };
-  const data = event.data && typeof event.data === "object" ? event.data : {};
-  for (const key of ["event_id", "conversation_id", "run_id", "sequence", "type", "created_at"]) {
-    const fieldValue = (data as Record<string, unknown>)[key];
-    if (
-      typeof fieldValue === "string" ||
-      typeof fieldValue === "number" ||
-      typeof fieldValue === "boolean"
-    ) {
-      value[key] = fieldValue;
-    }
+  const workflow = strategyWorkflowFromPythonEvent(event);
+  if (workflow) {
+    value.payload = workflow;
+    return value;
   }
 
   const payload = (data as Record<string, unknown>).payload;
@@ -1284,6 +1429,18 @@ function userSafeRunEventValue(event: PythonSseEvent) {
 
 function sanitizeRunEventPayload(payload: Record<string, unknown>) {
   const result = pickUserSafeFields(payload, SAFE_RUN_EVENT_PAYLOAD_FIELDS) ?? {};
+  const usage = pickNumericFields(payload.usage, ["input_tokens", "output_tokens", "total_tokens"]);
+  if (usage) {
+    result.usage = usage;
+  }
+  const repairSourceMix = pickNumericFields(payload.repair_source_mix, [
+    "llm",
+    "deterministic",
+    "unknown",
+  ]);
+  if (repairSourceMix) {
+    result.repair_source_mix = repairSourceMix;
+  }
 
   const input = sanitizeToolArgs(payload.input ?? payload.args ?? payload.parameters);
   if (input) {
@@ -1292,6 +1449,21 @@ function sanitizeRunEventPayload(payload: Record<string, unknown>) {
   const output = sanitizeToolResult(payload.output);
   if (output && Object.keys(output).length > 0) {
     result.output = output;
+  }
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function pickNumericFields(value: unknown, allowed: readonly string[]) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const result: Record<string, number> = {};
+  for (const key of allowed) {
+    const fieldValue = record[key];
+    if (typeof fieldValue === "number" && Number.isFinite(fieldValue)) {
+      result[key] = fieldValue;
+    }
   }
   return Object.keys(result).length > 0 ? result : null;
 }

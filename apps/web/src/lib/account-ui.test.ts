@@ -10,10 +10,18 @@ import {
   providerRouteReady,
 } from "./account-ui";
 
+const capabilityMatrix: ProviderStatusResponse["capability_matrix"] = {
+  agent: { missing_components: [], reason_codes: [], status: "available" },
+  "backtest-preview": { missing_components: [], reason_codes: [], status: "available" },
+  "dry-run": { missing_components: [], reason_codes: [], status: "available" },
+  "live-generation": { missing_components: [], reason_codes: [], status: "available" },
+};
+
 const me: MeResponse = {
   capability: {
     allowed_message_modes: ["deterministic", "agent"],
     allowed_run_modes: ["dry-run", "agent", "live-generation"],
+    capability_matrix: capabilityMatrix,
     role: "owner",
     tier: "free",
     tier_label: "Free",
@@ -28,6 +36,7 @@ function provider(overrides: Partial<ProviderStatusResponse> = {}): ProviderStat
   const base = {
     allowed_message_modes: ["deterministic", "agent"],
     allowed_run_modes: ["dry-run", "agent", "live-generation"],
+    capability_matrix: capabilityMatrix,
     available: true,
     available_gateways: ["litellm_proxy"],
     configured: true,
@@ -73,6 +82,7 @@ describe("account UI helpers", () => {
     const legacyReady = {
       allowed_message_modes: ["deterministic", "agent"],
       allowed_run_modes: ["dry-run", "agent", "live-generation"],
+      capability_matrix: capabilityMatrix,
       available: true,
       available_gateways: [],
       configured: true,

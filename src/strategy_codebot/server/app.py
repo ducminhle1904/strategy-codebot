@@ -50,6 +50,9 @@ from strategy_codebot.server.model_routing import gateway_env_report
 from strategy_codebot.server.model_routing import load_model_registry
 from strategy_codebot.server.model_routing import normalize_user_tier
 from strategy_codebot.server.model_routing import resolve_routes
+from strategy_codebot.server.model_audit import WORKFLOW_GATE_CONFIRMED
+from strategy_codebot.server.model_audit import WORKFLOW_GATE_REJECTED
+from strategy_codebot.server.model_audit import append_model_audit_event
 from strategy_codebot.server.observability import append_stage_event
 from strategy_codebot.server.observability import build_observability_summary
 from strategy_codebot.server.observability import ensure_harness_evidence_artifact
@@ -85,6 +88,7 @@ from strategy_codebot.server.repository import NautilusRuntimeEventRecord
 from strategy_codebot.server.repository import NautilusRuntimeRecord
 from strategy_codebot.server.repository import RunEventRecord
 from strategy_codebot.server.repository import TERMINAL_RUN_STATUSES
+from strategy_codebot.server.repository import WorkflowTaskRecord
 from strategy_codebot.server.run_modes import RUN_MODE_AGENT
 from strategy_codebot.server.run_modes import RUN_MODE_BACKTEST_PREVIEW
 from strategy_codebot.server.run_modes import BACKTEST_ENGINE_PINEFORGE
@@ -114,6 +118,7 @@ from strategy_codebot.server.schemas import FeedbackCreate
 from strategy_codebot.server.schemas import FeedbackOption
 from strategy_codebot.server.schemas import FeedbackOptionsResponse
 from strategy_codebot.server.schemas import FeedbackResponse
+from strategy_codebot.server.schemas import CapabilityModeStatus
 from strategy_codebot.server.schemas import KnowledgeCandidateCreate
 from strategy_codebot.server.schemas import KnowledgeCandidateListResponse
 from strategy_codebot.server.schemas import KnowledgeCandidateResponse
@@ -144,6 +149,10 @@ from strategy_codebot.server.schemas import StrategyMemoryResponse
 from strategy_codebot.server.schemas import StrategyProfileResponse
 from strategy_codebot.server.schemas import StrategySnapshotResponse
 from strategy_codebot.server.schemas import WorkspaceCapabilityResponse
+from strategy_codebot.server.schemas import WorkflowTaskListResponse
+from strategy_codebot.server.schemas import WorkflowTaskContinuationRequest
+from strategy_codebot.server.schemas import WorkflowTaskResponse
+from strategy_codebot.server.schemas import WorkflowTaskResponseRequest
 from strategy_codebot.server.runner_bridge import execute_dry_run
 from strategy_codebot.server.runner_bridge import execute_live_generation
 from strategy_codebot.server.runner_bridge import RunnerIntegrationResult
@@ -158,6 +167,13 @@ from strategy_codebot.server.security_controls import budget_policy_finding
 from strategy_codebot.server.security_controls import security_error_payload
 from strategy_codebot.server.streaming import DETERMINISTIC_DELTA_CHUNKS
 from strategy_codebot.server.streaming import compact_delta_text
+from strategy_codebot.server.workflow_tasks import WorkflowTaskValidationError
+from strategy_codebot.server.workflow_tasks import validate_workflow_task_response
+from strategy_codebot.server.workflow_tasks import workflow_task_continuation_state
+from strategy_codebot.server.workflow_tasks import workflow_task_response_status
+from strategy_codebot.server.workflow_tasks import workflow_task_resume_context
+from strategy_codebot.server.workflow_tasks import workflow_task_state
+from strategy_codebot.server.workflow_task_status import WORKFLOW_TASK_RESOLVED_STATUSES
 from strategy_codebot.server.streaming import sse_frame
 from strategy_codebot.server.streaming import transient_delta_event
 from strategy_codebot.server.ids import opaque_id
@@ -403,6 +419,7 @@ def create_app(
             tier_label=capability.tier_label,
             allowed_message_modes=capability.allowed_message_modes,
             allowed_run_modes=capability.allowed_run_modes,
+            capability_matrix=capability.capability_matrix,
             fallback_mode="deterministic",
             model_routing_mode=routing_status["model_routing_mode"],
             model_tier=routing_status["model_tier"],
@@ -427,6 +444,246 @@ def create_app(
                 for entry in ACTION_REGISTRY
             ],
         }
+
+    @api.get("/v1/conversations/{conversation_id}/workflow-tasks", response_model=WorkflowTaskListResponse)
+    def list_workflow_tasks(
+        conversation_id: str,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> WorkflowTaskListResponse:
+        tasks = conversation_repository.list_workflow_tasks(auth, conversation_id)
+        if tasks is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+        return WorkflowTaskListResponse(items=[_workflow_task_response(task) for task in tasks])
+
+    @api.post("/v1/workflow-tasks/{task_id}/responses", response_model=WorkflowTaskResponse)
+    def submit_workflow_task_response(
+        task_id: str,
+        payload: WorkflowTaskResponseRequest,
+        request: Request,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> WorkflowTaskResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="workflow_tasks.response")
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        task = conversation_repository.get_workflow_task(auth, task_id)
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow task not found")
+        try:
+            response_json = validate_workflow_task_response(
+                task,
+                values=payload.values,
+                action_id=payload.action_id,
+                partial=True,
+            )
+        except WorkflowTaskValidationError as exc:
+            _append_workflow_task_audit_event(
+                conversation_repository,
+                auth,
+                task,
+                WORKFLOW_GATE_REJECTED,
+                {
+                    "actor": "backend",
+                    "status": "rejected",
+                    "reason_code": "task_response_invalid",
+                    "action_id": payload.action_id,
+                },
+            )
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        updated = conversation_repository.submit_workflow_task_response(
+            auth,
+            task.id,
+            response_json=response_json,
+            status=workflow_task_response_status(task, response_json, requested_status=payload.status),
+        )
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow task not found")
+        _append_workflow_task_event(
+            conversation_repository,
+            auth,
+            updated,
+            "workflow.task.response_submitted",
+            {"task_id": updated.id, "task_template_id": updated.task_template_id, "status": updated.status},
+        )
+        if updated.status in WORKFLOW_TASK_RESOLVED_STATUSES:
+            _append_workflow_task_event(
+                conversation_repository,
+                auth,
+                updated,
+                "workflow.task.resolved",
+                {"task_id": updated.id, "task_template_id": updated.task_template_id, "status": updated.status},
+            )
+            continuation = (
+                workflow_task_continuation_state(updated)
+                if task.status not in WORKFLOW_TASK_RESOLVED_STATUSES
+                else None
+            )
+            if continuation is not None:
+                _append_workflow_task_event(
+                    conversation_repository,
+                    auth,
+                    updated,
+                    "workflow.continuation.required",
+                    continuation,
+                )
+        _append_workflow_task_audit_event(
+            conversation_repository,
+            auth,
+            updated,
+            WORKFLOW_GATE_CONFIRMED,
+            {
+                "actor": "user",
+                "status": "executed" if updated.status in WORKFLOW_TASK_RESOLVED_STATUSES else "allowed",
+                "decision": updated.status,
+                "action_id": payload.action_id,
+            },
+        )
+        return _workflow_task_response(updated)
+
+    @api.post("/v1/workflow-tasks/{task_id}/continuations")
+    def continue_workflow_task(
+        task_id: str,
+        payload: WorkflowTaskContinuationRequest,
+        request: Request,
+        stream: bool = Query(default=True),
+        idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+        x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
+        x_trace_id: str | None = Header(default=None, alias="X-Trace-Id"),
+        auth: AuthContext = Depends(require_auth_context),
+    ):
+        request_id = x_request_id or opaque_id("req")
+        trace_id = x_trace_id or opaque_id("trace")
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="workflow_tasks.continuation")
+            idempotency = controls.begin_idempotency(
+                auth,
+                method=request.method,
+                path=request.url.path,
+                key=idempotency_key,
+                body={"task_id": task_id, **payload.model_dump(mode="json"), "stream": stream},
+            )
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        if idempotency is not None and idempotency.replay:
+            return JSONResponse(idempotency.response, status_code=idempotency.status_code or status.HTTP_200_OK)
+        if not stream:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Workflow task continuation requires stream=true")
+        task = conversation_repository.get_workflow_task(auth, task_id)
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow task not found")
+        continuation = workflow_task_continuation_state(task)
+        if continuation is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow task is not resumable")
+        continuation_status = _workflow_continuation_event_state(
+            conversation_repository,
+            auth,
+            task.id,
+        )
+        if continuation_status in {"started", "completed"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow continuation already started")
+        try:
+            llm_orchestrator.ensure_configured()
+        except ProviderConfigurationError as exc:
+            return _security_error_response(exc)
+        agent_log(
+            logger,
+            "info",
+            "workflow.continuation.opened",
+            component="api",
+            conversation_id=task.conversation_id,
+            language=payload.language,
+            request_id=request_id,
+            task_id=task.id,
+            trace_id=trace_id,
+            user_tier=auth.user_tier,
+            web_search=payload.web_search,
+        )
+        return StreamingResponse(
+            _idempotent_sse_stream(
+                llm_orchestrator.stream_chat(
+                    auth=auth,
+                    conversation_id=task.conversation_id,
+                    language=payload.language,
+                    message_content=workflow_task_resume_context(task, language=payload.language),
+                    current_message_id=None,
+                    request_id=request_id,
+                    trace_id=trace_id,
+                    web_search=payload.web_search,
+                    workflow_task_resume=continuation,
+                ),
+                controls,
+                idempotency,
+            ),
+            media_type="text/event-stream",
+            status_code=status.HTTP_200_OK,
+        )
+
+    @api.post("/v1/workflow-tasks/{task_id}/actions/{action_id}", response_model=WorkflowTaskResponse)
+    def submit_workflow_task_action(
+        task_id: str,
+        action_id: str,
+        request: Request,
+        payload: WorkflowTaskResponseRequest | None = None,
+        auth: AuthContext = Depends(require_auth_context),
+    ) -> WorkflowTaskResponse | JSONResponse:
+        try:
+            controls.check_write(auth, ip_address=_client_ip(request), surface="workflow_tasks.action")
+        except SecurityControlError as exc:
+            return _security_error_response(exc)
+        task = conversation_repository.get_workflow_task(auth, task_id)
+        if task is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow task not found")
+        values = payload.values if payload is not None else {}
+        requested_status = payload.status if payload is not None else "approved"
+        try:
+            response_json = validate_workflow_task_response(task, values=values, action_id=action_id)
+        except WorkflowTaskValidationError as exc:
+            _append_workflow_task_audit_event(
+                conversation_repository,
+                auth,
+                task,
+                WORKFLOW_GATE_REJECTED,
+                {
+                    "actor": "backend",
+                    "status": "rejected",
+                    "reason_code": "task_action_invalid",
+                    "action_id": action_id,
+                },
+            )
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+        updated = conversation_repository.resolve_workflow_task(
+            auth,
+            task.id,
+            status=requested_status,
+            response_json=response_json,
+        )
+        if updated is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow task not found")
+        _append_workflow_task_event(
+            conversation_repository,
+            auth,
+            updated,
+            "workflow.gate.updated",
+            {
+                "task_id": updated.id,
+                "task_template_id": updated.task_template_id,
+                "action_id": action_id,
+                "status": updated.status,
+            },
+        )
+        _append_workflow_task_audit_event(
+            conversation_repository,
+            auth,
+            updated,
+            WORKFLOW_GATE_CONFIRMED,
+            {
+                "actor": "user",
+                "status": "executed",
+                "decision": updated.status,
+                "action_id": action_id,
+            },
+        )
+        return _workflow_task_response(updated)
 
     @api.post(
         "/v1/bots/proposals",
@@ -504,6 +761,18 @@ def create_app(
             data_subscriptions=proposal.data_subscriptions_json,
         )
         if missing:
+            _append_bot_proposal_audit_event(
+                conversation_repository,
+                auth,
+                proposal,
+                WORKFLOW_GATE_REJECTED,
+                {
+                    "status": "rejected",
+                    "reason_code": "missing_inputs",
+                    "missing_fields": missing,
+                    "risk_level": "paper_simulation_gate",
+                },
+            )
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail={"message": "Bot proposal is missing required inputs", "missing_inputs": missing},
@@ -560,6 +829,18 @@ def create_app(
             idempotency_key=f"bot-proposal-start:{proposal.id}",
         )
         updated_proposal = conversation_repository.mark_bot_proposal_started(auth, proposal.id, runtime_id=runtime.id)
+        _append_bot_proposal_audit_event(
+            conversation_repository,
+            auth,
+            updated_proposal or proposal,
+            WORKFLOW_GATE_CONFIRMED,
+            {
+                "status": "executed",
+                "reason_code": "confirm_start",
+                "risk_level": "paper_simulation",
+                "runtime_id": runtime.id,
+            },
+        )
         response = BotProposalConfirmStartResponse(
             proposal=_bot_proposal_response(updated_proposal or proposal),
             runtime=_nautilus_runtime_response(runtime),
@@ -1165,6 +1446,11 @@ def create_app(
                 snapshot.latest_run_artifacts,
             ),
             strategy_profile=_strategy_profile(snapshot),
+            pending_workflow_continuation=_pending_workflow_continuation(
+                conversation_repository,
+                auth,
+                snapshot.conversation.id,
+            ),
         )
 
     @api.get("/v1/conversations/{conversation_id}/artifacts", response_model=ArtifactListResponse)
@@ -2493,6 +2779,129 @@ def _bot_proposal_response(proposal: BotProposalRecord) -> BotProposalResponse:
     )
 
 
+def _workflow_task_response(task: WorkflowTaskRecord) -> WorkflowTaskResponse:
+    return WorkflowTaskResponse(**workflow_task_state(task))
+
+
+def _workflow_continuation_event_state(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    task_id: str,
+) -> str | None:
+    events = repository.list_workflow_task_continuation_events(auth, task_id)
+    if events is None:
+        return None
+    return _workflow_continuation_events_by_task(events).get(task_id, {}).get("status")
+
+
+def _workflow_continuation_events_by_task(events: list[RunEventRecord]) -> dict[str, dict[str, Any]]:
+    state_by_task: dict[str, dict[str, Any]] = {}
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        if event.type == "workflow.continuation.required":
+            state_by_task[task_id] = {"payload": payload, "status": "required"}
+        elif event.type == "workflow.continuation.started":
+            state_by_task[task_id] = {**state_by_task.get(task_id, {}), "status": "started"}
+        elif event.type == "workflow.continuation.completed":
+            state_by_task[task_id] = {**state_by_task.get(task_id, {}), "status": "completed"}
+        elif event.type == "workflow.continuation.failed":
+            state_by_task[task_id] = {**state_by_task.get(task_id, {}), "status": "failed"}
+    return state_by_task
+
+
+def _pending_workflow_continuation(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+) -> dict[str, Any] | None:
+    tasks = repository.list_workflow_tasks(auth, conversation_id)
+    if not tasks:
+        return None
+    for task in reversed(tasks):
+        if workflow_task_continuation_state(task) is None:
+            continue
+        events = repository.list_workflow_task_continuation_events(auth, task.id)
+        if events is None:
+            continue
+        item = _workflow_continuation_events_by_task(events).get(task.id, {})
+        if item.get("status") != "required":
+            continue
+        payload = item.get("payload")
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _append_workflow_task_event(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    task: WorkflowTaskRecord,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    if not task.run_id:
+        return
+    repository.append_run_event(auth, task.run_id, event_type, payload)
+
+
+def _append_workflow_task_audit_event(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    task: WorkflowTaskRecord,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    if not task.run_id:
+        return
+    run = repository.get_run(auth, task.run_id)
+    if run is None:
+        return
+    append_model_audit_event(
+        repository,
+        auth,
+        run,
+        event_type,
+        {
+            "actor": "user" if payload.get("actor") == "user" else "backend",
+            "source": "workflow_task",
+            "workflow_id": task.workflow_id,
+            "task_id": task.id,
+            "task_template_id": task.task_template_id,
+            "step_id": task.step_id,
+            **payload,
+        },
+    )
+
+
+def _append_bot_proposal_audit_event(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    proposal: BotProposalRecord,
+    event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    if not proposal.source_run_id:
+        return
+    run = repository.get_run(auth, proposal.source_run_id)
+    if run is None:
+        return
+    append_model_audit_event(
+        repository,
+        auth,
+        run,
+        event_type,
+        {
+            "actor": "backend",
+            "source": "bot_proposal",
+            "proposal_id": proposal.id,
+            **payload,
+        },
+    )
+
+
 def _nautilus_runtime_event_response(event: NautilusRuntimeEventRecord) -> NautilusRuntimeEventResponse:
     return NautilusRuntimeEventResponse(
         event_id=event.id,
@@ -2952,7 +3361,13 @@ def _current_usage_period() -> tuple[datetime, datetime]:
 
 def _workspace_capability(auth: AuthContext) -> WorkspaceCapabilityResponse:
     allowed_message_modes = ["deterministic", "agent"]
-    allowed_run_modes = list(RUN_MODES)
+    capability_matrix = _workspace_capability_matrix()
+    allowed_run_modes = [
+        mode
+        for mode in RUN_MODES
+        if capability_matrix.get(mode, CapabilityModeStatus(status="blocked", reason_codes=["unknown_mode"])).status
+        in {"available", "degraded"}
+    ]
     return WorkspaceCapabilityResponse(
         user_id=auth.user_id,
         workspace_id=auth.workspace_id,
@@ -2961,7 +3376,15 @@ def _workspace_capability(auth: AuthContext) -> WorkspaceCapabilityResponse:
         tier_label=TIER_LABELS.get(auth.user_tier, auth.user_tier),
         allowed_message_modes=allowed_message_modes,
         allowed_run_modes=allowed_run_modes,
+        capability_matrix=capability_matrix,
     )
+
+
+def _workspace_capability_matrix() -> dict[str, CapabilityModeStatus]:
+    return {
+        mode: CapabilityModeStatus(status="available")
+        for mode in RUN_MODES
+    }
 
 
 USER_FACING_MODEL_STAGES = (
@@ -3042,6 +3465,9 @@ def _run_idempotency_body(payload: RunCreate) -> dict[str, Any]:
     body = payload.model_dump(mode="json")
     if body.get("web_search") == "auto":
         body.pop("web_search", None)
+    for key in ("pine_code", "backtest_config"):
+        if body.get(key) is None:
+            body.pop(key, None)
     return body
 
 

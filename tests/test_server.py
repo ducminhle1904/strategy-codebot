@@ -97,6 +97,7 @@ def test_me_returns_workspace_capability() -> None:
     assert payload["capability"]["tier"] == "paid_medium"
     assert payload["capability"]["tier_label"] == "Pro"
     assert payload["capability"]["allowed_message_modes"] == ["deterministic", "agent"]
+    assert payload["capability"]["capability_matrix"]["dry-run"]["status"] == "available"
 
 
 def test_provider_status_does_not_expose_secrets() -> None:
@@ -108,6 +109,8 @@ def test_provider_status_does_not_expose_secrets() -> None:
     payload = response.json()
     assert payload["tier"] == "paid_low"
     assert "allowed_run_modes" in payload
+    assert "capability_matrix" in payload
+    assert payload["capability_matrix"]["dry-run"]["status"] == "available"
     assert "model_routing_mode" in payload
     assert "route_ready" in payload
     assert "user_message" in payload

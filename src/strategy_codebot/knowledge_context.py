@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,28 @@ KNOWLEDGE_CONTEXT_MODES = {KNOWLEDGE_CONTEXT_AUTO, KNOWLEDGE_CONTEXT_OFF}
 
 MAX_DOCS_PER_CONTEXT = 5
 MAX_CHARS_PER_DOC = 1800
+DEFAULT_SELECTION_ALIASES = {
+    "pine": ("pine", "tradingview", "indicator", "strategy"),
+    "mql5": ("mql5", "mt5", "metatrader", "expert advisor", "both-platform", "both platform"),
+    "crypto": ("crypto", "bitcoin", "btc", "ethereum", "eth", "altcoin", "perpetual", "funding", "exchange"),
+    "forex": ("forex", "fx", "eurusd", "gbpusd", "usdjpy", "session", "london", "new york", "rollover", "spread"),
+    "review": (
+        "review",
+        "overfit",
+        "backtest",
+        "optimize",
+        "curve",
+        "robust",
+        "sample size",
+        "position sizing",
+        "risk gate",
+        "invalidation",
+        "price action",
+        "lesson",
+        "postmortem",
+    ),
+    "strategy_general": ("trend", "mean reversion", "breakout", "volatility", "position sizing"),
+}
 
 INTERNAL_DOCS = {
     "pine_v6_rules": {
@@ -61,13 +85,30 @@ INTERNAL_DOCS = {
 }
 
 
-def build_knowledge_context(prompt: str, *, source_registry_path: Path | None = None) -> dict[str, Any]:
+@dataclass(frozen=True)
+class KnowledgeSelectionSignals:
+    pine_context: bool = True
+    mql5_context: bool = False
+    crypto_context: bool = False
+    forex_context: bool = False
+    review_context: bool = False
+    strategy_general_context: bool = False
+    source: str = "structured"
+
+
+def build_knowledge_context(
+    prompt: str,
+    *,
+    source_registry_path: Path | None = None,
+    selection_signals: KnowledgeSelectionSignals | dict[str, Any] | None = None,
+) -> dict[str, Any]:
     index_path = default_index_path()
     if ensure_database_url() or index_path.exists():
         try:
-            return build_retrieved_knowledge_context(prompt, index_path=index_path)
+            retrieved = build_retrieved_knowledge_context(prompt, index_path=index_path)
+            return _merge_static_floor(prompt, retrieved, selection_signals=selection_signals)
         except Exception as exc:
-            fallback = _build_static_knowledge_context(prompt, source_registry_path=source_registry_path)
+            fallback = _build_static_knowledge_context(prompt, source_registry_path=source_registry_path, selection_signals=selection_signals)
             fallback.update(
                 {
                     "knowledge_health_status": "degraded",
@@ -78,34 +119,77 @@ def build_knowledge_context(prompt: str, *, source_registry_path: Path | None = 
                 }
             )
             return fallback
-    return _build_static_knowledge_context(prompt, source_registry_path=source_registry_path)
+    return _build_static_knowledge_context(prompt, source_registry_path=source_registry_path, selection_signals=selection_signals)
 
 
-def _build_static_knowledge_context(prompt: str, *, source_registry_path: Path | None = None) -> dict[str, Any]:
+def _merge_static_floor(
+    prompt: str,
+    context: dict[str, Any],
+    *,
+    selection_signals: KnowledgeSelectionSignals | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    existing_doc_ids = {str(doc.get("id")) for doc in context.get("internal_docs", []) if isinstance(doc, dict)}
+    internal_docs = list(context.get("internal_docs", []))
+    context_refs = list(context.get("context_refs", []))
+    floor_docs = []
+    for doc_id in _floor_doc_ids_for_prompt(prompt, selection_signals=selection_signals):
+        if doc_id in existing_doc_ids:
+            continue
+        doc = _internal_doc_payload(doc_id)
+        floor_docs.append(doc)
+        internal_docs.append(doc)
+        existing_doc_ids.add(doc_id)
+        path = doc.get("path")
+        if path and path not in context_refs:
+            context_refs.append(path)
+    if internal_docs:
+        context["internal_docs"] = internal_docs
+    if context_refs:
+        context["context_refs"] = context_refs
+    stage_relevance = dict(context.get("stage_relevance", {}))
+    for stage, refs in _stage_relevance(floor_docs).items():
+        merged_refs = list(stage_relevance.get(stage, []))
+        for ref in refs:
+            if ref not in merged_refs:
+                merged_refs.append(ref)
+        if merged_refs:
+            stage_relevance[stage] = merged_refs
+    if stage_relevance:
+        context["stage_relevance"] = stage_relevance
+    return context
+
+
+def _floor_doc_ids_for_prompt(
+    prompt: str,
+    *,
+    source_registry_path: Path | None = None,
+    selection_signals: KnowledgeSelectionSignals | dict[str, Any] | None = None,
+) -> list[str]:
     registry_path = resolve_repo_path(source_registry_path or repo_root() / "configs" / "source-registry.yaml")
-    prompt_text = prompt.lower()
-    wants_mql5 = any(token in prompt_text for token in ("mql5", "mt5", "metatrader", "expert advisor", "both-platform", "both platform"))
-    wants_pine = not wants_mql5 or any(token in prompt_text for token in ("pine", "tradingview", "indicator", "strategy"))
-    wants_crypto = any(token in prompt_text for token in ("crypto", "bitcoin", "btc", "ethereum", "eth", "altcoin", "perpetual", "funding", "exchange"))
-    wants_forex = any(token in prompt_text for token in ("forex", "fx", "eurusd", "gbpusd", "usdjpy", "session", "london", "new york", "rollover", "spread"))
-    wants_review_skill = any(
-        token in prompt_text
-        for token in (
-            "review",
-            "overfit",
-            "backtest",
-            "optimize",
-            "curve",
-            "robust",
-            "sample size",
-            "position sizing",
-            "risk gate",
-            "invalidation",
-            "price action",
-            "lesson",
-            "postmortem",
-        )
-    )
+    signals = _knowledge_selection_signals(prompt, registry_path, selection_signals=selection_signals)
+    wants_mql5 = bool(signals["mql5_context"])
+    wants_pine = bool(signals["pine_context"])
+    selected = ["risk_policy"]
+    if wants_pine:
+        selected.insert(0, "pine_v6_rules")
+    if wants_mql5:
+        selected.append("mql5_rules")
+    return selected
+
+
+def _build_static_knowledge_context(
+    prompt: str,
+    *,
+    source_registry_path: Path | None = None,
+    selection_signals: KnowledgeSelectionSignals | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    registry_path = resolve_repo_path(source_registry_path or repo_root() / "configs" / "source-registry.yaml")
+    signals = _knowledge_selection_signals(prompt, registry_path, selection_signals=selection_signals)
+    wants_mql5 = bool(signals["mql5_context"])
+    wants_pine = bool(signals["pine_context"])
+    wants_crypto = bool(signals["crypto_context"])
+    wants_forex = bool(signals["forex_context"])
+    wants_review_skill = bool(signals["review_context"])
     selected_keys = ["risk_policy"]
     if wants_pine:
         selected_keys.insert(0, "pine_v6_rules")
@@ -115,7 +199,7 @@ def _build_static_knowledge_context(prompt: str, *, source_registry_path: Path |
         selected_keys.append("crypto_playbook")
     if wants_forex:
         selected_keys.append("forex_playbook")
-    if wants_crypto or wants_forex or any(token in prompt_text for token in ("trend", "mean reversion", "breakout", "volatility", "position sizing")):
+    if wants_crypto or wants_forex or bool(signals["strategy_general_context"]):
         selected_keys.append("strategy_patterns")
     selected_keys.append("anti_overfit_checklist")
     if wants_mql5:
@@ -133,6 +217,9 @@ def _build_static_knowledge_context(prompt: str, *, source_registry_path: Path |
             "mql5_context": wants_mql5,
             "crypto_context": wants_crypto,
             "forex_context": wants_forex,
+            "review_context": wants_review_skill,
+            "strategy_general_context": bool(signals["strategy_general_context"]),
+            "selection_source": str(signals["source"]),
             "risk_context": True,
             "external_refs_only": True,
         },
@@ -223,6 +310,13 @@ def _knowledge_doc_ids(context: dict[str, Any]) -> list[str]:
 
 
 def _internal_doc_payload(doc_id: str) -> dict[str, Any]:
+    payload = dict(_cached_internal_doc_payload(doc_id))
+    payload["stages"] = list(payload["stages"])
+    return payload
+
+
+@lru_cache(maxsize=None)
+def _cached_internal_doc_payload(doc_id: str) -> dict[str, Any]:
     config = INTERNAL_DOCS[doc_id]
     path = resolve_repo_path(Path(config["path"]))
     raw = path.read_text(encoding="utf-8")
@@ -236,6 +330,74 @@ def _internal_doc_payload(doc_id: str) -> dict[str, Any]:
         "truncated": truncated,
         "char_count": len(raw),
     }
+
+
+def _knowledge_selection_signals(
+    prompt: str,
+    registry_path: Path,
+    *,
+    selection_signals: KnowledgeSelectionSignals | dict[str, Any] | None = None,
+) -> dict[str, bool | str]:
+    if selection_signals is not None:
+        return _normalize_selection_signals(selection_signals)
+
+    prompt_text = prompt.lower()
+    aliases = _selection_aliases(registry_path)
+    wants_mql5 = _matches_any_alias(prompt_text, aliases["mql5"])
+    wants_pine = not wants_mql5 or _matches_any_alias(prompt_text, aliases["pine"])
+    return {
+        "pine_context": wants_pine,
+        "mql5_context": wants_mql5,
+        "crypto_context": _matches_any_alias(prompt_text, aliases["crypto"]),
+        "forex_context": _matches_any_alias(prompt_text, aliases["forex"]),
+        "review_context": _matches_any_alias(prompt_text, aliases["review"]),
+        "strategy_general_context": _matches_any_alias(prompt_text, aliases["strategy_general"]),
+        "source": "legacy_alias_fallback",
+    }
+
+
+def _normalize_selection_signals(selection_signals: KnowledgeSelectionSignals | dict[str, Any]) -> dict[str, bool | str]:
+    if isinstance(selection_signals, KnowledgeSelectionSignals):
+        raw = {
+            "pine_context": selection_signals.pine_context,
+            "mql5_context": selection_signals.mql5_context,
+            "crypto_context": selection_signals.crypto_context,
+            "forex_context": selection_signals.forex_context,
+            "review_context": selection_signals.review_context,
+            "strategy_general_context": selection_signals.strategy_general_context,
+            "source": selection_signals.source,
+        }
+    else:
+        raw = selection_signals
+    return {
+        "pine_context": bool(raw.get("pine_context", True)),
+        "mql5_context": bool(raw.get("mql5_context", False)),
+        "crypto_context": bool(raw.get("crypto_context", False)),
+        "forex_context": bool(raw.get("forex_context", False)),
+        "review_context": bool(raw.get("review_context", False)),
+        "strategy_general_context": bool(raw.get("strategy_general_context", False)),
+        "source": str(raw.get("source") or "structured"),
+    }
+
+
+def _selection_aliases(registry_path: Path) -> dict[str, tuple[str, ...]]:
+    aliases = {key: tuple(values) for key, values in DEFAULT_SELECTION_ALIASES.items()}
+    try:
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    except Exception:
+        return aliases
+    raw_aliases = registry.get("selection_aliases", {}) if isinstance(registry, dict) else {}
+    if not isinstance(raw_aliases, dict):
+        return aliases
+    for key in aliases:
+        values = raw_aliases.get(key)
+        if isinstance(values, list) and all(isinstance(value, str) for value in values):
+            aliases[key] = tuple(value.lower() for value in values if value.strip())
+    return aliases
+
+
+def _matches_any_alias(prompt_text: str, aliases: tuple[str, ...]) -> bool:
+    return any(alias in prompt_text for alias in aliases)
 
 
 def _truncate_doc(text: str) -> tuple[str, bool]:

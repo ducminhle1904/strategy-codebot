@@ -19,6 +19,7 @@ import {
   runEventMetadataByAnchorMessage,
   shouldShowStrategyProfile,
 } from "./chat-ui";
+import { normalizeWorkflowState } from "./workflow-ui";
 
 function strategyMessage(role: "assistant" | "user", text: string) {
   return {
@@ -125,6 +126,20 @@ describe("chat UI helpers", () => {
     expect(isRenderableMessage(assistant)).toBe(true);
   });
 
+  it("keeps workflow-only assistant messages visible before text arrives", () => {
+    const workflow = normalizeWorkflowState({
+      current_step: "collect_strategy_inputs",
+      workflow_id: "strategy_bot_simulation",
+    });
+    const assistant = {
+      ...strategyMessage("assistant", ""),
+      workflow,
+    };
+
+    expect(workflow).not.toBeNull();
+    expect(isRenderableMessage(assistant)).toBe(true);
+  });
+
   it("finds only the assistant response for the latest user turn", () => {
     const oldAssistant = strategyMessage("assistant", "Hi back");
     const latestUser = strategyMessage("user", "analyze current ETH market");
@@ -203,6 +218,29 @@ describe("chat UI helpers", () => {
       kind: "report",
       qualityStatus: "pass",
     });
+  });
+
+  it("anchors persisted safe reasoning deltas to the assistant message", () => {
+    const metadata = runEventMetadataByAnchorMessage({
+      backendMessages: [
+        backendMessage("msg_user", "user", "2026-06-21T11:44:44.000Z"),
+        backendMessage("msg_assistant", "assistant", "2026-06-21T11:44:58.000Z"),
+      ],
+      events: [
+        runEvent("model.reasoning.delta", "2026-06-21T11:44:55.000Z", {
+          safe: true,
+          text: "Checking workflow state.",
+        }),
+      ],
+    });
+
+    expect(metadata.get("msg_assistant")?.reasoningSummaries).toEqual([
+      {
+        id: "evt_model_reasoning_delta",
+        state: "done",
+        text: "Checking workflow state.",
+      },
+    ]);
   });
 
   it("does not attach cancelled-run metadata to a previous assistant", () => {
@@ -442,6 +480,8 @@ describe("chat UI helpers", () => {
     expect(marketPatch?.marketSnapshot).toMatchObject({ price: "$1,705.40", symbol: "ETH" });
     expect(shouldShowStrategyProfile("strategy_building")).toBe(true);
     expect(shouldShowStrategyProfile("artifact_generation")).toBe(true);
+    expect(shouldShowStrategyProfile("pine_generation")).toBe(true);
+    expect(shouldShowStrategyProfile("backtest_preview")).toBe(true);
   });
 
   it("does not expose sources for normal text-only messages", () => {

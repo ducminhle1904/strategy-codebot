@@ -3,11 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { backtestTradesTableFromToolOutput } from "@/lib/backtest-trades-inline-table";
 
 const streamMessageMock = vi.fn();
+const streamWorkflowTaskContinuationMock = vi.fn();
 let cancelCount = 0;
 
 vi.mock("@/lib/server-auth", () => ({
   createServerBackendClient: vi.fn(async () => ({
     streamMessage: streamMessageMock,
+    streamWorkflowTaskContinuation: streamWorkflowTaskContinuationMock,
   })),
 }));
 
@@ -460,6 +462,39 @@ describe("/api/copilotkit-chat", () => {
     );
   });
 
+  it("handles a final buffered backend event through the same workflow projection", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const frame = pythonSse({
+      data: {
+        payload: {
+          stage: "strategy_reasoning",
+          status: "completed",
+          workflow: "strategy_prompt_chain",
+        },
+        run_id: "run_backend",
+      },
+      event: "prompt_chain.stage_completed",
+    }).replace(/\n\n$/, "");
+    streamMessageMock.mockResolvedValue(responseFromSseFrames([frame]));
+
+    const events = await postCopilotRun({
+      forwardedProps: { conversationId: "conv_1" },
+      messages: [{ content: "hello", role: "user" }],
+    });
+    const runEvents = events.filter(
+      (event) => event.type === "CUSTOM" && event.name === "strategy.runEvent"
+    );
+
+    expect(runEvents[0]?.value).toMatchObject({
+      payload: { stage: "strategy_reasoning" },
+      type: "prompt_chain.stage_completed",
+    });
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("event_type=prompt_chain.stage_completed")
+    );
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("chain_stage_count=1"));
+  });
+
   it("maps Python SSE text and safe reasoning into AG-UI events", async () => {
     const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
     streamMessageMock.mockResolvedValue(
@@ -542,6 +577,251 @@ describe("/api/copilotkit-chat", () => {
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("status=success"));
   });
 
+  it("streams workflow task continuation without requiring a user message", async () => {
+    streamWorkflowTaskContinuationMock.mockResolvedValue(
+      responseFromSseFrames([
+        pythonSse({
+          data: {
+            payload: {
+              required: true,
+              status: "started",
+              task_id: "wft_1",
+            },
+          },
+          event: "workflow.continuation.started",
+          id: "evt_cont_started",
+        }),
+        pythonSse({
+          data: { payload: { delta: "Drafting spec" } },
+          event: "message.delta",
+          id: "evt_delta",
+        }),
+        pythonSse({
+          data: { payload: { status: "completed" }, run_id: "run_resume" },
+          event: "run.completed",
+          id: "evt_done",
+        }),
+      ])
+    );
+
+    const events = await postCopilotRun({
+      forwardedProps: {
+        conversationId: "conv_1",
+        language: "vi",
+        mode: "workflow_task_continuation",
+        workflowTaskId: "wft_1",
+      },
+      messages: [],
+      runId: "run_resume_client",
+    });
+
+    expect(streamMessageMock).not.toHaveBeenCalled();
+    expect(streamWorkflowTaskContinuationMock).toHaveBeenCalledWith(
+      "wft_1",
+      { language: "vi", web_search: "auto" },
+      expect.objectContaining({
+        idempotencyKey: "run_resume_client",
+        requestId: expect.stringMatching(/^req_/),
+        traceId: expect.stringMatching(/^trace_/),
+      })
+    );
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "RUN_STARTED" }),
+        expect.objectContaining({
+          name: "strategy.runEvent",
+          type: "CUSTOM",
+          value: expect.objectContaining({
+            payload: expect.objectContaining({ task_id: "wft_1" }),
+            type: "workflow.continuation.started",
+          }),
+        }),
+        expect.objectContaining({ delta: "Drafting spec", type: "TEXT_MESSAGE_CONTENT" }),
+        expect.objectContaining({ type: "RUN_FINISHED" }),
+      ])
+    );
+  });
+
+  it("does not let malformed backend run-event ids override stream context", async () => {
+    streamMessageMock.mockResolvedValue(
+      responseFromSseFrames([
+        pythonSse({
+          data: {
+            conversation_id: true,
+            created_at: false,
+            event_id: 456,
+            payload: { status: "completed" },
+            run_id: 123,
+            sequence: "bad",
+            type: false,
+          },
+          event: "run.completed",
+          id: "evt_done",
+        }),
+      ])
+    );
+
+    const events = await postCopilotRun({
+      forwardedProps: { conversationId: "conv_1" },
+      messages: [{ content: "hello", role: "user" }],
+      runId: "run_client",
+    });
+    const runEvent = events.find(
+      (event) => event.type === "CUSTOM" && event.name === "strategy.runEvent"
+    );
+
+    expect(runEvent?.value).toMatchObject({
+      conversation_id: "conv_1",
+      event_id: "evt_done",
+      run_id: "run_client",
+      sequence: 0,
+      type: "run.completed",
+    });
+    expect((runEvent?.value as Record<string, unknown>).created_at).toEqual(expect.any(String));
+  });
+
+  it("logs agent workflow observability events and final counters", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    streamMessageMock.mockResolvedValue(
+      responseFromSseFrames([
+        pythonSse({
+          data: {
+            payload: {
+              status: "started",
+              workflow: "strategy_prompt_chain",
+            },
+            run_id: "run_backend",
+          },
+          event: "prompt_chain.started",
+          id: "evt_chain_started",
+        }),
+        pythonSse({
+          data: {
+            payload: {
+              handoff_status: "passed",
+              model_stage: "strategy_reasoning",
+              provider_route: "openrouter/reasoning",
+              stage: "strategy_reasoning",
+              status: "completed",
+              usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+              workflow: "strategy_prompt_chain",
+            },
+            run_id: "run_backend",
+          },
+          event: "prompt_chain.stage_completed",
+          id: "evt_chain_stage",
+        }),
+        pythonSse({
+          data: {
+            payload: {
+              fallback_reason: "invalid_handoff",
+              stage: "strategy_coding",
+              status: "fallback",
+              workflow: "strategy_prompt_chain",
+            },
+            run_id: "run_backend",
+          },
+          event: "prompt_chain.fallback",
+          id: "evt_chain_fallback",
+        }),
+        pythonSse({
+          data: {
+            payload: {
+              budget_exhausted: false,
+              final_review_status: "blocked",
+              final_validation_status: "pass",
+              repair_count: 1,
+              repair_source_mix: { deterministic: 0, llm: 1, unknown: 0 },
+              status: "pass",
+              stop_reason: "policy_blocked",
+              workflow: "multi-agent",
+            },
+            run_id: "run_backend",
+          },
+          event: "evaluator_optimizer.summary",
+          id: "evt_eval",
+        }),
+        pythonSse({
+          data: {
+            payload: {
+              decision: "blocked",
+              gate: "policy",
+              iteration: 1,
+              reason_code: "agent_loop_tool_risk_blocked",
+              risk_tier: "code_generation",
+              status: "blocked",
+              tool_call_count: 1,
+              tool_id: "generate_pine",
+              workflow: "bounded_agent_loop",
+            },
+            run_id: "run_backend",
+          },
+          event: "agent_loop.tool_checked",
+          id: "evt_agent_tool",
+        }),
+        pythonSse({
+          data: { payload: { status: "completed" }, run_id: "run_backend" },
+          event: "run.completed",
+          id: "evt_done",
+        }),
+      ])
+    );
+
+    const events = await postCopilotRun({
+      forwardedProps: { conversationId: "conv_1" },
+      messages: [{ content: "build strategy", role: "user" }],
+      runId: "run_client",
+    });
+    const runEvents = events.filter(
+      (event) => event.type === "CUSTOM" && event.name === "strategy.runEvent"
+    );
+
+    expect(runEvents.map((event) => (event.value as Record<string, unknown>).type)).toEqual([
+      "prompt_chain.started",
+      "prompt_chain.stage_completed",
+      "prompt_chain.fallback",
+      "evaluator_optimizer.summary",
+      "agent_loop.tool_checked",
+      "run.completed",
+    ]);
+    expect(runEvents[1]?.value).toMatchObject({
+      payload: {
+        stage: "strategy_reasoning",
+        usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+      },
+    });
+    expect(runEvents[3]?.value).toMatchObject({
+      payload: {
+        repair_source_mix: { deterministic: 0, llm: 1, unknown: 0 },
+        stop_reason: "policy_blocked",
+      },
+    });
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("event_type=prompt_chain.stage_completed")
+    );
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("stage=strategy_reasoning"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("provider_route=openrouter/reasoning"));
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("event_type=evaluator_optimizer.summary")
+    );
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("stop_reason=policy_blocked"));
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("event_type=agent_loop.tool_checked")
+    );
+    expect(runEvents[4]?.value).toMatchObject({
+      payload: {
+        iteration: 1,
+        tool_call_count: 1,
+      },
+    });
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("reason_code=agent_loop_tool_risk_blocked"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("chain_stage_count=1"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("chain_fallback_count=1"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("evaluator_stop_reason=policy_blocked"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("agent_loop_tool_count=1"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("agent_loop_blocked_tool_count=1"));
+  });
+
   it("logs backend run failures as failed agent outcomes with failure code", async () => {
     const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
     streamMessageMock.mockResolvedValue(
@@ -579,6 +859,52 @@ describe("/api/copilotkit-chat", () => {
     );
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("agent_status=failed"));
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("status=backend_failed"));
+  });
+
+  it("logs canonical model workflow audit events from backend SSE summaries", async () => {
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    streamMessageMock.mockResolvedValue(
+      responseFromSseFrames([
+        pythonSse({
+          data: {
+            payload: {
+              actor: "backend",
+              proposal_id: "botp_1",
+              reason_code: "schema_invalid",
+              risk_level: "blocker",
+              source: "llm_tool_call",
+              status: "rejected",
+              task_id: "task_1",
+              tool_id: "generate_pine",
+              trace_id: "trace_backend",
+              workflow_id: "strategy_bot_simulation",
+            },
+            run_id: "run_backend",
+          },
+          event: "model_action.rejected",
+          id: "evt_audit",
+        }),
+      ])
+    );
+
+    await postCopilotRun({
+      forwardedProps: { conversationId: "conv_1", language: "en", mode: "agent" },
+      messages: [{ content: "generate pine", role: "user" }],
+      runId: "run_client",
+    });
+
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("event=backend.sse.event")
+    );
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("event_type=model_action.rejected")
+    );
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("source=llm_tool_call"));
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("reason_code=schema_invalid"));
+    expect(infoSpy).toHaveBeenCalledWith(
+      expect.stringContaining("workflow_id=strategy_bot_simulation")
+    );
+    expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("proposal_id=botp_1"));
   });
 
   it("preserves forwarded conversation id for new-chat sends and normalizes invalid options", async () => {
@@ -681,6 +1007,21 @@ describe("/api/copilotkit-chat", () => {
           event: "chat.suggestions.updated",
         }),
         pythonSse({
+          data: {
+            payload: {
+              workflow_id: "strategy_bot_simulation",
+              current_step: "draft_strategy_spec",
+              completed_steps: ["collect_strategy_inputs"],
+              required_fields: ["market", "symbol", "timeframe", "style", "risk_preference"],
+              missing_fields: ["account_id"],
+              artifact_refs: { pine_code_artifact_id: "artifact_pine" },
+              evidence_status: "insufficient_evidence",
+              start_allowed: false,
+            },
+          },
+          event: "chat.workflow.updated",
+        }),
+        pythonSse({
           data: { payload: { delta: "BTC update" } },
           event: "message.delta",
         }),
@@ -699,8 +1040,27 @@ describe("/api/copilotkit-chat", () => {
         expect.objectContaining({ name: "strategy.marketSnapshot" }),
         expect.objectContaining({ name: "strategy.sources" }),
         expect.objectContaining({ name: "strategy.suggestions" }),
+        expect.objectContaining({ name: "strategy.workflow" }),
       ])
     );
+    const workflowRunEvent = customEvents.find(
+      (event) =>
+        event.name === "strategy.runEvent" &&
+        event.value &&
+        typeof event.value === "object" &&
+        (event.value as Record<string, unknown>).type === "chat.workflow.updated"
+    );
+    expect(workflowRunEvent).toMatchObject({
+      value: {
+        conversation_id: "conv_1",
+        payload: {
+          artifact_refs: { pine_code_artifact_id: "artifact_pine" },
+          current_step: "draft_strategy_spec",
+          workflow_id: "strategy_bot_simulation",
+        },
+        type: "chat.workflow.updated",
+      },
+    });
     expect(events.filter((event) => event.type === "TEXT_MESSAGE_CONTENT")).toEqual([
       expect.objectContaining({ delta: "BTC update" }),
     ]);

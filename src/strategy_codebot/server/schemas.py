@@ -19,6 +19,12 @@ from strategy_codebot.server.run_modes import BACKTEST_EXECUTABLE_TIMEFRAMES
 from strategy_codebot.server.run_modes import BACKTEST_MAX_COST_BPS
 
 
+class CapabilityModeStatus(BaseModel):
+    status: Literal["available", "degraded", "blocked"]
+    reason_codes: list[str] = Field(default_factory=list)
+    missing_components: list[str] = Field(default_factory=list)
+
+
 class WorkspaceCapabilityResponse(BaseModel):
     user_id: str
     workspace_id: str
@@ -27,6 +33,7 @@ class WorkspaceCapabilityResponse(BaseModel):
     tier_label: str
     allowed_message_modes: list[str]
     allowed_run_modes: list[str]
+    capability_matrix: dict[str, CapabilityModeStatus] = Field(default_factory=dict)
 
 
 class MeResponse(BaseModel):
@@ -42,6 +49,7 @@ class ProviderStatusResponse(BaseModel):
     tier_label: str
     allowed_message_modes: list[str]
     allowed_run_modes: list[str]
+    capability_matrix: dict[str, CapabilityModeStatus] = Field(default_factory=dict)
     fallback_mode: str
     model_routing_mode: str = "registry"
     model_tier: str | None = None
@@ -166,6 +174,62 @@ class BotProposalResponse(BaseModel):
     runtime_id: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class WorkflowTaskResponseRequest(BaseModel):
+    values: dict[str, Any] = Field(default_factory=dict)
+    action_id: str | None = Field(default=None, min_length=1, max_length=120)
+    status: Literal["completed", "approved", "rejected", "cancelled", "blocked"] = "completed"
+
+
+class WorkflowTaskContinuationState(BaseModel):
+    required: bool = False
+    task_id: str
+    workflow_id: str
+    task_template_id: str
+    resume_intent: str | None = None
+    reason: str | None = None
+
+
+class WorkflowTaskContinuationRequest(BaseModel):
+    language: str = "en"
+    web_search: str = Field(default="auto", pattern="^(off|auto|on)$")
+
+    @field_validator("language")
+    @classmethod
+    def normalize_language(cls, value: str) -> str:
+        return "vi" if value == "vi" else "en"
+
+    @field_validator("web_search")
+    @classmethod
+    def normalize_web_search(cls, value: str) -> str:
+        return value if value in {"off", "auto", "on"} else "auto"
+
+
+class WorkflowTaskResponse(BaseModel):
+    id: str
+    workflow_id: str
+    task_template_id: str
+    step_id: str
+    kind: str
+    status: str
+    title: str
+    blocking: bool
+    input_request_ids: list[str] = Field(default_factory=list)
+    action_ids: list[str] = Field(default_factory=list)
+    input_requests: list[dict[str, Any]] = Field(default_factory=list)
+    actions: list[dict[str, Any]] = Field(default_factory=list)
+    values: dict[str, Any] = Field(default_factory=dict)
+    response: dict[str, Any] | None = None
+    reason: str | None = None
+    continuation: WorkflowTaskContinuationState | None = None
+    created_at: datetime
+    updated_at: datetime
+    resolved_at: datetime | None = None
+
+
+class WorkflowTaskListResponse(BaseModel):
+    items: list[WorkflowTaskResponse]
 
 
 class NautilusRuntimeEventResponse(BaseModel):
@@ -625,6 +689,7 @@ class ConversationStateResponse(BaseModel):
     conversation_run_events: list[RunEventResponse] = Field(default_factory=list)
     feedback_targets: dict[str, Any]
     strategy_profile: StrategyProfileResponse | None = None
+    pending_workflow_continuation: WorkflowTaskContinuationState | None = None
 
 
 class FeedbackCreate(BaseModel):

@@ -70,6 +70,30 @@ class ToolHarness:
         for event in events:
             self.record_external_event(event)
 
+    def record_blocked_tool(
+        self,
+        tool_id: str,
+        reason: str,
+        *,
+        risk_tier: str | None = None,
+        input_refs: list[str] | None = None,
+        output_refs: list[str] | None = None,
+        failure_class: str = FAILURE_POLICY_VIOLATION,
+    ) -> None:
+        contract = self.contracts.get(tool_id, ToolContract(id=tool_id, risk_tier=risk_tier or "unknown"))
+        input_refs = input_refs or []
+        output_refs = output_refs or []
+        self._record("tool.started", contract, input_refs=input_refs, output_refs=output_refs, status=STATUS_STARTED)
+        self._record(
+            "tool.blocked",
+            contract,
+            input_refs=input_refs,
+            output_refs=output_refs,
+            error={"type": "ToolBlockedError", "message": reason},
+            status=STATUS_BLOCKED,
+            failure_class=failure_class,
+        )
+
     def call(
         self,
         tool_id: str,
@@ -201,6 +225,7 @@ def check_tool_registry(registry_path: Path) -> dict[str, Any]:
 
     checks.append(validation_check("tools_present", bool(tools), f"Found {len(tools)} tools." if tools else "Registry must contain tools."))
     seen: set[str] = set()
+    seen_provider_names: dict[str, str] = {}
     for index, tool in enumerate(tools):
         if not isinstance(tool, dict):
             checks.append({"name": f"tool_{index}:mapping", "status": STATUS_FAIL, "details": "Each tool entry must be a mapping."})
@@ -214,6 +239,32 @@ def check_tool_registry(registry_path: Path) -> dict[str, Any]:
             validate_payload(tool, "tool-contract.schema.json")
         except Exception as exc:
             checks.append({"name": f"{tool_id}:schema", "status": STATUS_FAIL, "details": str(exc)})
+        provider_names: list[str] = []
+        if tool.get("provider_exposed") is True:
+            backend_handler = str(tool.get("backend_handler") or "").strip()
+            if backend_handler:
+                provider_names.append(backend_handler)
+            aliases = tool.get("aliases", [])
+            if isinstance(aliases, list):
+                provider_names.extend(str(alias).strip() for alias in aliases if str(alias).strip())
+            provider_names = list(dict.fromkeys(provider_names))
+            checks.append(
+                validation_check(
+                    f"{tool_id}:provider_metadata",
+                    bool(provider_names),
+                    "Provider-exposed tools must declare backend_handler or aliases." if not provider_names else "Provider metadata present.",
+                )
+            )
+        for provider_name in provider_names:
+            previous = seen_provider_names.get(provider_name)
+            checks.append(
+                validation_check(
+                    f"{tool_id}:provider_name:{provider_name}",
+                    previous is None,
+                    f"Provider name already claimed by {previous}." if previous else "Provider name is unique.",
+                )
+            )
+            seen_provider_names.setdefault(provider_name, tool_id)
         else:
             checks.append({"name": f"{tool_id}:schema", "status": STATUS_PASS, "details": "Tool contract schema is valid."})
 

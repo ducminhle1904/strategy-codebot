@@ -21,6 +21,11 @@ import yaml
 from jsonschema import ValidationError
 
 from strategy_codebot.agent_harness import classify_failure
+from strategy_codebot.evaluator_optimizer import evaluator_review_status as _evaluator_optimizer_review_status
+from strategy_codebot.evaluator_optimizer import evaluator_stop_reason as _evaluator_optimizer_stop_reason
+from strategy_codebot.evaluator_optimizer import repair_source_mix as _repair_source_mix
+from strategy_codebot.evaluator_optimizer import validation_allows_artifact as _validation_allows_artifact
+from strategy_codebot.evaluator_optimizer import validation_failures as _validation_failures
 from strategy_codebot.harness_types import (
     FAILURE_CONFIGURATION_ERROR,
     FAILURE_FREE_CAPACITY_UNAVAILABLE,
@@ -37,7 +42,14 @@ from strategy_codebot.harness_types import (
     STATUS_SKIPPED,
     STATUS_STARTED,
 )
-from strategy_codebot.knowledge_context import KNOWLEDGE_CONTEXT_AUTO, KNOWLEDGE_CONTEXT_MODES, build_knowledge_context, compact_knowledge_context, knowledge_metadata
+from strategy_codebot.knowledge_context import (
+    KNOWLEDGE_CONTEXT_AUTO,
+    KNOWLEDGE_CONTEXT_MODES,
+    KnowledgeSelectionSignals,
+    build_knowledge_context,
+    compact_knowledge_context,
+    knowledge_metadata,
+)
 from strategy_codebot.openrouter_free import free_catalog_report, resolve_free_catalog, select_free_models_for_task
 from strategy_codebot.pine import validate_pine
 from strategy_codebot.prompt_contracts import (
@@ -58,6 +70,7 @@ from strategy_codebot.prompt_contracts import (
 from strategy_codebot.route_health import load_route_health as load_persisted_route_health
 from strategy_codebot.route_health import record_route_attempt as record_persisted_route_attempt
 from strategy_codebot.schemas import schema, validate_payload
+from strategy_codebot.current_context_policy import current_context_policy_decision
 from strategy_codebot.tool_runtime import POLICY_ENFORCE, POLICY_OBSERVE, find_policy_claims
 
 
@@ -104,6 +117,10 @@ WEB_SEARCH_AUTO = "auto"
 WEB_SEARCH_ON = "on"
 WEB_SEARCH_MODES = {WEB_SEARCH_OFF, WEB_SEARCH_AUTO, WEB_SEARCH_ON}
 WEB_SEARCH_DEFAULT = WEB_SEARCH_AUTO
+LIVE_KNOWLEDGE_REVIEW_INTENTS = frozenset({"backtest_preview", "strategy_review", "market_research"})
+LIVE_KNOWLEDGE_STRATEGY_INTENTS = frozenset(
+    {None, "strategy_building", "artifact_generation", "pine_generation", "backtest_preview"}
+)
 
 CONSERVATIVE_POSITION_SIZING_GUIDANCE = (
     "Use 1-2% account equity risk per trade, fixed units, or another explicitly bounded small-risk position sizing model. "
@@ -284,6 +301,8 @@ class LiveRunOptions:
     prompt_profile: str = PROMPT_PROFILE_DEFAULT
     web_search: str = WEB_SEARCH_DEFAULT
     require_web_search: bool = False
+    response_intent: str | None = None
+    current_context_required: bool = False
     route_health: dict[tuple[str, str], "RouteHealthState"] = field(default_factory=dict, repr=False, compare=False)
     proxy_attribution_path: Path | None = field(default=None, repr=False, compare=False)
     runtime_preflight: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
@@ -463,10 +482,11 @@ class LiveGenerationResult:
     post_repair_review_count: int = 0
     provider_calls_saved: int = 0
     repair_budget_exhausted: bool = False
+    evaluator_optimizer_summary: dict[str, Any] = field(default_factory=dict)
 
     def metadata(self) -> dict[str, Any]:
         market_research = self.market_research or {}
-        return {
+        metadata = {
             "workflow": self.workflow,
             "user_tier": self.user_tier,
             "prompt_profile": self.prompt_profile,
@@ -514,6 +534,9 @@ class LiveGenerationResult:
             **self.free_catalog,
             **knowledge_metadata(self.knowledge_context),
         }
+        if self.evaluator_optimizer_summary:
+            metadata["evaluator_optimizer_summary"] = self.evaluator_optimizer_summary
+        return metadata
 
 
 @dataclass
@@ -1008,6 +1031,8 @@ def generate_live(
     knowledge_context: str = KNOWLEDGE_CONTEXT_AUTO,
     web_search: str = WEB_SEARCH_DEFAULT,
     require_web_search: bool = False,
+    response_intent: str | None = None,
+    current_context_required: bool = False,
 ) -> LiveGenerationResult:
     try:
         import litellm
@@ -1026,11 +1051,17 @@ def generate_live(
         knowledge_context=knowledge_context,
         web_search=web_search,
         require_web_search=require_web_search,
+        response_intent=response_intent,
+        current_context_required=current_context_required,
     )
     runtime_preflight = _raise_if_runtime_misconfigured(registry, options)
     options.runtime_preflight = runtime_preflight
     _load_persistent_route_health(options)
-    run_knowledge_context = build_knowledge_context(prompt) if options.knowledge_context == KNOWLEDGE_CONTEXT_AUTO else {}
+    run_knowledge_context = (
+        build_knowledge_context(prompt, selection_signals=_live_knowledge_selection_signals(options))
+        if options.knowledge_context == KNOWLEDGE_CONTEXT_AUTO
+        else {}
+    )
     if options.workflow == WORKFLOW_SINGLE:
         result = _generate_single_live(litellm, prompt, registry, options=options, policy=policy, knowledge_context=run_knowledge_context)
     elif options.workflow == WORKFLOW_COMPACT_FREE:
@@ -1069,6 +1100,8 @@ def normalize_live_options(
     prompt_profile: str = PROMPT_PROFILE_DEFAULT,
     web_search: str = WEB_SEARCH_DEFAULT,
     require_web_search: bool = False,
+    response_intent: str | None = None,
+    current_context_required: bool = False,
 ) -> LiveRunOptions:
     if live_options is not None:
         if (
@@ -1082,6 +1115,8 @@ def normalize_live_options(
             or prompt_profile != PROMPT_PROFILE_DEFAULT
             or web_search != WEB_SEARCH_DEFAULT
             or require_web_search
+            or response_intent is not None
+            or current_context_required
         ):
             raise ValueError("live_options cannot be combined with legacy live option kwargs")
         return live_options
@@ -1096,6 +1131,8 @@ def normalize_live_options(
         prompt_profile=prompt_profile,
         web_search=web_search,
         require_web_search=require_web_search,
+        response_intent=response_intent,
+        current_context_required=current_context_required,
     )
 
 
@@ -1250,6 +1287,7 @@ def _generate_compact_free_live(
             {
                 "iteration": repair_iteration + 1,
                 "stage": "compact_free_validation_repair",
+                "repair_source": "llm",
                 "validation_failures": validation_failures,
                 "validation_warnings": validation.get("warnings", []),
                 "previous_model": call.model,
@@ -1270,6 +1308,22 @@ def _generate_compact_free_live(
     review_output = {"verdict": STATUS_PASS, "required_fixes": [], "rationale": "compact-free uses local validation and quality gates; no paid review stage."}
     repair_count = len(repair_history)
     production_gate = _production_gate(validation, review_output, [*call.policy_findings, *final_policy_findings], repair_count)
+    repair_loop_metrics = {
+        "llm_repair_count": repair_count,
+        "deterministic_repair_count": 0,
+        "post_repair_review_count": 0,
+        "provider_calls_saved": 0,
+        "repair_budget_exhausted": False,
+    }
+    evaluator_optimizer_summary = _evaluator_optimizer_summary(
+        validation=validation,
+        review_output=review_output,
+        production_gate=production_gate,
+        policy_findings=[*call.policy_findings, *final_policy_findings],
+        repair_count=repair_count,
+        repair_history=repair_history,
+        repair_loop_metrics=repair_loop_metrics,
+    )
     free_report = free_catalog_report(free_catalog, models)
     stage_record = {
         "stage": "compact_free",
@@ -1302,6 +1356,7 @@ def _generate_compact_free_live(
         "knowledge_context": _knowledge_context_summary(knowledge_context),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "route_health_snapshot": _route_health_snapshot(options.route_health),
         "cooldown_skips": _cooldown_skips(attempts),
         "fallback_count": _fallback_count(attempts),
@@ -1309,7 +1364,15 @@ def _generate_compact_free_live(
         "final_route_by_stage": {"compact_free": call.model},
         "stage_timeout_seconds": {"compact_free": _stage_route_policy(registry, "compact_free").request_timeout_seconds},
         "free_catalog": free_report,
-        "final_decision": {"status": STATUS_PASS, "validation_status": validation["status"], "validation": validation, "repair_count": repair_count, "generation_gate": generation_gate, "production_gate": production_gate},
+        "final_decision": {
+            "status": STATUS_PASS,
+            "validation_status": validation["status"],
+            "validation": validation,
+            "repair_count": repair_count,
+            "generation_gate": generation_gate,
+            "production_gate": production_gate,
+            "evaluator_optimizer_summary": evaluator_optimizer_summary,
+        },
     }
     return LiveGenerationResult(
         strategy_spec=strategy_spec,
@@ -1325,6 +1388,7 @@ def _generate_compact_free_live(
         stages=[_stage_metadata(stage_record)],
         workflow_trace=workflow_trace,
         repair_count=repair_count,
+        llm_repair_count=repair_count,
         policy_findings=[*call.policy_findings, *final_policy_findings],
         generation_gate=generation_gate,
         production_gate=production_gate,
@@ -1337,6 +1401,7 @@ def _generate_compact_free_live(
         stage_timeout_seconds={"compact_free": _stage_route_policy(registry, "compact_free").request_timeout_seconds},
         free_catalog=free_report,
         prompt_profile=options.prompt_profile,
+        evaluator_optimizer_summary=evaluator_optimizer_summary,
     )
 
 
@@ -1423,7 +1488,23 @@ def _compact_free_failure_diagnostics(
     final_attempt = _last_failed_attempt(attempts)
     repair_history = repair_history or []
     generation_gate = _generation_gate(validation or {})
-    production_gate = _production_gate(validation or {}, {"verdict": STATUS_FAIL, "required_fixes": []}, policy_findings or [], 0)
+    production_gate = _production_gate(validation or {}, {"verdict": STATUS_FAIL, "required_fixes": []}, policy_findings or [], len(repair_history))
+    repair_loop_metrics = {
+        "llm_repair_count": len(repair_history),
+        "deterministic_repair_count": 0,
+        "post_repair_review_count": 0,
+        "provider_calls_saved": 0,
+        "repair_budget_exhausted": bool(repair_history and validation and not _validation_allows_artifact(validation)),
+    }
+    evaluator_optimizer_summary = _evaluator_optimizer_summary(
+        validation=validation or {},
+        review_output={"verdict": STATUS_FAIL, "required_fixes": []},
+        production_gate=production_gate,
+        policy_findings=policy_findings or [],
+        repair_count=len(repair_history),
+        repair_history=repair_history,
+        repair_loop_metrics=repair_loop_metrics,
+    )
     final_decision = {
         "status": STATUS_FAIL,
         "failure_class": final_attempt.get("failure_class") or classify_failure(final_attempt.get("error_code"), final_attempt.get("error")),
@@ -1436,6 +1517,7 @@ def _compact_free_failure_diagnostics(
         "repair_count": len(repair_history),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
     }
     workflow_trace = {
         "run_id": run_id,
@@ -1451,6 +1533,7 @@ def _compact_free_failure_diagnostics(
         "knowledge_context": _knowledge_context_summary(knowledge_context),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "route_health_snapshot": _route_health_snapshot(options.route_health),
         "cooldown_skips": _cooldown_skips(attempts),
         "fallback_count": _fallback_count(attempts),
@@ -1475,6 +1558,7 @@ def _compact_free_failure_diagnostics(
         "attempts": attempts,
         "stages": [],
         "repair_count": len(repair_history),
+        **repair_loop_metrics,
         "validation": validation or {},
         "validation_status": (validation or {}).get("status"),
         "validation_failures": _validation_failures(validation),
@@ -1483,6 +1567,7 @@ def _compact_free_failure_diagnostics(
         **knowledge_metadata(knowledge_context),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "route_health_snapshot": _route_health_snapshot(options.route_health),
         "cooldown_skips": _cooldown_skips(attempts),
         "fallback_count": _fallback_count(attempts),
@@ -1507,6 +1592,7 @@ def _compact_free_failure_diagnostics(
         "validation_warnings": (validation or {}).get("warnings", []),
         "review_findings": {},
         "repair_history": repair_history,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "normalizations": [],
         "policy_findings": policy_findings or [],
         "knowledge_context": _knowledge_context_summary(knowledge_context),
@@ -1608,66 +1694,24 @@ def _web_search_should_run(prompt: str, options: LiveRunOptions) -> bool:
     return should_run
 
 
+def _live_knowledge_selection_signals(options: LiveRunOptions) -> KnowledgeSelectionSignals:
+    return KnowledgeSelectionSignals(
+        pine_context=True,
+        review_context=options.response_intent in LIVE_KNOWLEDGE_REVIEW_INTENTS,
+        strategy_general_context=options.response_intent in LIVE_KNOWLEDGE_STRATEGY_INTENTS,
+        source="live_options",
+    )
+
+
 def _web_search_decision(prompt: str, options: LiveRunOptions) -> tuple[bool, str]:
-    if options.web_search == WEB_SEARCH_OFF:
-        return False, "mode_off"
-    if options.web_search == WEB_SEARCH_ON:
-        return True, "mode_on"
-    lowered = prompt.lower()
-    current_terms = (
-        "latest",
-        "current",
-        "today",
-        "news",
-        "recent",
-        "updated",
-        "new rule",
-        "new rules",
-        "status",
-        "pricing",
-        "version",
-        "release",
-        "regulation",
-        "regulations",
-        "rules",
+    _ = prompt
+    decision = current_context_policy_decision(
+        web_search=options.web_search,
+        response_intent=options.response_intent,
+        current_context_required=options.current_context_required,
+        require_web_search=options.require_web_search,
     )
-    source_terms = (
-        "source",
-        "sources",
-        "citation",
-        "citations",
-        "cite",
-        "verify",
-        "research",
-        "web search",
-        "search web",
-        "look up",
-        "find sources",
-        "browser",
-        "fetch",
-    )
-    docs_provider_terms = (
-        "docs",
-        "documentation",
-        "provider",
-        "openrouter",
-        "vercel",
-        "gemini",
-        "model pricing",
-        "model provider",
-        "model docs",
-        "api docs",
-        "api reference",
-    )
-    for group_name, terms in (
-        ("current_info", current_terms),
-        ("source_request", source_terms),
-        ("docs_or_provider", docs_provider_terms),
-    ):
-        matched = next((term for term in terms if term in lowered), None)
-        if matched:
-            return True, f"auto_{group_name}:{matched}"
-    return False, "auto_no_current_info_signal"
+    return decision.enabled, decision.reason
 
 
 def _market_research_models(registry: dict[str, Any], options: LiveRunOptions) -> list[str]:
@@ -2172,6 +2216,15 @@ def _generate_multi_agent_live(
     production_gate = _production_gate(validation, review_output, stage_context.policy_findings, repair_count)
     repair_loop_metrics = _repair_loop_metrics(stage_context)
     production_gate.update(repair_loop_metrics)
+    evaluator_optimizer_summary = _evaluator_optimizer_summary(
+        validation=validation,
+        review_output=review_output,
+        production_gate=production_gate,
+        policy_findings=stage_context.policy_findings,
+        repair_count=repair_count,
+        repair_history=repair_history,
+        repair_loop_metrics=repair_loop_metrics,
+    )
     workflow_trace = {
         "run_id": run_id,
         "workflow": WORKFLOW_MULTI_AGENT,
@@ -2179,7 +2232,14 @@ def _generate_multi_agent_live(
         "cost_profile": options.cost_profile,
         "prompt_profile": options.prompt_profile,
         "agent_roles": AGENT_ROLE_REGISTRY,
-        "lifecycle_events": _lifecycle_events(run_id or "live-workflow", options.cost_profile, policy, stage_records, attempts),
+        "lifecycle_events": _lifecycle_events(
+            run_id or "live-workflow",
+            options.cost_profile,
+            policy,
+            stage_records,
+            attempts,
+            evaluator_optimizer_summary=evaluator_optimizer_summary,
+        ),
         "attempts": attempts,
         "stages": stage_records,
         "repair_history": repair_history,
@@ -2196,6 +2256,7 @@ def _generate_multi_agent_live(
         "web_search_decision_reason": market_research.get("web_search_decision_reason"),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         **repair_loop_metrics,
         "route_health_snapshot": _route_health_snapshot(options.route_health),
         "cooldown_skips": _cooldown_skips(attempts),
@@ -2213,6 +2274,7 @@ def _generate_multi_agent_live(
             **repair_loop_metrics,
             "generation_gate": generation_gate,
             "production_gate": production_gate,
+            "evaluator_optimizer_summary": evaluator_optimizer_summary,
         },
     }
     return LiveGenerationResult(
@@ -2246,6 +2308,7 @@ def _generate_multi_agent_live(
         stage_timeout_seconds=_stage_timeout_seconds(registry),
         prompt_profile=options.prompt_profile,
         market_research=market_research,
+        evaluator_optimizer_summary=evaluator_optimizer_summary,
     )
 
 
@@ -2652,16 +2715,6 @@ def _normalize_repaint_lookahead(code: str) -> tuple[str, dict[str, Any]]:
     return normalized, action
 
 
-def _validation_failures(validation: dict[str, Any] | None) -> list[dict[str, Any]]:
-    if not validation:
-        return []
-    return [
-        {"name": check.get("name"), "status": check.get("status"), "details": check.get("details")}
-        for check in validation.get("checks", [])
-        if check.get("status") not in {STATUS_PASS, STATUS_SKIPPED}
-    ]
-
-
 def _final_gate_failure_class(validation: dict[str, Any], review_output: dict[str, Any]) -> str:
     if validation["status"] != STATUS_PASS and review_output.get("verdict") == STATUS_PASS:
         return FAILURE_REVIEW_VALIDATION_DISAGREEMENT
@@ -2700,8 +2753,18 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
     generation_gate = _generation_gate(context.validation or {})
     production_gate = _production_gate(context.validation or {}, context.review_output or {}, context.policy_findings, context.repair_count)
     production_gate.update(repair_loop_metrics)
+    evaluator_optimizer_summary = _evaluator_optimizer_summary(
+        validation=context.validation or {},
+        review_output=context.review_output or {},
+        production_gate=production_gate,
+        policy_findings=context.policy_findings,
+        repair_count=context.repair_count,
+        repair_history=context.repair_history,
+        repair_loop_metrics=repair_loop_metrics,
+    )
     final_decision["generation_gate"] = generation_gate
     final_decision["production_gate"] = production_gate
+    final_decision["evaluator_optimizer_summary"] = evaluator_optimizer_summary
     workflow_trace = {
         "run_id": context.run_id,
         "workflow": context.options.workflow,
@@ -2709,7 +2772,14 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "cost_profile": context.options.cost_profile,
         "prompt_profile": context.options.prompt_profile,
         "agent_roles": AGENT_ROLE_REGISTRY,
-        "lifecycle_events": _lifecycle_events(context.run_id or "live-workflow", context.options.cost_profile, context.policy, context.stage_records, context.attempts),
+        "lifecycle_events": _lifecycle_events(
+            context.run_id or "live-workflow",
+            context.options.cost_profile,
+            context.policy,
+            context.stage_records,
+            context.attempts,
+            evaluator_optimizer_summary=evaluator_optimizer_summary,
+        ),
         "attempts": context.attempts,
         "stages": context.stage_records,
         "repair_history": context.repair_history,
@@ -2726,6 +2796,7 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "web_search_decision_reason": context.market_research.get("web_search_decision_reason"),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         **repair_loop_metrics,
         "route_health_snapshot": _route_health_snapshot(context.options.route_health),
         "cooldown_skips": _cooldown_skips(context.attempts),
@@ -2768,6 +2839,7 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "web_search_decision_reason": context.market_research.get("web_search_decision_reason"),
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "route_health_snapshot": _route_health_snapshot(context.options.route_health),
         "cooldown_skips": _cooldown_skips(context.attempts),
         "fallback_count": _fallback_count(context.attempts),
@@ -2797,6 +2869,7 @@ def _live_failure_diagnostics(context: StageRunContext, exc: LiveError) -> dict[
         "market_research": context.market_research,
         "generation_gate": generation_gate,
         "production_gate": production_gate,
+        "evaluator_optimizer_summary": evaluator_optimizer_summary,
         "route_health_snapshot": _route_health_snapshot(context.options.route_health),
         "cooldown_skips": _cooldown_skips(context.attempts),
         "fallback_count": _fallback_count(context.attempts),
@@ -4706,7 +4779,15 @@ def _sum_usage(stage_records: list[dict[str, Any]]) -> dict[str, Any]:
     return total
 
 
-def _lifecycle_events(run_id: str, cost_profile: str, policy: str, stage_records: list[dict[str, Any]], attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _lifecycle_events(
+    run_id: str,
+    cost_profile: str,
+    policy: str,
+    stage_records: list[dict[str, Any]],
+    attempts: list[dict[str, Any]],
+    *,
+    evaluator_optimizer_summary: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     attempt_lookup: dict[tuple[str | None, str | None, int | None], dict[str, Any]] = {}
     for attempt in attempts:
@@ -4805,6 +4886,21 @@ def _lifecycle_events(run_id: str, cost_profile: str, policy: str, stage_records
             usage=stage.get("usage", {}),
             status=stage.get("status", STATUS_PASS),
         )
+    if evaluator_optimizer_summary:
+        previous_event_id = append(
+            "evaluator_optimizer.summary",
+            agent_role="evaluator_optimizer",
+            stage="evaluator_optimizer",
+            parent_event_id=previous_event_id,
+            status=STATUS_PASS,
+            stop_reason=evaluator_optimizer_summary.get("stop_reason"),
+            repair_count=evaluator_optimizer_summary.get("repair_count"),
+            repair_source_mix=evaluator_optimizer_summary.get("repair_source_mix"),
+            final_validation_status=evaluator_optimizer_summary.get("final_validation_status"),
+            final_review_status=evaluator_optimizer_summary.get("final_review_status"),
+            budget_exhausted=evaluator_optimizer_summary.get("budget_exhausted"),
+            output_summary=evaluator_optimizer_summary.get("stop_reason"),
+        )
     append("agent.completed", agent_role="multi_agent_orchestrator", stage="workflow", parent_event_id=previous_event_id, status=STATUS_PASS, cost_profile=cost_profile)
     return events
 
@@ -4871,10 +4967,39 @@ def _repair_loop_metrics(context: StageRunContext) -> dict[str, Any]:
     }
 
 
-def _validation_allows_artifact(validation: dict[str, Any]) -> bool:
-    return validation.get("status") == STATUS_PASS or (
-        validation.get("status") == "manual_required" and not _validation_failures(validation)
+def _evaluator_optimizer_summary(
+    *,
+    validation: dict[str, Any],
+    review_output: dict[str, Any],
+    production_gate: dict[str, Any],
+    policy_findings: list[dict[str, Any]],
+    repair_count: int,
+    repair_history: list[dict[str, Any]],
+    repair_loop_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    budget_exhausted = bool(repair_loop_metrics.get("repair_budget_exhausted"))
+    final_review_status = _evaluator_optimizer_review_status(
+        review_output=review_output,
+        production_gate=production_gate,
     )
+    return {
+        "stop_reason": _evaluator_optimizer_stop_reason(
+            validation=validation,
+            final_review_status=final_review_status,
+            production_gate=production_gate,
+            policy_findings=policy_findings,
+            budget_exhausted=budget_exhausted,
+        ),
+        "repair_count": repair_count,
+        "repair_source_mix": _repair_source_mix(
+            repair_history,
+            repair_count=repair_count,
+            repair_loop_metrics=repair_loop_metrics,
+        ),
+        "final_validation_status": validation.get("status") or production_gate.get("validation_status"),
+        "final_review_status": final_review_status,
+        "budget_exhausted": budget_exhausted,
+    }
 
 
 def _required_fix_blocks_production(required_fix: str) -> bool:

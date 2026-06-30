@@ -10,13 +10,22 @@ from typing import Any, Callable
 
 from jsonschema import ValidationError, validate
 
+from strategy_codebot.evaluator_optimizer import (
+    evaluator_review_status,
+    evaluator_stop_reason,
+    validation_allows_artifact,
+    validation_failures,
+)
+from strategy_codebot.harness_types import STATUS_FAIL, STATUS_PASS
 from strategy_codebot.knowledge_context import build_knowledge_context
 from strategy_codebot.mql5 import runner_design
 from strategy_codebot.pine import generate_pine, validate_pine, validate_pineforge_pine
 from strategy_codebot.review import REVIEW_REPORT_PATH, write_review_report
 from strategy_codebot.schemas import schema
 from strategy_codebot.schemas import write_json
+from strategy_codebot.paths import repo_root
 from strategy_codebot.tool_runtime import POLICY_OBSERVE
+from strategy_codebot.tool_runtime import load_tool_registry
 from strategy_codebot.server.action_registry import action_registry_backend_tool_ids
 from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
 from strategy_codebot.server.artifact_store import LocalArtifactStore
@@ -27,6 +36,7 @@ from strategy_codebot.server.bot_proposals import BotProposalSourceNotFoundError
 from strategy_codebot.server.bot_proposals import build_bot_proposal_create_input
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
+from strategy_codebot.server.policy import evaluate_agent_loop_tool_policy
 from strategy_codebot.server.redaction import redact_value
 from strategy_codebot.server.repository import AssistantRunRecord
 from strategy_codebot.server.repository import ConversationRepository
@@ -381,6 +391,25 @@ def provider_tools() -> list[dict[str, Any]]:
     return [definition.as_provider_tool() for definition in TOOL_DEFINITIONS.values()]
 
 
+def read_risk_tool_names(registry: dict[str, Any]) -> list[str]:
+    registry_read_tools = {
+        str(entry["id"])
+        for entry in registry.get("tools", [])
+        if isinstance(entry, dict) and entry.get("id") and entry.get("risk_tier") == "read"
+    }
+    return [
+        name
+        for name in TOOL_DEFINITIONS
+        if name in registry_read_tools
+        and name in TOOL_HANDLERS
+        and evaluate_agent_loop_tool_policy(name, "read").allowed
+    ]
+
+
+def read_risk_provider_tools(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    return [TOOL_DEFINITIONS[name].as_provider_tool() for name in read_risk_tool_names(registry)]
+
+
 def validate_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> str | None:
     definition = TOOL_DEFINITIONS.get(tool_name)
     if definition is None:
@@ -413,7 +442,16 @@ def _generate_pine_tool(arguments: dict[str, Any], context: ToolExecutionContext
         content=pine_code,
         source="llm_orchestrator.generate_pine",
     )
-    return {"pine_code": pine_code, "artifact_id": artifact.id if artifact else None}
+    validation_summary = run_chat_artifact_validation_summary(
+        context,
+        strategy_spec=strategy_spec,
+        pine_code=pine_code,
+    )
+    return {
+        "pine_code": pine_code,
+        "artifact_id": artifact.id if artifact else None,
+        **validation_summary,
+    }
 
 
 def _create_mql5_design_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
@@ -439,20 +477,67 @@ def _create_mql5_design_tool(arguments: dict[str, Any], context: ToolExecutionCo
 
 def _static_validate_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
     strategy_spec = arguments["strategy_spec"]
-    validation = validate_pine(arguments["pine_code"], strategy_spec)
     context.repository.create_strategy_spec(
         context.auth,
         context.run.id,
         strategy_spec,
         STRATEGY_SPEC_SCHEMA_VERSION,
     )
+    validation, artifact_id = _persist_chat_validation_summary(
+        context,
+        strategy_spec=strategy_spec,
+        pine_code=arguments["pine_code"],
+        source="llm_orchestrator.static_validate",
+    )
+    return {"validation": validation, "artifact_id": artifact_id}
+
+
+def run_chat_artifact_validation_summary(
+    context: ToolExecutionContext,
+    *,
+    strategy_spec: dict[str, Any],
+    pine_code: str,
+) -> dict[str, Any]:
+    validation, validation_artifact_id = _persist_chat_validation_summary(
+        context,
+        strategy_spec=strategy_spec,
+        pine_code=pine_code,
+        source="llm_orchestrator.generate_pine.static_validation",
+    )
+    review_report, review_artifact_id = _persist_chat_review_summary(
+        context,
+        validation=validation,
+        source="llm_orchestrator.generate_pine.static_review",
+    )
+    evaluator_summary = _persist_chat_evaluator_optimizer_summary(
+        context,
+        validation=validation,
+        review_report=review_report,
+    )
+    return {
+        "validation": validation,
+        "validation_artifact_id": validation_artifact_id,
+        "review": review_report,
+        "review_artifact_id": review_artifact_id,
+        "evaluator_optimizer_summary": evaluator_summary,
+    }
+
+
+def _persist_chat_validation_summary(
+    context: ToolExecutionContext,
+    *,
+    strategy_spec: dict[str, Any],
+    pine_code: str,
+    source: str,
+) -> tuple[dict[str, Any], str | None]:
+    validation = validate_pine(pine_code, strategy_spec)
     artifact = _persist_json_artifact(
         context,
         kind="validation_report",
         display_name="validation-report.json",
         relative_path=VALIDATION_REPORT_PATH,
         payload=validation,
-        source="llm_orchestrator.static_validate",
+        source=source,
     )
     context.repository.create_validation_report(
         context.auth,
@@ -466,7 +551,96 @@ def _static_validate_tool(arguments: dict[str, Any], context: ToolExecutionConte
         "validation.completed",
         {"status": str(validation.get("status", "unknown"))},
     )
-    return {"validation": validation, "artifact_id": artifact.id if artifact else None}
+    return validation, artifact.id if artifact else None
+
+
+def _persist_chat_review_summary(
+    context: ToolExecutionContext,
+    *,
+    validation: dict[str, Any],
+    source: str,
+) -> tuple[dict[str, Any], str | None]:
+    failures = validation_failures(validation)
+    allowed = validation_allows_artifact(validation)
+    required_fixes = [
+        {
+            "source": "static_validation",
+            "check": str(failure.get("name") or "validation_check"),
+            "details": str(failure.get("details") or failure.get("message") or "Validation check failed."),
+        }
+        for failure in failures
+    ]
+    decision = STATUS_PASS if allowed else STATUS_FAIL
+    review_report: dict[str, Any] = {
+        "decision": decision,
+        "verdict": decision,
+        "source": "deterministic_static_validation",
+        "validation_status": str(validation.get("status", "unknown")),
+        "required_fixes": required_fixes,
+        "rationale": (
+            "Static Pine validation did not find blocking failures."
+            if allowed
+            else "Static Pine validation found blocking failures."
+        ),
+    }
+    artifact = _persist_json_artifact(
+        context,
+        kind="review_report",
+        display_name="review-report.json",
+        relative_path=REVIEW_REPORT_PATH,
+        payload=review_report,
+        source=source,
+    )
+    context.repository.create_review_report(
+        context.auth,
+        context.run.id,
+        decision=decision,
+        payload=review_report,
+    )
+    context.repository.append_run_event(
+        context.auth,
+        context.run.id,
+        "review.completed",
+        {"decision": decision, "source": "deterministic_static_validation"},
+    )
+    return review_report, artifact.id if artifact else None
+
+
+def _persist_chat_evaluator_optimizer_summary(
+    context: ToolExecutionContext,
+    *,
+    validation: dict[str, Any],
+    review_report: dict[str, Any],
+) -> dict[str, Any]:
+    final_review_status = evaluator_review_status(review_report=review_report)
+    production_gate = {
+        "status": STATUS_PASS if validation_allows_artifact(validation) and final_review_status != STATUS_FAIL else STATUS_FAIL,
+        "validation_status": str(validation.get("status", "unknown")),
+        "review_decision": final_review_status,
+        "blocking_required_fixes": review_report.get("required_fixes", []),
+        "source": "chat_generate_pine_static_validation",
+    }
+    summary = {
+        "stop_reason": evaluator_stop_reason(
+            validation=validation,
+            final_review_status=final_review_status,
+            production_gate=production_gate,
+            policy_findings=[],
+            budget_exhausted=False,
+        ),
+        "repair_count": 0,
+        "repair_source_mix": {"llm": 0, "deterministic": 0, "unknown": 0},
+        "final_validation_status": str(validation.get("status", "unknown")),
+        "final_review_status": final_review_status,
+        "budget_exhausted": False,
+    }
+    context.repository.append_run_event(
+        context.auth,
+        context.run.id,
+        "evaluator_optimizer.summary",
+        summary,
+    )
+    return summary
 
 
 def _parallel_review_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
@@ -834,7 +1008,20 @@ def _find_backtest_plan_for_approval(
     snapshot = repository.get_conversation_state_snapshot(auth, conversation_id, event_limit=500)
     if snapshot is None:
         raise ValueError("Conversation not found")
-    for artifact in snapshot.conversation_artifacts:
+    artifacts = list(snapshot.conversation_artifacts)
+    page = repository.list_conversation_artifacts_page(
+        auth,
+        conversation_id,
+        limit=500,
+        visibility="all",
+    )
+    if page is not None:
+        seen_artifact_ids = {artifact.id for artifact in artifacts}
+        for artifact in page.items:
+            if artifact.id not in seen_artifact_ids:
+                artifacts.append(artifact)
+                seen_artifact_ids.add(artifact.id)
+    for artifact in artifacts:
         if artifact.kind != "backtest_plan":
             continue
         content = artifact_store.read_content(artifact)
@@ -1728,6 +1915,7 @@ def tool_catalog_consistency_errors() -> list[str]:
     definition_names = set(TOOL_DEFINITIONS)
     handler_names = set(TOOL_HANDLERS)
     action_tool_names = action_registry_backend_tool_ids()
+    registry_provider_names, registry_errors = _provider_tool_names_from_registry()
     errors: list[str] = []
     missing_handlers = sorted(definition_names - handler_names)
     if missing_handlers:
@@ -1741,7 +1929,40 @@ def tool_catalog_consistency_errors() -> list[str]:
     missing_registry_handlers = sorted(action_tool_names - handler_names)
     if missing_registry_handlers:
         errors.append(f"Action registry backend tools without handlers: {', '.join(missing_registry_handlers)}")
+    errors.extend(registry_errors)
+    missing_provider_registry = sorted(definition_names - registry_provider_names)
+    if missing_provider_registry:
+        errors.append(f"Provider tool definitions missing from tool registry: {', '.join(missing_provider_registry)}")
+    registry_without_definitions = sorted(registry_provider_names - definition_names)
+    if registry_without_definitions:
+        errors.append(f"Provider-exposed registry tools without definitions: {', '.join(registry_without_definitions)}")
+    missing_handler_registry = sorted(handler_names - registry_provider_names)
+    if missing_handler_registry:
+        errors.append(f"Tool handlers missing from tool registry: {', '.join(missing_handler_registry)}")
     return errors
+
+
+def _provider_tool_names_from_registry() -> tuple[set[str], list[str]]:
+    registry = load_tool_registry(repo_root() / "configs" / "tool-registry.yaml")
+    provider_names: set[str] = set()
+    errors: list[str] = []
+    for entry in registry.get("tools", []):
+        if not isinstance(entry, dict) or entry.get("provider_exposed") is not True:
+            continue
+        tool_id = str(entry.get("id") or "").strip()
+        names: list[str] = []
+        backend_handler = str(entry.get("backend_handler") or "").strip()
+        if backend_handler:
+            names.append(backend_handler)
+        aliases = entry.get("aliases", [])
+        if isinstance(aliases, list):
+            names.extend(str(alias).strip() for alias in aliases if str(alias).strip())
+        names = list(dict.fromkeys(names))
+        if not names:
+            errors.append(f"Provider-exposed registry tool {tool_id or '<unknown>'} has no backend_handler or aliases")
+            continue
+        provider_names.update(names)
+    return provider_names, errors
 
 
 def execute_tool(tool_name: str, arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:

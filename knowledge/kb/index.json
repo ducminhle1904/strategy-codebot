@@ -25815,6 +25815,306 @@
       ],
       "created_at": "2026-06-28T09:17:45.492150+00:00",
       "last_used_at": "2026-06-28T09:17:45.492151+00:00"
+    },
+    "edcda59924b47083153a98e625c1866c192e5f20c8cb8d4cfdcfe4a412843d31": {
+      "normalized_query": "slow provider",
+      "stage": null,
+      "embedding_provider": "local",
+      "embedding_model": "local/hash-embedding-64",
+      "knowledge_version": "1",
+      "embedding": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.70710678,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.70710678,
+        0.0
+      ],
+      "created_at": "2026-06-29T15:07:35.931184+00:00",
+      "last_used_at": "2026-06-29T15:07:35.931199+00:00"
+    },
+    "e7510940e5fff54e9e166043d5eb715e9d43b526f03152fa7a8a6be446461f5c": {
+      "normalized_query": "create a pine strategy",
+      "stage": null,
+      "embedding_provider": "local",
+      "embedding_model": "local/hash-embedding-64",
+      "knowledge_version": "1",
+      "embedding": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "created_at": "2026-06-29T15:07:38.741140+00:00",
+      "last_used_at": "2026-06-29T15:07:38.741142+00:00"
+    },
+    "3f37a8f493ca276b1bcf561728d72868ca17bb339edf9fca1a6a2a983a51a804": {
+      "normalized_query": "create another pine strategy",
+      "stage": null,
+      "embedding_provider": "local",
+      "embedding_model": "local/hash-embedding-64",
+      "knowledge_version": "1",
+      "embedding": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "created_at": "2026-06-29T15:07:38.969093+00:00",
+      "last_used_at": "2026-06-29T15:07:38.969096+00:00"
+    },
+    "c5b5518ac480f62e8fed89bb1a7b65821195642d941088c0c48ed36e9c1aa3ce": {
+      "normalized_query": "create a pine v6 strategy",
+      "stage": null,
+      "embedding_provider": "local",
+      "embedding_model": "local/hash-embedding-64",
+      "knowledge_version": "1",
+      "embedding": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.4472136,
+        0.0,
+        0.0,
+        0.0,
+        0.4472136,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.4472136,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.4472136,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.4472136,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "created_at": "2026-06-29T15:07:43.414534+00:00",
+      "last_used_at": "2026-06-29T15:07:43.414537+00:00"
     }
   },
   "stats": {
@@ -29313,6 +29613,1704 @@
       "cache_saved_ms": 9,
       "created_at": "2026-06-28T09:17:45.499742+00:00",
       "last_used_at": "2026-06-28T09:17:45.499743+00:00"
+    },
+    "9608f0a9657a1d7d33b77f1d0b1dde9d6635adedcec45cbf2fd6f000db4658da": {
+      "normalized_query": "slow provider",
+      "stage": null,
+      "knowledge_version": "1",
+      "options": {
+        "limit": 6,
+        "lexical_limit": 20,
+        "vector_limit": 20,
+        "max_chars_per_chunk": 900,
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "prefilter_limit": 200
+      },
+      "result": {
+        "status": "pass",
+        "index_ref": "knowledge/kb/index.json",
+        "index_id": "kb-3339e19d",
+        "knowledge_version": 1,
+        "retrieval_query": "Slow provider",
+        "intent": {
+          "tags": [
+            "pine",
+            "price_action",
+            "risk"
+          ],
+          "no_indicators": false
+        },
+        "expanded_terms": [],
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "retrieval_latency_ms": 31,
+        "embedding_latency_ms": 23,
+        "db_search_latency_ms": 0,
+        "hybrid_candidate_count": 20,
+        "rerank_latency_ms": 0,
+        "cache_hit": false,
+        "cache_layer": "query_embedding",
+        "cache_key": "edcda59924b47083153a98e625c1866c192e5f20c8cb8d4cfdcfe4a412843d31",
+        "cache_key_hash": "edcda59924b47083153a98e625c1866c192e5f20c8cb8d4cfdcfe4a412843d31",
+        "cache_saved_ms": 0,
+        "cache_ttl_seconds": null,
+        "cache_bypass_reason": null,
+        "retrieval_cache_status": "miss",
+        "embedding_cache_status": "miss",
+        "knowledge_health_status": "not_applicable",
+        "retrieved_chunks": [
+          {
+            "chunk_id": "internal-strategy-patterns#6-volatility-filters-volatility-filters-6",
+            "item_id": "internal-strategy-patterns",
+            "source_id": "internal-strategy-patterns",
+            "type": "strategy_pattern",
+            "title": "Internal Strategy Patterns",
+            "text": "## Volatility Filters\n\n- Use volatility filters to decide when a pattern is allowed, not to hide weak rules.\n- Define the volatility measure, lookback, threshold, and behavior during sudden expansion.\n- Check that the filter does not simply curve-fit the best historical windows.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "price_action"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "section_title": "Volatility Filters",
+            "parent_title": "Volatility Filters",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.055385,
+            "lexical_score": 0.0,
+            "vector_score": 0.238667,
+            "rerank_features": {
+              "domain_overlap": 0.04,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.0
+            }
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#9-experience-block-template-experience-block-template-9",
+            "item_id": "internal-strategy-patterns",
+            "source_id": "internal-strategy-patterns",
+            "type": "strategy_pattern",
+            "title": "Internal Strategy Patterns",
+            "text": "## Experience Block Template\n\n- When it works: name the regime, market, timeframe, and structural condition that makes the pattern plausible.\n- When it fails: name the regime shift, liquidity issue, or execution assumption that invalidates the pattern.\n- Required assumptions: state market, timeframe, data source, fees/spread/slippage, and invalidation.\n- Implementation traps: call out repaint, future pivots, vague candle language, and unstated session logic.\n- Validation checklist: include out-of-sample, walk-forward or regime split, and conservative execution costs.\n- Clarifying questions: ask only for missing assumptions that materially change code or risk.\n- Reject/repair triggers: no max loss, guaranteed profit claim, live-ready claim, or unlimited averaging.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "price_action"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "section_title": "Experience Block Template",
+            "parent_title": "Experience Block Template",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.054085,
+            "lexical_score": 0.0,
+            "vector_score": 0.168168,
+            "rerank_features": {
+              "domain_overlap": 0.04,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.0
+            }
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#2-boundary-boundary-2",
+            "item_id": "internal-strategy-patterns",
+            "source_id": "internal-strategy-patterns",
+            "type": "strategy_pattern",
+            "title": "Internal Strategy Patterns",
+            "text": "## Boundary\n\nPatterns describe design templates, not guarantees. Every generated strategy still needs explicit rules, risk limits, validation, and review before any live use.\nWhen a prompt asks for price action without exact rules, convert the request into observable market structure, invalidation, and execution assumptions before coding.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "price_action"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "section_title": "Boundary",
+            "parent_title": "Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.052987,
+            "lexical_score": 0.0,
+            "vector_score": 0.145865,
+            "rerank_features": {
+              "domain_overlap": 0.04,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.0
+            }
+          },
+          {
+            "chunk_id": "internal-forex-playbook#7-session-playbooks-session-playbooks-7",
+            "item_id": "internal-forex-playbook",
+            "source_id": "internal-forex-playbook",
+            "type": "semantic",
+            "title": "Internal Forex Playbook",
+            "text": "## Session Playbooks",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "market_regime",
+              "session",
+              "risk"
+            ],
+            "market_tags": [
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/forex-playbook.md",
+            "section_title": "Session Playbooks",
+            "parent_title": "Session Playbooks",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.036393,
+            "lexical_score": 0.0,
+            "vector_score": 0.5,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.0
+            }
+          },
+          {
+            "chunk_id": "internal-forex-playbook#17-ask-before-coding-ask-before-coding-17",
+            "item_id": "internal-forex-playbook",
+            "source_id": "internal-forex-playbook",
+            "type": "semantic",
+            "title": "Internal Forex Playbook",
+            "text": "## Ask Before Coding\n\n- Which pair group: major, minor, or exotic?\n- Which session: Asian, London, New York, overlap, rollover, or all sessions?\n- Should news windows disable entries?\n- What spread/slippage/commission assumptions should the backtest use?\n- How should correlated exposure across pairs be limited?",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "market_regime",
+              "session",
+              "risk"
+            ],
+            "market_tags": [
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/forex-playbook.md",
+            "section_title": "Ask Before Coding",
+            "parent_title": "Ask Before Coding",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.036129,
+            "lexical_score": 0.0,
+            "vector_score": 0.31046,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.0
+            }
+          },
+          {
+            "chunk_id": "internal-crypto-playbook#9-timeframe-guidance-intraday-9",
+            "item_id": "internal-crypto-playbook",
+            "source_id": "internal-crypto-playbook",
+            "type": "semantic",
+            "title": "Internal Crypto Playbook",
+            "text": "### Intraday\n\n- When it works: clear volatility regime, enough volume, and a defined session or funding window.\n- When it fails: chop after a volatility event or false continuation after a liquidation cascade.\n- Required assumptions: timeframe, exchange, session filter, and volatility filter.\n- Implementation traps: copying forex session logic into 24/7 crypto without defining weekend behavior.\n- Validation checklist: split tests across weekday/weekend and high/low volatility windows.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "market_regime",
+              "liquidity",
+              "risk"
+            ],
+            "market_tags": [
+              "crypto"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/crypto-playbook.md",
+            "section_title": "Intraday",
+            "parent_title": "Timeframe Guidance",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.035873,
+            "lexical_score": 0.0,
+            "vector_score": 0.309426,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.0
+            }
+          }
+        ],
+        "source_ids": [
+          "internal-crypto-playbook",
+          "internal-forex-playbook",
+          "internal-strategy-patterns"
+        ],
+        "citations": [
+          {
+            "chunk_id": "internal-strategy-patterns#6-volatility-filters-volatility-filters-6",
+            "source_id": "internal-strategy-patterns",
+            "title": "Internal Strategy Patterns",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "trust_level": "high",
+            "section_title": "Volatility Filters"
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#9-experience-block-template-experience-block-template-9",
+            "source_id": "internal-strategy-patterns",
+            "title": "Internal Strategy Patterns",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "trust_level": "high",
+            "section_title": "Experience Block Template"
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#2-boundary-boundary-2",
+            "source_id": "internal-strategy-patterns",
+            "title": "Internal Strategy Patterns",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "trust_level": "high",
+            "section_title": "Boundary"
+          },
+          {
+            "chunk_id": "internal-forex-playbook#7-session-playbooks-session-playbooks-7",
+            "source_id": "internal-forex-playbook",
+            "title": "Internal Forex Playbook",
+            "source_uri": "docs/trading/strategy-playbooks/forex-playbook.md",
+            "trust_level": "high",
+            "section_title": "Session Playbooks"
+          },
+          {
+            "chunk_id": "internal-forex-playbook#17-ask-before-coding-ask-before-coding-17",
+            "source_id": "internal-forex-playbook",
+            "title": "Internal Forex Playbook",
+            "source_uri": "docs/trading/strategy-playbooks/forex-playbook.md",
+            "trust_level": "high",
+            "section_title": "Ask Before Coding"
+          },
+          {
+            "chunk_id": "internal-crypto-playbook#9-timeframe-guidance-intraday-9",
+            "source_id": "internal-crypto-playbook",
+            "title": "Internal Crypto Playbook",
+            "source_uri": "docs/trading/strategy-playbooks/crypto-playbook.md",
+            "trust_level": "high",
+            "section_title": "Intraday"
+          }
+        ],
+        "filters_applied": {
+          "stage": null,
+          "market_tags": [],
+          "platform_tags": [
+            "pine"
+          ],
+          "status": [
+            "active",
+            "approved",
+            "auto_approved"
+          ],
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108
+        },
+        "retrieval_confidence": {
+          "score": 0.475,
+          "signals": {
+            "max_lexical_score": 0.0,
+            "max_vector_score": 0.5,
+            "source_count": 3,
+            "metadata_match_count": 6,
+            "required_source_hit_count": 0
+          }
+        },
+        "low_confidence": false,
+        "missing_context": [],
+        "required_source_hits": [],
+        "metrics": {
+          "chunk_hit_rate": 1.0,
+          "source_coverage": 3,
+          "p95_target_ms": 300,
+          "embedding_latency_ms": 23,
+          "db_search_latency_ms": 0,
+          "embedding_cache_status": "miss",
+          "retrieval_cache_status": "miss",
+          "cache_layer": "query_embedding",
+          "knowledge_health_status": "not_applicable",
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108,
+          "retrieval_confidence": 0.475
+        }
+      },
+      "cache_saved_ms": 31,
+      "created_at": "2026-06-29T15:07:35.954777+00:00",
+      "last_used_at": "2026-06-30T02:32:54.070216+00:00"
+    },
+    "fc2c499a0e733b29e18832545b159deb9a9b98aba0984f9609fcf701e8ab40bd": {
+      "normalized_query": "create a pine strategy",
+      "stage": null,
+      "knowledge_version": "1",
+      "options": {
+        "limit": 6,
+        "lexical_limit": 20,
+        "vector_limit": 20,
+        "max_chars_per_chunk": 900,
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "prefilter_limit": 200
+      },
+      "result": {
+        "status": "pass",
+        "index_ref": "knowledge/kb/index.json",
+        "index_id": "kb-3339e19d",
+        "knowledge_version": 1,
+        "retrieval_query": "Create a Pine strategy",
+        "intent": {
+          "tags": [
+            "pine"
+          ],
+          "no_indicators": false
+        },
+        "expanded_terms": [],
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "retrieval_latency_ms": 10,
+        "embedding_latency_ms": 8,
+        "db_search_latency_ms": 0,
+        "hybrid_candidate_count": 32,
+        "rerank_latency_ms": 0,
+        "cache_hit": false,
+        "cache_layer": "query_embedding",
+        "cache_key": "e7510940e5fff54e9e166043d5eb715e9d43b526f03152fa7a8a6be446461f5c",
+        "cache_key_hash": "e7510940e5fff54e9e166043d5eb715e9d43b526f03152fa7a8a6be446461f5c",
+        "cache_saved_ms": 0,
+        "cache_ttl_seconds": null,
+        "cache_bypass_reason": null,
+        "retrieval_cache_status": "miss",
+        "embedding_cache_status": "miss",
+        "knowledge_health_status": "not_applicable",
+        "retrieved_chunks": [
+          {
+            "chunk_id": "internal-bots-chat-workflow#2-product-boundary-product-boundary-2",
+            "item_id": "internal-bots-chat-workflow",
+            "source_id": "internal-bots-chat-workflow",
+            "type": "procedural",
+            "title": "Internal Bots Chat Workflow",
+            "text": "## Product Boundary\n\nBots are a chat-native monitoring and simulation workflow. Public UI copy should say `Bots`, but the runtime mode remains paper simulation. The model must describe the workflow as `No broker execution`, `Simulated order intent`, and `Not live trading evidence`.\n\nThe model can prepare a Bot proposal, explain setup requirements, read proposal or runtime status, list Bots, and summarize Bot events. The model must not autonomously start, stop, or kill-switch a Bot. Starting a simulation requires the user to review the setup and confirm start through the UI. Stop and kill-switch actions also require explicit UI confirmation.\n\nDo not describe Bots as live trading, broker execution, guaranteed profitability, or proof that a strategy is safe. If a user asks to run a live bot or place real orders, redirect to the simulation-only boundary and explain that this product path has",
+            "truncated": true,
+            "domain_tags": [
+              "bots",
+              "chat_workflow",
+              "safety_boundary",
+              "simulation",
+              "runtime"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/bots-chat-workflow.md",
+            "section_title": "Product Boundary",
+            "parent_title": "Product Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.109727,
+            "lexical_score": 8.0,
+            "vector_score": 0.313741,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.08
+            }
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#2-product-boundary-product-boundary-2",
+            "item_id": "internal-backtest-preview-workflow",
+            "source_id": "internal-backtest-preview-workflow",
+            "type": "procedural",
+            "title": "Internal Backtest Preview Workflow",
+            "text": "## Product Boundary\n\nBacktest preview is local sandbox evidence for review. It is not TradingView proof, broker proof, live-trading evidence, or a profitability claim. Use `review-only evidence`, `local preview`, and `sandbox preview` wording.\n\nThe model may prepare a backtest plan, queue a local preview, fetch bounded summary metrics, fetch bounded indexed trades, and fetch a downsampled equity curve sample. The model must not claim that a strategy is proven profitable, safe, or live-ready because a preview completed.",
+            "truncated": false,
+            "domain_tags": [
+              "backtest",
+              "preview",
+              "local_sandbox",
+              "review_only",
+              "trades",
+              "equity_curve",
+              "risk"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "section_title": "Product Boundary",
+            "parent_title": "Product Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.100415,
+            "lexical_score": 7.0,
+            "vector_score": 0.32979,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.07
+            }
+          },
+          {
+            "chunk_id": "pattern-price-action-liquidity-sweep#1-overview-overview-1",
+            "item_id": "pattern-price-action-liquidity-sweep",
+            "source_id": "pattern-price-action-liquidity-sweep",
+            "type": "strategy_pattern",
+            "title": "Liquidity sweep and reclaim",
+            "text": "A liquidity sweep setup looks for price to take a prior swing high or low, fail to hold beyond it, and reclaim the level on a confirmed candle. The strategy should define the swept level, reclaim rule, entry trigger, stop beyond the sweep extreme, and bounded target logic.",
+            "truncated": false,
+            "domain_tags": [
+              "price_action",
+              "liquidity_sweep",
+              "stop_hunt",
+              "reclaim"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "pine_v6"
+            ],
+            "trust_level": "medium",
+            "source_type": "internal_seed",
+            "source_uri": "seed:pattern-price-action-liquidity-sweep",
+            "section_title": "overview",
+            "parent_title": "overview",
+            "chunk_kind": "overview",
+            "stages": [
+              "balanced_review",
+              "pine_code_generation",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.068624,
+            "lexical_score": 4.0,
+            "vector_score": 0.319505,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.04
+            }
+          },
+          {
+            "chunk_id": "internal-risk-gate-order-intent-workflow#3-proposed-order-intent-proposed-order-intent-3",
+            "item_id": "internal-risk-gate-order-intent-workflow",
+            "source_id": "internal-risk-gate-order-intent-workflow",
+            "type": "procedural",
+            "title": "Internal Risk Gate Order Intent Workflow",
+            "text": "## Proposed Order Intent\n\nUse `create_proposed_intent` when the user wants a structured intent draft from the current setup. The result should be described as a draft intent that requires review. It should not be described as an order sent to a broker or a paper/live execution.\n\nIf required assumptions are missing, ask for the missing setup instead of inventing symbol, side, size, stop, target, account, venue, or leverage.",
+            "truncated": false,
+            "domain_tags": [
+              "risk",
+              "risk_gate",
+              "order_intent",
+              "safety_boundary",
+              "review_only"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/risk-gate-order-intent-workflow.md",
+            "section_title": "Proposed Order Intent",
+            "parent_title": "Proposed Order Intent",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.068139,
+            "lexical_score": 4.0,
+            "vector_score": 0.306786,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.04
+            }
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#3-tool-use-tool-use-3",
+            "item_id": "internal-backtest-preview-workflow",
+            "source_id": "internal-backtest-preview-workflow",
+            "type": "procedural",
+            "title": "Internal Backtest Preview Workflow",
+            "text": "## Tool Use\n\nUse `create_backtest_plan` when the user wants to plan a local preview from Pine Script source or strategy context.\n\nUse `run_backtest_preview` when the user clearly asks to simulate, paper test, preview performance, run a local backtest, chạy thử, thử hiệu quả, or chay thu. This queues sandbox work; do not imply immediate completion.\n\nUse `get_backtest_summary` for bounded DB-indexed report metrics after a completed preview. Use `query_backtest_trades` for explicit trade row requests such as first N trades, latest trades, top winners, or top losers. Use `get_equity_curve_sample` for downsampled equity curve review instead of loading raw artifacts.",
+            "truncated": false,
+            "domain_tags": [
+              "backtest",
+              "preview",
+              "local_sandbox",
+              "review_only",
+              "trades",
+              "equity_curve",
+              "risk"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "section_title": "Tool Use",
+            "parent_title": "Tool Use",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.065873,
+            "lexical_score": 5.0,
+            "vector_score": 0.0,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.05
+            }
+          },
+          {
+            "chunk_id": "concept-market-structure-foundations#1-overview-overview-1",
+            "item_id": "concept-market-structure-foundations",
+            "source_id": "concept-market-structure-foundations",
+            "type": "semantic",
+            "title": "Market structure foundations",
+            "text": "Price action strategies should define observable market structure terms such as swing high, swing low, range high, range low, break of structure, change of character, retest, and invalidation. When the user asks for a price action strategy but gives no indicators or exact rules, require observable market structure and invalidation. Natural-language prompts should be converted into explicit OHLC conditions before Pine generation. No-indicator price action should avoid future pivots and use clarifying questions for BOS, CHoCH, sweep, rejection, or retest triggers.",
+            "truncated": false,
+            "domain_tags": [
+              "price_action",
+              "market_structure",
+              "swing_high",
+              "swing_low"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "medium",
+            "source_type": "internal_seed",
+            "source_uri": "seed:concept-market-structure-foundations",
+            "section_title": "overview",
+            "parent_title": "overview",
+            "chunk_kind": "overview",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.060835,
+            "lexical_score": 3.0,
+            "vector_score": 0.431638,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.03
+            }
+          }
+        ],
+        "source_ids": [
+          "concept-market-structure-foundations",
+          "internal-backtest-preview-workflow",
+          "internal-bots-chat-workflow",
+          "internal-risk-gate-order-intent-workflow",
+          "pattern-price-action-liquidity-sweep"
+        ],
+        "citations": [
+          {
+            "chunk_id": "internal-bots-chat-workflow#2-product-boundary-product-boundary-2",
+            "source_id": "internal-bots-chat-workflow",
+            "title": "Internal Bots Chat Workflow",
+            "source_uri": "docs/product/bots-chat-workflow.md",
+            "trust_level": "high",
+            "section_title": "Product Boundary"
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#2-product-boundary-product-boundary-2",
+            "source_id": "internal-backtest-preview-workflow",
+            "title": "Internal Backtest Preview Workflow",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "trust_level": "high",
+            "section_title": "Product Boundary"
+          },
+          {
+            "chunk_id": "pattern-price-action-liquidity-sweep#1-overview-overview-1",
+            "source_id": "pattern-price-action-liquidity-sweep",
+            "title": "Liquidity sweep and reclaim",
+            "source_uri": "seed:pattern-price-action-liquidity-sweep",
+            "trust_level": "medium",
+            "section_title": "overview"
+          },
+          {
+            "chunk_id": "internal-risk-gate-order-intent-workflow#3-proposed-order-intent-proposed-order-intent-3",
+            "source_id": "internal-risk-gate-order-intent-workflow",
+            "title": "Internal Risk Gate Order Intent Workflow",
+            "source_uri": "docs/product/risk-gate-order-intent-workflow.md",
+            "trust_level": "high",
+            "section_title": "Proposed Order Intent"
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#3-tool-use-tool-use-3",
+            "source_id": "internal-backtest-preview-workflow",
+            "title": "Internal Backtest Preview Workflow",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "trust_level": "high",
+            "section_title": "Tool Use"
+          },
+          {
+            "chunk_id": "concept-market-structure-foundations#1-overview-overview-1",
+            "source_id": "concept-market-structure-foundations",
+            "title": "Market structure foundations",
+            "source_uri": "seed:concept-market-structure-foundations",
+            "trust_level": "medium",
+            "section_title": "overview"
+          }
+        ],
+        "filters_applied": {
+          "stage": null,
+          "market_tags": [],
+          "platform_tags": [
+            "pine"
+          ],
+          "status": [
+            "active",
+            "approved",
+            "auto_approved"
+          ],
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108
+        },
+        "retrieval_confidence": {
+          "score": 0.75791,
+          "signals": {
+            "max_lexical_score": 8.0,
+            "max_vector_score": 0.431638,
+            "source_count": 5,
+            "metadata_match_count": 6,
+            "required_source_hit_count": 0
+          }
+        },
+        "low_confidence": false,
+        "missing_context": [],
+        "required_source_hits": [],
+        "metrics": {
+          "chunk_hit_rate": 1.0,
+          "source_coverage": 5,
+          "p95_target_ms": 300,
+          "embedding_latency_ms": 8,
+          "db_search_latency_ms": 0,
+          "embedding_cache_status": "miss",
+          "retrieval_cache_status": "miss",
+          "cache_layer": "query_embedding",
+          "knowledge_health_status": "not_applicable",
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108,
+          "retrieval_confidence": 0.75791
+        }
+      },
+      "cache_saved_ms": 10,
+      "created_at": "2026-06-29T15:07:38.749513+00:00",
+      "last_used_at": "2026-06-30T04:47:54.644408+00:00"
+    },
+    "02ba5b1ee93adc5a1dd20b5828e2580ca5830c4dc184667b0de495d202ea17e1": {
+      "normalized_query": "create another pine strategy",
+      "stage": null,
+      "knowledge_version": "1",
+      "options": {
+        "limit": 6,
+        "lexical_limit": 20,
+        "vector_limit": 20,
+        "max_chars_per_chunk": 900,
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "prefilter_limit": 200
+      },
+      "result": {
+        "status": "pass",
+        "index_ref": "knowledge/kb/index.json",
+        "index_id": "kb-3339e19d",
+        "knowledge_version": 1,
+        "retrieval_query": "Create another Pine strategy",
+        "intent": {
+          "tags": [
+            "pine"
+          ],
+          "no_indicators": false
+        },
+        "expanded_terms": [],
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "retrieval_latency_ms": 11,
+        "embedding_latency_ms": 8,
+        "db_search_latency_ms": 1,
+        "hybrid_candidate_count": 33,
+        "rerank_latency_ms": 0,
+        "cache_hit": false,
+        "cache_layer": "query_embedding",
+        "cache_key": "3f37a8f493ca276b1bcf561728d72868ca17bb339edf9fca1a6a2a983a51a804",
+        "cache_key_hash": "3f37a8f493ca276b1bcf561728d72868ca17bb339edf9fca1a6a2a983a51a804",
+        "cache_saved_ms": 0,
+        "cache_ttl_seconds": null,
+        "cache_bypass_reason": null,
+        "retrieval_cache_status": "miss",
+        "embedding_cache_status": "miss",
+        "knowledge_health_status": "not_applicable",
+        "retrieved_chunks": [
+          {
+            "chunk_id": "concept-market-structure-foundations#1-overview-overview-1",
+            "item_id": "concept-market-structure-foundations",
+            "source_id": "concept-market-structure-foundations",
+            "type": "semantic",
+            "title": "Market structure foundations",
+            "text": "Price action strategies should define observable market structure terms such as swing high, swing low, range high, range low, break of structure, change of character, retest, and invalidation. When the user asks for a price action strategy but gives no indicators or exact rules, require observable market structure and invalidation. Natural-language prompts should be converted into explicit OHLC conditions before Pine generation. No-indicator price action should avoid future pivots and use clarifying questions for BOS, CHoCH, sweep, rejection, or retest triggers.",
+            "truncated": false,
+            "domain_tags": [
+              "price_action",
+              "market_structure",
+              "swing_high",
+              "swing_low"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "medium",
+            "source_type": "internal_seed",
+            "source_uri": "seed:concept-market-structure-foundations",
+            "section_title": "overview",
+            "parent_title": "overview",
+            "chunk_kind": "overview",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.052522,
+            "lexical_score": 2.0,
+            "vector_score": 0.524132,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.02
+            }
+          },
+          {
+            "chunk_id": "internal-risk-policy#2-product-boundary-product-boundary-2",
+            "item_id": "internal-risk-policy",
+            "source_id": "internal-risk-policy",
+            "type": "procedural",
+            "title": "Internal Risk Policy",
+            "text": "## Product Boundary\n\nThis project generates and reviews trading strategy code. It must not claim that a strategy is profitable, safe, or suitable for live trading.",
+            "truncated": false,
+            "domain_tags": [
+              "risk",
+              "safety_boundary"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/risk-policy.md",
+            "section_title": "Product Boundary",
+            "parent_title": "Product Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.05055,
+            "lexical_score": 2.0,
+            "vector_score": 0.422577,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.02
+            }
+          },
+          {
+            "chunk_id": "internal-anti-overfit-checklist#3-required-review-questions-required-review-questions-3",
+            "item_id": "internal-anti-overfit-checklist",
+            "source_id": "internal-anti-overfit-checklist",
+            "type": "procedural",
+            "title": "Internal Anti Overfit Checklist",
+            "text": "## Required Review Questions\n\n- What market regime is this strategy designed for?\n- What causes the strategy to fail?\n- Which assumptions are platform-specific?\n- Are risk controls explicit and testable?\n- Can a simpler version explain most of the result?",
+            "truncated": false,
+            "domain_tags": [
+              "risk",
+              "anti_overfit",
+              "validation"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/anti-overfit-checklist.md",
+            "section_title": "Required Review Questions",
+            "parent_title": "Required Review Questions",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.050214,
+            "lexical_score": 2.0,
+            "vector_score": 0.300965,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.02
+            }
+          },
+          {
+            "chunk_id": "internal-forex-playbook#2-boundary-boundary-2",
+            "item_id": "internal-forex-playbook",
+            "source_id": "internal-forex-playbook",
+            "type": "semantic",
+            "title": "Internal Forex Playbook",
+            "text": "## Boundary\n\nThis playbook is decision support for strategy design and review. It must not be used to claim that a forex strategy is profitable, safe, or ready for live trading.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "market_regime",
+              "session",
+              "risk"
+            ],
+            "market_tags": [
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/forex-playbook.md",
+            "section_title": "Boundary",
+            "parent_title": "Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.05009,
+            "lexical_score": 2.0,
+            "vector_score": 0.340207,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.02
+            }
+          },
+          {
+            "chunk_id": "internal-anti-overfit-checklist#1-anti-overfit-checklist-anti-overfit-checklist-1",
+            "item_id": "internal-anti-overfit-checklist",
+            "source_id": "internal-anti-overfit-checklist",
+            "type": "procedural",
+            "title": "Internal Anti Overfit Checklist",
+            "text": "# Anti-Overfit Checklist\n\nUse this checklist when reviewing strategy logic or backtest output.",
+            "truncated": false,
+            "domain_tags": [
+              "risk",
+              "anti_overfit",
+              "validation"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/anti-overfit-checklist.md",
+            "section_title": "Anti-Overfit Checklist",
+            "parent_title": "Anti-Overfit Checklist",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.038624,
+            "lexical_score": 1.0,
+            "vector_score": 0.344124,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.01
+            }
+          },
+          {
+            "chunk_id": "internal-bots-chat-workflow#4-proposal-lifecycle-proposal-lifecycle-4",
+            "item_id": "internal-bots-chat-workflow",
+            "source_id": "internal-bots-chat-workflow",
+            "type": "procedural",
+            "title": "Internal Bots Chat Workflow",
+            "text": "## Proposal Lifecycle\n\nBot proposals are workflow records, not Artifacts. Do not expose proposal JSON as a user artifact.\n\nCanonical proposal statuses:\n\n- `draft`: proposal exists but setup is not complete.\n- `missing_inputs`: required operator inputs are missing.\n- `ready`: proposal has the required source and operator inputs.\n- `started`: proposal has created a paper runtime.\n- `rejected`: proposal should not be started.\n\nRequired fields for a startable proposal include source artifact, strategy id or name, data subscriptions, broker connection id, account id, and risk policy id. The model must not invent broker connection, account, or risk policy identity. If required identity fields are missing, ask only for the missing fields and keep the proposal unstarted.\n\nConfirm start must force `mode: paper`, use idempotency by proposal, and route through the proposal confirmation path. The fr",
+            "truncated": true,
+            "domain_tags": [
+              "bots",
+              "chat_workflow",
+              "safety_boundary",
+              "simulation",
+              "runtime"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/bots-chat-workflow.md",
+            "section_title": "Proposal Lifecycle",
+            "parent_title": "Proposal Lifecycle",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.037151,
+            "lexical_score": 1.0,
+            "vector_score": 0.326036,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.01
+            }
+          }
+        ],
+        "source_ids": [
+          "concept-market-structure-foundations",
+          "internal-anti-overfit-checklist",
+          "internal-bots-chat-workflow",
+          "internal-forex-playbook",
+          "internal-risk-policy"
+        ],
+        "citations": [
+          {
+            "chunk_id": "concept-market-structure-foundations#1-overview-overview-1",
+            "source_id": "concept-market-structure-foundations",
+            "title": "Market structure foundations",
+            "source_uri": "seed:concept-market-structure-foundations",
+            "trust_level": "medium",
+            "section_title": "overview"
+          },
+          {
+            "chunk_id": "internal-risk-policy#2-product-boundary-product-boundary-2",
+            "source_id": "internal-risk-policy",
+            "title": "Internal Risk Policy",
+            "source_uri": "docs/trading/risk-policy.md",
+            "trust_level": "high",
+            "section_title": "Product Boundary"
+          },
+          {
+            "chunk_id": "internal-anti-overfit-checklist#3-required-review-questions-required-review-questions-3",
+            "source_id": "internal-anti-overfit-checklist",
+            "title": "Internal Anti Overfit Checklist",
+            "source_uri": "docs/trading/anti-overfit-checklist.md",
+            "trust_level": "high",
+            "section_title": "Required Review Questions"
+          },
+          {
+            "chunk_id": "internal-forex-playbook#2-boundary-boundary-2",
+            "source_id": "internal-forex-playbook",
+            "title": "Internal Forex Playbook",
+            "source_uri": "docs/trading/strategy-playbooks/forex-playbook.md",
+            "trust_level": "high",
+            "section_title": "Boundary"
+          },
+          {
+            "chunk_id": "internal-anti-overfit-checklist#1-anti-overfit-checklist-anti-overfit-checklist-1",
+            "source_id": "internal-anti-overfit-checklist",
+            "title": "Internal Anti Overfit Checklist",
+            "source_uri": "docs/trading/anti-overfit-checklist.md",
+            "trust_level": "high",
+            "section_title": "Anti-Overfit Checklist"
+          },
+          {
+            "chunk_id": "internal-bots-chat-workflow#4-proposal-lifecycle-proposal-lifecycle-4",
+            "source_id": "internal-bots-chat-workflow",
+            "title": "Internal Bots Chat Workflow",
+            "source_uri": "docs/product/bots-chat-workflow.md",
+            "trust_level": "high",
+            "section_title": "Proposal Lifecycle"
+          }
+        ],
+        "filters_applied": {
+          "stage": null,
+          "market_tags": [],
+          "platform_tags": [
+            "pine"
+          ],
+          "status": [
+            "active",
+            "approved",
+            "auto_approved"
+          ],
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108
+        },
+        "retrieval_confidence": {
+          "score": 0.556033,
+          "signals": {
+            "max_lexical_score": 2.0,
+            "max_vector_score": 0.524132,
+            "source_count": 5,
+            "metadata_match_count": 6,
+            "required_source_hit_count": 0
+          }
+        },
+        "low_confidence": false,
+        "missing_context": [],
+        "required_source_hits": [],
+        "metrics": {
+          "chunk_hit_rate": 1.0,
+          "source_coverage": 5,
+          "p95_target_ms": 300,
+          "embedding_latency_ms": 8,
+          "db_search_latency_ms": 1,
+          "embedding_cache_status": "miss",
+          "retrieval_cache_status": "miss",
+          "cache_layer": "query_embedding",
+          "knowledge_health_status": "not_applicable",
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108,
+          "retrieval_confidence": 0.556033
+        }
+      },
+      "cache_saved_ms": 11,
+      "created_at": "2026-06-29T15:07:38.978197+00:00",
+      "last_used_at": "2026-06-30T04:47:54.267619+00:00"
+    },
+    "46a05e6a030132a0af975b27eb8be1be69ff3e21e78b54c8c9b73a7973661656": {
+      "normalized_query": "create a pine v6 strategy",
+      "stage": null,
+      "knowledge_version": "1",
+      "options": {
+        "limit": 6,
+        "lexical_limit": 20,
+        "vector_limit": 20,
+        "max_chars_per_chunk": 900,
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "prefilter_limit": 200
+      },
+      "result": {
+        "status": "pass",
+        "index_ref": "knowledge/kb/index.json",
+        "index_id": "kb-3339e19d",
+        "knowledge_version": 1,
+        "retrieval_query": "Create a Pine v6 strategy",
+        "intent": {
+          "tags": [
+            "pine"
+          ],
+          "no_indicators": false
+        },
+        "expanded_terms": [],
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "retrieval_latency_ms": 12,
+        "embedding_latency_ms": 9,
+        "db_search_latency_ms": 0,
+        "hybrid_candidate_count": 30,
+        "rerank_latency_ms": 0,
+        "cache_hit": false,
+        "cache_layer": "query_embedding",
+        "cache_key": "c5b5518ac480f62e8fed89bb1a7b65821195642d941088c0c48ed36e9c1aa3ce",
+        "cache_key_hash": "c5b5518ac480f62e8fed89bb1a7b65821195642d941088c0c48ed36e9c1aa3ce",
+        "cache_saved_ms": 0,
+        "cache_ttl_seconds": null,
+        "cache_bypass_reason": null,
+        "retrieval_cache_status": "miss",
+        "embedding_cache_status": "miss",
+        "knowledge_health_status": "not_applicable",
+        "retrieved_chunks": [
+          {
+            "chunk_id": "internal-bots-chat-workflow#2-product-boundary-product-boundary-2",
+            "item_id": "internal-bots-chat-workflow",
+            "source_id": "internal-bots-chat-workflow",
+            "type": "procedural",
+            "title": "Internal Bots Chat Workflow",
+            "text": "## Product Boundary\n\nBots are a chat-native monitoring and simulation workflow. Public UI copy should say `Bots`, but the runtime mode remains paper simulation. The model must describe the workflow as `No broker execution`, `Simulated order intent`, and `Not live trading evidence`.\n\nThe model can prepare a Bot proposal, explain setup requirements, read proposal or runtime status, list Bots, and summarize Bot events. The model must not autonomously start, stop, or kill-switch a Bot. Starting a simulation requires the user to review the setup and confirm start through the UI. Stop and kill-switch actions also require explicit UI confirmation.\n\nDo not describe Bots as live trading, broker execution, guaranteed profitability, or proof that a strategy is safe. If a user asks to run a live bot or place real orders, redirect to the simulation-only boundary and explain that this product path has",
+            "truncated": true,
+            "domain_tags": [
+              "bots",
+              "chat_workflow",
+              "safety_boundary",
+              "simulation",
+              "runtime"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/bots-chat-workflow.md",
+            "section_title": "Product Boundary",
+            "parent_title": "Product Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.109551,
+            "lexical_score": 8.0,
+            "vector_score": 0.280618,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.08
+            }
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#2-product-boundary-product-boundary-2",
+            "item_id": "internal-backtest-preview-workflow",
+            "source_id": "internal-backtest-preview-workflow",
+            "type": "procedural",
+            "title": "Internal Backtest Preview Workflow",
+            "text": "## Product Boundary\n\nBacktest preview is local sandbox evidence for review. It is not TradingView proof, broker proof, live-trading evidence, or a profitability claim. Use `review-only evidence`, `local preview`, and `sandbox preview` wording.\n\nThe model may prepare a backtest plan, queue a local preview, fetch bounded summary metrics, fetch bounded indexed trades, and fetch a downsampled equity curve sample. The model must not claim that a strategy is proven profitable, safe, or live-ready because a preview completed.",
+            "truncated": false,
+            "domain_tags": [
+              "backtest",
+              "preview",
+              "local_sandbox",
+              "review_only",
+              "trades",
+              "equity_curve",
+              "risk"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "section_title": "Product Boundary",
+            "parent_title": "Product Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.099828,
+            "lexical_score": 7.0,
+            "vector_score": 0.294973,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.07
+            }
+          },
+          {
+            "chunk_id": "pattern-no-repaint-request-security#1-overview-overview-1",
+            "item_id": "pattern-no-repaint-request-security",
+            "source_id": "pattern-no-repaint-request-security",
+            "type": "procedural",
+            "title": "No-repaint higher timeframe retrieval",
+            "text": "For Pine v6 multi-timeframe logic, avoid barmerge.lookahead_on. Prefer explicit lookahead=barmerge.lookahead_off and confirmed-bar logic. Static validation treats lookahead_on as a repaint hazard.",
+            "truncated": false,
+            "domain_tags": [
+              "pine",
+              "repaint",
+              "multi_timeframe"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "pine_v6"
+            ],
+            "trust_level": "medium",
+            "source_type": "internal_seed",
+            "source_uri": "seed:pattern-no-repaint-request-security",
+            "section_title": "overview",
+            "parent_title": "overview",
+            "chunk_kind": "overview",
+            "stages": [
+              "balanced_review",
+              "pine_code_generation",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.078787,
+            "lexical_score": 3.0,
+            "vector_score": 0.395628,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.03
+            }
+          },
+          {
+            "chunk_id": "pattern-price-action-liquidity-sweep#1-overview-overview-1",
+            "item_id": "pattern-price-action-liquidity-sweep",
+            "source_id": "pattern-price-action-liquidity-sweep",
+            "type": "strategy_pattern",
+            "title": "Liquidity sweep and reclaim",
+            "text": "A liquidity sweep setup looks for price to take a prior swing high or low, fail to hold beyond it, and reclaim the level on a confirmed candle. The strategy should define the swept level, reclaim rule, entry trigger, stop beyond the sweep extreme, and bounded target logic.",
+            "truncated": false,
+            "domain_tags": [
+              "price_action",
+              "liquidity_sweep",
+              "stop_hunt",
+              "reclaim"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "pine_v6"
+            ],
+            "trust_level": "medium",
+            "source_type": "internal_seed",
+            "source_uri": "seed:pattern-price-action-liquidity-sweep",
+            "section_title": "overview",
+            "parent_title": "overview",
+            "chunk_kind": "overview",
+            "stages": [
+              "balanced_review",
+              "pine_code_generation",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.068259,
+            "lexical_score": 4.0,
+            "vector_score": 0.285774,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.04
+            }
+          },
+          {
+            "chunk_id": "internal-risk-gate-order-intent-workflow#3-proposed-order-intent-proposed-order-intent-3",
+            "item_id": "internal-risk-gate-order-intent-workflow",
+            "source_id": "internal-risk-gate-order-intent-workflow",
+            "type": "procedural",
+            "title": "Internal Risk Gate Order Intent Workflow",
+            "text": "## Proposed Order Intent\n\nUse `create_proposed_intent` when the user wants a structured intent draft from the current setup. The result should be described as a draft intent that requires review. It should not be described as an order sent to a broker or a paper/live execution.\n\nIf required assumptions are missing, ask for the missing setup instead of inventing symbol, side, size, stop, target, account, venue, or leverage.",
+            "truncated": false,
+            "domain_tags": [
+              "risk",
+              "risk_gate",
+              "order_intent",
+              "safety_boundary",
+              "review_only"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/risk-gate-order-intent-workflow.md",
+            "section_title": "Proposed Order Intent",
+            "parent_title": "Proposed Order Intent",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.067972,
+            "lexical_score": 4.0,
+            "vector_score": 0.274398,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.04
+            }
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#3-tool-use-tool-use-3",
+            "item_id": "internal-backtest-preview-workflow",
+            "source_id": "internal-backtest-preview-workflow",
+            "type": "procedural",
+            "title": "Internal Backtest Preview Workflow",
+            "text": "## Tool Use\n\nUse `create_backtest_plan` when the user wants to plan a local preview from Pine Script source or strategy context.\n\nUse `run_backtest_preview` when the user clearly asks to simulate, paper test, preview performance, run a local backtest, chạy thử, thử hiệu quả, or chay thu. This queues sandbox work; do not imply immediate completion.\n\nUse `get_backtest_summary` for bounded DB-indexed report metrics after a completed preview. Use `query_backtest_trades` for explicit trade row requests such as first N trades, latest trades, top winners, or top losers. Use `get_equity_curve_sample` for downsampled equity curve review instead of loading raw artifacts.",
+            "truncated": false,
+            "domain_tags": [
+              "backtest",
+              "preview",
+              "local_sandbox",
+              "review_only",
+              "trades",
+              "equity_curve",
+              "risk"
+            ],
+            "market_tags": [
+              "general"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "section_title": "Tool Use",
+            "parent_title": "Tool Use",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.065873,
+            "lexical_score": 5.0,
+            "vector_score": 0.0,
+            "rerank_features": {
+              "domain_overlap": 0.0,
+              "market_overlap": 0.0,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.05
+            }
+          }
+        ],
+        "source_ids": [
+          "internal-backtest-preview-workflow",
+          "internal-bots-chat-workflow",
+          "internal-risk-gate-order-intent-workflow",
+          "pattern-no-repaint-request-security",
+          "pattern-price-action-liquidity-sweep"
+        ],
+        "citations": [
+          {
+            "chunk_id": "internal-bots-chat-workflow#2-product-boundary-product-boundary-2",
+            "source_id": "internal-bots-chat-workflow",
+            "title": "Internal Bots Chat Workflow",
+            "source_uri": "docs/product/bots-chat-workflow.md",
+            "trust_level": "high",
+            "section_title": "Product Boundary"
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#2-product-boundary-product-boundary-2",
+            "source_id": "internal-backtest-preview-workflow",
+            "title": "Internal Backtest Preview Workflow",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "trust_level": "high",
+            "section_title": "Product Boundary"
+          },
+          {
+            "chunk_id": "pattern-no-repaint-request-security#1-overview-overview-1",
+            "source_id": "pattern-no-repaint-request-security",
+            "title": "No-repaint higher timeframe retrieval",
+            "source_uri": "seed:pattern-no-repaint-request-security",
+            "trust_level": "medium",
+            "section_title": "overview"
+          },
+          {
+            "chunk_id": "pattern-price-action-liquidity-sweep#1-overview-overview-1",
+            "source_id": "pattern-price-action-liquidity-sweep",
+            "title": "Liquidity sweep and reclaim",
+            "source_uri": "seed:pattern-price-action-liquidity-sweep",
+            "trust_level": "medium",
+            "section_title": "overview"
+          },
+          {
+            "chunk_id": "internal-risk-gate-order-intent-workflow#3-proposed-order-intent-proposed-order-intent-3",
+            "source_id": "internal-risk-gate-order-intent-workflow",
+            "title": "Internal Risk Gate Order Intent Workflow",
+            "source_uri": "docs/product/risk-gate-order-intent-workflow.md",
+            "trust_level": "high",
+            "section_title": "Proposed Order Intent"
+          },
+          {
+            "chunk_id": "internal-backtest-preview-workflow#3-tool-use-tool-use-3",
+            "source_id": "internal-backtest-preview-workflow",
+            "title": "Internal Backtest Preview Workflow",
+            "source_uri": "docs/product/backtest-preview-workflow.md",
+            "trust_level": "high",
+            "section_title": "Tool Use"
+          }
+        ],
+        "filters_applied": {
+          "stage": null,
+          "market_tags": [],
+          "platform_tags": [
+            "pine"
+          ],
+          "status": [
+            "active",
+            "approved",
+            "auto_approved"
+          ],
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108
+        },
+        "retrieval_confidence": {
+          "score": 0.748907,
+          "signals": {
+            "max_lexical_score": 8.0,
+            "max_vector_score": 0.395628,
+            "source_count": 5,
+            "metadata_match_count": 6,
+            "required_source_hit_count": 0
+          }
+        },
+        "low_confidence": false,
+        "missing_context": [],
+        "required_source_hits": [],
+        "metrics": {
+          "chunk_hit_rate": 1.0,
+          "source_coverage": 5,
+          "p95_target_ms": 300,
+          "embedding_latency_ms": 9,
+          "db_search_latency_ms": 0,
+          "embedding_cache_status": "miss",
+          "retrieval_cache_status": "miss",
+          "cache_layer": "query_embedding",
+          "knowledge_health_status": "not_applicable",
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 108,
+          "retrieval_confidence": 0.748907
+        }
+      },
+      "cache_saved_ms": 12,
+      "created_at": "2026-06-29T15:07:43.424010+00:00",
+      "last_used_at": "2026-06-30T02:33:01.305498+00:00"
     }
   }
 }

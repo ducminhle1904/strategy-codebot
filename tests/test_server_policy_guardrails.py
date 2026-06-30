@@ -50,6 +50,10 @@ def test_agent_output_policy_block_prevents_unsafe_delta_stream(tmp_path: Path) 
         event
         for event in events
         if event not in {"model.reasoning.delta", "provider.started"}
+        and not event.startswith("model_action.")
+        and not event.startswith("prompt_chain.")
+        and not event.startswith("agent_loop.")
+        and event != "evaluator_optimizer.summary"
     ] == ["chat.response_intent", "chat.suggestions.updated", "policy.blocked", "message.delta", "run.completed"]
     assert frames[-1]["data"]["payload"]["status"] == "blocked"
     message_payloads = [frame["data"]["payload"] for frame in frames if frame["event"] == "message.delta"]
@@ -152,7 +156,8 @@ def test_positive_broker_execution_request_is_blocked() -> None:
 
     assert not decision.allowed
     assert decision.blocked_finding is not None
-    assert decision.blocked_finding.message == "Blocked trading action or arbitrary IO request: broker execution"
+    assert decision.blocked_finding.rule_id == "broker_execution"
+    assert decision.blocked_finding.code == "policy_violation"
 
 
 def test_market_data_metadata_is_required() -> None:

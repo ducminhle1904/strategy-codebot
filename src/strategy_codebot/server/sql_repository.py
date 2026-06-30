@@ -30,6 +30,7 @@ from strategy_codebot.server.models import ToolCall
 from strategy_codebot.server.models import UsageLedger
 from strategy_codebot.server.models import User
 from strategy_codebot.server.models import ValidationReport
+from strategy_codebot.server.models import WorkflowTask
 from strategy_codebot.server.models import utc_now
 from strategy_codebot.server.models import Workspace
 from strategy_codebot.server.models import WorkspaceMembership
@@ -53,6 +54,7 @@ from strategy_codebot.server.repository import NautilusHeartbeatRecord
 from strategy_codebot.server.repository import NautilusRuntimeEventInput
 from strategy_codebot.server.repository import NautilusRuntimeEventRecord
 from strategy_codebot.server.repository import NautilusRuntimeRecord
+from strategy_codebot.server.repository import WORKFLOW_CONTINUATION_EVENT_TYPES
 from strategy_codebot.server.repository import _bounded_market_data_subscription_limit
 from strategy_codebot.server.repository import nautilus_runtime_state_from_heartbeat_payload
 from strategy_codebot.server.repository import normalize_market_data_subscription_payloads
@@ -75,8 +77,12 @@ from strategy_codebot.server.repository import PolicyFindingRecord
 from strategy_codebot.server.repository import ToolCallRecord
 from strategy_codebot.server.repository import UsageLedgerRecord
 from strategy_codebot.server.repository import ValidationReportRecord
+from strategy_codebot.server.repository import WorkflowTaskRecord
+from strategy_codebot.server.repository import WorkflowTaskSyncResult
+from strategy_codebot.server.repository import _workflow_task_payload_matches
 from strategy_codebot.server.run_modes import BACKTEST_JOB_MAX_ATTEMPTS
 from strategy_codebot.server.run_modes import backtest_active_limit_from_payload
+from strategy_codebot.server.workflow_task_status import WORKFLOW_TASK_RESOLVED_STATUSES
 
 
 class SQLAlchemyConversationRepository:
@@ -815,6 +821,280 @@ class SQLAlchemyConversationRepository:
                 .order_by(RunEvent.sequence.asc())
             ).all()
             return [_run_event_record(row, run) for row in rows]
+
+    def list_workflow_task_continuation_events(
+        self,
+        auth: AuthContext,
+        task_id: str,
+    ) -> list[RunEventRecord] | None:
+        with self._session_factory() as session:
+            task = session.scalar(
+                select(WorkflowTask).where(
+                    WorkflowTask.id == task_id,
+                    WorkflowTask.owner_user_id == auth.user_id,
+                    WorkflowTask.workspace_id == auth.workspace_id,
+                )
+            )
+            if task is None:
+                return None
+            rows = session.scalars(
+                select(RunEvent)
+                .where(
+                    RunEvent.conversation_id == task.conversation_id,
+                    RunEvent.owner_user_id == auth.user_id,
+                    RunEvent.workspace_id == auth.workspace_id,
+                    RunEvent.type.in_(tuple(WORKFLOW_CONTINUATION_EVENT_TYPES)),
+                )
+                .order_by(
+                    RunEvent.created_at.asc(),
+                    RunEvent.run_id.asc(),
+                    RunEvent.sequence.asc(),
+                    RunEvent.id.asc(),
+                )
+            ).all()
+            return [
+                _run_event_record(row)
+                for row in rows
+                if isinstance(row.payload_json, dict) and row.payload_json.get("task_id") == task.id
+            ]
+
+    def upsert_workflow_task(
+        self,
+        auth: AuthContext,
+        *,
+        conversation_id: str,
+        workflow_id: str,
+        task_template_id: str,
+        step_id: str,
+        kind: str,
+        status: str,
+        payload_json: dict,
+        run_id: str | None = None,
+    ) -> WorkflowTaskRecord | None:
+        now = utc_now()
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            if run_id is not None:
+                run = _authorized_run(session, auth, run_id)
+                if run is None or run.conversation_id != conversation.id:
+                    return None
+            task = session.scalars(
+                select(WorkflowTask).where(
+                    WorkflowTask.conversation_id == conversation.id,
+                    WorkflowTask.workflow_id == workflow_id,
+                    WorkflowTask.task_template_id == task_template_id,
+                    WorkflowTask.owner_user_id == auth.user_id,
+                    WorkflowTask.workspace_id == auth.workspace_id,
+                )
+            ).first()
+            if task is None:
+                task = WorkflowTask(
+                    id=opaque_id("wft"),
+                    conversation_id=conversation.id,
+                    run_id=run_id,
+                    owner_user_id=auth.user_id,
+                    workspace_id=auth.workspace_id,
+                    workflow_id=workflow_id,
+                    task_template_id=task_template_id,
+                    step_id=step_id,
+                    kind=kind,
+                    status=status,
+                    payload_json=payload_json,
+                    created_at=now,
+                    updated_at=now,
+                )
+                session.add(task)
+            else:
+                task.run_id = run_id
+                task.step_id = step_id
+                task.kind = kind
+                task.status = status
+                task.payload_json = payload_json
+                task.updated_at = now
+                if status not in WORKFLOW_TASK_RESOLVED_STATUSES:
+                    task.resolved_at = None
+            session.commit()
+            return _workflow_task_record(task)
+
+    def sync_workflow_tasks(
+        self,
+        auth: AuthContext,
+        *,
+        conversation_id: str,
+        run_id: str | None,
+        workflow_id: str,
+        task_payloads: list[dict],
+        completed_steps: set[str],
+    ) -> WorkflowTaskSyncResult | None:
+        now = utc_now()
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            if run_id is not None:
+                run = _authorized_run(session, auth, run_id)
+                if run is None or run.conversation_id != conversation.id:
+                    return None
+            rows = session.scalars(
+                select(WorkflowTask)
+                .where(
+                    WorkflowTask.conversation_id == conversation.id,
+                    WorkflowTask.workflow_id == workflow_id,
+                    WorkflowTask.owner_user_id == auth.user_id,
+                    WorkflowTask.workspace_id == auth.workspace_id,
+                )
+                .order_by(WorkflowTask.created_at.asc(), WorkflowTask.id.asc())
+            ).all()
+            by_template = {row.task_template_id: row for row in rows}
+            created: list[WorkflowTask] = []
+            updated: list[WorkflowTask] = []
+            unchanged: list[WorkflowTask] = []
+            requested_templates: set[str] = set()
+
+            for payload_json in task_payloads:
+                task_template_id = payload_json.get("task_template_id")
+                status = payload_json.get("status")
+                step_id = payload_json.get("step_id")
+                kind = payload_json.get("kind")
+                if (
+                    not isinstance(task_template_id, str)
+                    or not isinstance(status, str)
+                    or not isinstance(step_id, str)
+                    or not isinstance(kind, str)
+                ):
+                    continue
+                requested_templates.add(task_template_id)
+                task_payload = dict(payload_json)
+                task_payload["status"] = status
+                task = by_template.get(task_template_id)
+                if task is not None and task.status in WORKFLOW_TASK_RESOLVED_STATUSES:
+                    unchanged.append(task)
+                    continue
+                if task is None:
+                    task = WorkflowTask(
+                        id=opaque_id("wft"),
+                        conversation_id=conversation.id,
+                        run_id=run_id,
+                        owner_user_id=auth.user_id,
+                        workspace_id=auth.workspace_id,
+                        workflow_id=workflow_id,
+                        task_template_id=task_template_id,
+                        step_id=step_id,
+                        kind=kind,
+                        status=status,
+                        payload_json=task_payload,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(task)
+                    rows.append(task)
+                    by_template[task_template_id] = task
+                    created.append(task)
+                    continue
+                task_record = _workflow_task_record(task)
+                if _workflow_task_payload_matches(task_record, run_id=run_id, payload_json=task_payload):
+                    unchanged.append(task)
+                    continue
+                task.run_id = run_id
+                task.step_id = step_id
+                task.kind = kind
+                task.status = status
+                task.payload_json = task_payload
+                task.updated_at = now
+                if status not in WORKFLOW_TASK_RESOLVED_STATUSES:
+                    task.resolved_at = None
+                updated.append(task)
+
+            resolved: list[WorkflowTask] = []
+            for task in list(by_template.values()):
+                if (
+                    task.task_template_id not in requested_templates
+                    and task.step_id in completed_steps
+                    and task.status not in WORKFLOW_TASK_RESOLVED_STATUSES
+                ):
+                    task.status = "completed"
+                    task.updated_at = now
+                    task.resolved_at = now
+                    resolved.append(task)
+
+            if created or updated or resolved:
+                session.commit()
+            resolved_ids = {task.id for task in resolved}
+            unchanged_records = [_workflow_task_record(task) for task in unchanged if task.id not in resolved_ids]
+            records = sorted(rows, key=lambda task: (task.created_at, task.id))
+            return WorkflowTaskSyncResult(
+                records=[_workflow_task_record(task) for task in records],
+                created=[_workflow_task_record(task) for task in created],
+                updated=[_workflow_task_record(task) for task in updated],
+                resolved=[_workflow_task_record(task) for task in resolved],
+                unchanged=unchanged_records,
+            )
+
+    def list_workflow_tasks(self, auth: AuthContext, conversation_id: str) -> list[WorkflowTaskRecord] | None:
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            rows = session.scalars(
+                select(WorkflowTask)
+                .where(
+                    WorkflowTask.conversation_id == conversation.id,
+                    WorkflowTask.owner_user_id == auth.user_id,
+                    WorkflowTask.workspace_id == auth.workspace_id,
+                )
+                .order_by(WorkflowTask.created_at.asc(), WorkflowTask.id.asc())
+            ).all()
+            return [_workflow_task_record(row) for row in rows]
+
+    def get_workflow_task(self, auth: AuthContext, task_id: str) -> WorkflowTaskRecord | None:
+        with self._session_factory() as session:
+            task = session.scalar(
+                select(WorkflowTask).where(
+                    WorkflowTask.id == task_id,
+                    WorkflowTask.owner_user_id == auth.user_id,
+                    WorkflowTask.workspace_id == auth.workspace_id,
+                )
+            )
+            return _workflow_task_record(task) if task is not None else None
+
+    def submit_workflow_task_response(
+        self,
+        auth: AuthContext,
+        task_id: str,
+        *,
+        response_json: dict,
+        status: str = "completed",
+    ) -> WorkflowTaskRecord | None:
+        return self.resolve_workflow_task(auth, task_id, status=status, response_json=response_json)
+
+    def resolve_workflow_task(
+        self,
+        auth: AuthContext,
+        task_id: str,
+        *,
+        status: str,
+        response_json: dict | None = None,
+    ) -> WorkflowTaskRecord | None:
+        now = utc_now()
+        with self._session_factory() as session:
+            task = session.scalar(
+                select(WorkflowTask).where(
+                    WorkflowTask.id == task_id,
+                    WorkflowTask.owner_user_id == auth.user_id,
+                    WorkflowTask.workspace_id == auth.workspace_id,
+                )
+            )
+            if task is None:
+                return None
+            task.status = status
+            if response_json is not None:
+                task.response_json = response_json
+            task.updated_at = now
+            task.resolved_at = now if status in WORKFLOW_TASK_RESOLVED_STATUSES else None
+            session.commit()
+            return _workflow_task_record(task)
 
     def summarize_run_events(self, auth: AuthContext, run_id: str) -> RunEventSummaryRecord | None:
         with self._session_factory() as session:
@@ -2315,6 +2595,26 @@ def _run_event_record(event: RunEvent, run: AssistantRun | None = None) -> RunEv
         created_at=_utc_aware(event.created_at),
         request_id=run.request_id if run is not None else None,
         trace_id=run.trace_id if run is not None else None,
+    )
+
+
+def _workflow_task_record(task: WorkflowTask) -> WorkflowTaskRecord:
+    return WorkflowTaskRecord(
+        id=task.id,
+        conversation_id=task.conversation_id,
+        run_id=task.run_id,
+        owner_user_id=task.owner_user_id,
+        workspace_id=task.workspace_id,
+        workflow_id=task.workflow_id,
+        task_template_id=task.task_template_id,
+        step_id=task.step_id,
+        kind=task.kind,
+        status=task.status,
+        payload_json=task.payload_json,
+        response_json=task.response_json,
+        created_at=_utc_aware(task.created_at),
+        updated_at=_utc_aware(task.updated_at),
+        resolved_at=_utc_aware(task.resolved_at) if task.resolved_at is not None else None,
     )
 
 

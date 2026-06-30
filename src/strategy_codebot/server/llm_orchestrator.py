@@ -1,14 +1,20 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field, replace
 import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 from strategy_codebot.server.action_registry import action_registry_payload
+from strategy_codebot.server.action_registry import ActionRegistryEvaluation
+from strategy_codebot.server.action_registry import ActionRegistryRequestCache
+from strategy_codebot.server.action_registry import evaluate_action_registry
 from strategy_codebot.server.action_registry import available_registry_tool_ids
+from strategy_codebot.server.agent_loop import AgentLoopBudget
+from strategy_codebot.server.agent_loop import BoundedScoutRunner
 from strategy_codebot.server.agent_logging import agent_log
 from strategy_codebot.server.artifact_kinds import BACKTEST_PLAN_ARTIFACT_KIND
 from strategy_codebot.server.artifact_kinds import BACKTEST_REPORT_ARTIFACT_KIND
@@ -22,11 +28,34 @@ from strategy_codebot.server.backtest_auto_chain import BacktestAutoChainPlanner
 from strategy_codebot.server.backtest_summary_text import format_backtest_summary_text
 from strategy_codebot.server.bot_proposals import bot_required_missing
 from strategy_codebot.server.conversation_context import ConversationContextBuilder
+from strategy_codebot.server.domain_intent_gate import CHAT_INTENT_ACTIONS
+from strategy_codebot.server.domain_intent_gate import CHAT_INTENT_MIN_CONFIDENCE
+from strategy_codebot.server.domain_intent_gate import CHAT_INTENT_MODEL_STAGES
+from strategy_codebot.server.domain_intent_gate import DOMAIN_SCOPES
+from strategy_codebot.server.domain_intent_gate import RESPONSE_INTENTS
+from strategy_codebot.server.domain_intent_gate import WORKFLOW_INTENTS
+from strategy_codebot.server.domain_intent_gate import DomainScopeDecision
+from strategy_codebot.server.domain_intent_gate import chat_intent_registry_guidance
+from strategy_codebot.server.domain_intent_gate import classify_domain_scope_compat
+from strategy_codebot.server.domain_intent_gate import domain_scope_for_response_intent
+from strategy_codebot.server.domain_intent_gate import evidence_signals_from_regex
+from strategy_codebot.server.domain_intent_gate import model_stage_for_response_intent
+from strategy_codebot.server.domain_intent_gate import normalize_evidence_signals
+from strategy_codebot.server.domain_intent_gate import normalize_domain_scope
+from strategy_codebot.server.domain_intent_gate import normalize_workflow_intent
+from strategy_codebot.server.domain_intent_gate import precheck_domain_scope
+from strategy_codebot.server.domain_intent_gate import response_intent_allows_workflow
+from strategy_codebot.server.domain_intent_gate import should_block_domain_scope
+from strategy_codebot.server.domain_intent_gate import workflow_timeout_fallback_policy
+from strategy_codebot.server.domain_intent_gate import workflow_id_for_intent
+from strategy_codebot.server.domain_intent_gate import workflow_intent_policy
+from strategy_codebot.current_context_policy import current_context_policy_decision
 from strategy_codebot.server.llm_clients import LLMClient, LLMClientEvent, ResponsesClient
 from strategy_codebot.server.llm_clients import LLM_EVENT_MESSAGE_DELTA
 from strategy_codebot.server.llm_clients import LLM_EVENT_SOURCES
 from strategy_codebot.server.llm_clients import LLM_EVENT_TOOL_CALL
 from strategy_codebot.server.llm_clients import LLM_EVENT_USAGE
+from strategy_codebot.server.llm_clients import stream_client as _stream_client
 from strategy_codebot.server.llm_json import extract_json_object
 from strategy_codebot.server.llm_tools import ToolExecutionContext
 from strategy_codebot.server.llm_tools import TOOL_DEFINITIONS
@@ -35,16 +64,32 @@ from strategy_codebot.server.llm_tools import execute_tool
 from strategy_codebot.server.llm_tools import provider_tools
 from strategy_codebot.server.llm_tools import validate_tool_arguments
 from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
+from strategy_codebot.server.intent_evidence import collect_chat_regex_evidence
+from strategy_codebot.server.intent_evidence import current_context_signal
 from strategy_codebot.server.market_data import MarketDataGateway
 from strategy_codebot.server.market_data import market_data_context
 from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
 from strategy_codebot.server.model_routing import MODEL_STAGE_BALANCED_REVIEW
+from strategy_codebot.server.model_routing import MODEL_STAGE_CLASSIFIER
 from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
 from strategy_codebot.server.model_routing import MODEL_STAGE_REPAIR
+from strategy_codebot.server.model_routing import MODEL_STAGE_STRATEGY_CODING
 from strategy_codebot.server.model_routing import PROVIDER_ROUTE_EVENT
+from strategy_codebot.server.model_audit import MODEL_ACTION_EXECUTED
+from strategy_codebot.server.model_audit import MODEL_ACTION_PROPOSED
+from strategy_codebot.server.model_audit import MODEL_ACTION_REJECTED
+from strategy_codebot.server.model_audit import MODEL_ACTION_VALIDATED
+from strategy_codebot.server.model_audit import WORKFLOW_GATE_REQUIRED
+from strategy_codebot.server.model_audit import append_model_audit_event
+from strategy_codebot.server.model_audit import model_audit_payload
 from strategy_codebot.server.observability import StageTimer
 from strategy_codebot.server.observability import append_stage_event
 from strategy_codebot.server.observability import append_stage_started_event
+from strategy_codebot.server.policy_semantic_gate import PolicySemanticGateClassifier
+from strategy_codebot.server.policy_semantic_gate import collect_semantic_policy_candidates
+from strategy_codebot.server.policy_semantic_gate import semantic_policy_block_finding
+from strategy_codebot.server.policy_semantic_gate import semantic_policy_fallback_decision
+from strategy_codebot.server.policy_semantic_gate import should_block_semantic_policy
 from strategy_codebot.server.policy import EVIDENCE_GENERATED_ARTIFACT
 from strategy_codebot.server.policy import EVIDENCE_STRATEGY_IDEA
 from strategy_codebot.server.policy import SAFE_BLOCKED_MESSAGE
@@ -70,12 +115,21 @@ from strategy_codebot.server.streaming import sse_frame
 from strategy_codebot.server.streaming import transient_delta_event
 from strategy_codebot.server.streaming import transient_reasoning_event
 from strategy_codebot.server.token_estimation import estimate_tokens as _token_estimate
+from strategy_codebot.server.workflow_registry import STRATEGY_BOT_OPTIONAL_STEPS
 from strategy_codebot.server.workflow_registry import STRATEGY_BOT_REQUIRED_INPUT_FIELDS
 from strategy_codebot.server.workflow_registry import STRATEGY_BOT_SETUP_FIELDS
 from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_ID
 from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_STEPS
 from strategy_codebot.server.workflow_registry import validate_workflow_payload
 from strategy_codebot.server.workflow_registry import workflow_catalog_guidance
+from strategy_codebot.server.workflow_task_status import WORKFLOW_TASK_RESOLVED_STATUSES
+from strategy_codebot.server.workflow_tasks import build_workflow_task_payload
+from strategy_codebot.server.workflow_tasks import normalize_workflow_tasks
+from strategy_codebot.server.workflow_tasks import workflow_task_state
+from strategy_codebot.prompt_contracts import STAGE_PINE_CODE_GENERATION
+from strategy_codebot.prompt_contracts import STAGE_STRATEGY_CODING
+from strategy_codebot.prompt_contracts import STAGE_STRATEGY_REASONING
+from strategy_codebot.prompt_contracts import stage_messages as prompt_stage_messages
 
 logger = logging.getLogger(__name__)
 
@@ -84,30 +138,54 @@ SUGGESTIONS_EVENT = "chat.suggestions.updated"
 STRATEGY_WORKFLOW_EVENT = "chat.workflow.updated"
 CLASSIFIER_TIMEOUT_SECONDS_ENV = "STRATEGY_CODEBOT_CLASSIFIER_TIMEOUT_SECONDS"
 DEFAULT_CLASSIFIER_TIMEOUT_SECONDS = 25.0
-ACTION_PLANNER_ENABLED_ENV = "STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED"
-RESPONSE_INTENTS = {
-    "artifact_generation",
-    "backtest_preview",
-    "capability_help",
-    "docs_research",
-    "general_chat",
-    "market_research",
-    "market_snapshot",
-    "pine_generation",
-    "strategy_building",
+CLASSIFIER_DEFAULT_TIMEOUTS = {
+    "policy_semantic_gate": 5.0,
+    "chat_intent_decision": 12.0,
+    "action_planner": 8.0,
+    "response_intent": 8.0,
 }
+CLASSIFIER_ROUTE_TIMEOUT_SECONDS_ENV = "STRATEGY_CODEBOT_CLASSIFIER_ROUTE_TIMEOUT_SECONDS"
+CLASSIFIER_ROUTE_TIMEOUT_MARGIN_SECONDS = 1.0
+CLASSIFIER_ROUTE_ATTEMPT_TARGET = 2
+CLASSIFIER_ROUTE_TIMEOUT_MAX_SECONDS = 5.0
+CLASSIFIER_ROUTE_TIMEOUT_MIN_SECONDS = 0.5
+CLASSIFIER_EVENT_STARTED = "classifier.started"
+CLASSIFIER_EVENT_ROUTE = "classifier.route"
+CLASSIFIER_EVENT_COMPLETED = "classifier.completed"
+CLASSIFIER_EVENT_TIMEOUT = "classifier.timeout"
+CLASSIFIER_EVENT_FAILED = "classifier.failed"
+WORKFLOW_TIMEOUT_FALLBACK_SOURCE = "workflow_timeout_fallback"
+SAFE_CLASSIFIER_PROMPT_SUMMARY_SCALAR_KEYS = frozenset(
+    {
+        "action_count",
+        "artifact_kind_count",
+        "candidate_count",
+        "message_chars",
+        "regex_evidence_count",
+    }
+)
+ACTION_PLANNER_ENABLED_ENV = "STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED"
 SUGGESTION_SLOTS = {"entry", "exit", "market", "risk"}
 RESPONSE_INTENT_FALLBACK_CONFIDENCE = 0.35
 RESPONSE_INTENT_LLM_MIN_CONFIDENCE = 0.6
 SEMANTIC_ACTION_MIN_CONFIDENCE = 0.65
-CHAT_INTENT_DECISION_MIN_CONFIDENCE = 0.65
-CHAT_INTENT_ACTIONS = {"answer", "call_tool", "suggest_actions", "ask_clarification", "start_auto_chain"}
-CHAT_INTENT_MODEL_STAGES = {
-    DEFAULT_MODEL_STAGE,
-    MODEL_STAGE_BALANCED_REVIEW,
-    MODEL_STAGE_PINE_CODE_GENERATION,
-    MODEL_STAGE_REPAIR,
-}
+CHAT_INTENT_DECISION_MIN_CONFIDENCE = CHAT_INTENT_MIN_CONFIDENCE
+STRATEGY_PROMPT_CHAIN_INTENTS = {"artifact_generation", "pine_generation", "strategy_building"}
+STRATEGY_PROMPT_CHAIN_STAGES = (
+    STAGE_STRATEGY_REASONING,
+    STAGE_STRATEGY_CODING,
+    STAGE_PINE_CODE_GENERATION,
+)
+PROMPT_CHAIN_WORKFLOW = "strategy_prompt_chain"
+PROMPT_CHAIN_STARTED_EVENT = "prompt_chain.started"
+PROMPT_CHAIN_STAGE_COMPLETED_EVENT = "prompt_chain.stage_completed"
+PROMPT_CHAIN_COMPLETED_EVENT = "prompt_chain.completed"
+PROMPT_CHAIN_FALLBACK_EVENT = "prompt_chain.fallback"
+PROMPT_CHAIN_FAILED_EVENT = "prompt_chain.failed"
+STRATEGY_PROMPT_CHAIN_SIZING_GUIDANCE = (
+    "Use bounded position sizing such as fixed units or 1-2% account equity risk per trade; "
+    "never use full-capital, all-in, or unbounded leverage assumptions."
+)
 SEMANTIC_ACTIONS = {
     "build_robustness_report",
     "create_proposed_intent",
@@ -200,19 +278,48 @@ class IntentClassification:
 
 
 @dataclass(frozen=True)
-class DomainScopeDecision:
-    allowed: bool
-    scope: str
-    reason: str
-    confidence: float
+class ClassifierRunOutcome:
+    value: Any
+    status: str
+    duration_ms: int
+    timeout_seconds: float
+    fallback_source: str | None = None
+    error_class: str | None = None
 
-    def payload(self) -> dict[str, Any]:
-        return {
-            "domain_scope": self.scope,
-            "domain_scope_allowed": self.allowed,
-            "domain_scope_confidence": round(max(0.0, min(1.0, self.confidence)), 3),
-            "domain_scope_reason": self.reason,
-        }
+
+class ClassifierRouteCaptureClient:
+    def __init__(
+        self,
+        client: LLMClient,
+        *,
+        stage: str,
+        route_timeout_seconds: float | None,
+    ) -> None:
+        self.client = client
+        self.model = getattr(client, "model", "classifier-route-capture")
+        self.stage = stage
+        self.route_timeout_seconds = route_timeout_seconds
+        self.route_events: list[dict[str, Any]] = []
+
+    def ensure_configured(self) -> None:
+        self.client.ensure_configured()
+
+    def stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        tools: list[dict[str, Any]],
+        routing_context: dict[str, Any] | None = None,
+    ) -> Iterable[LLMClientEvent]:
+        context = dict(routing_context or {})
+        context.setdefault("stage", self.stage)
+        if self.route_timeout_seconds is not None:
+            context.setdefault("route_timeout_seconds", self.route_timeout_seconds)
+            context.setdefault("hard_route_timeout", True)
+        for event in _stream_client(self.client, messages=messages, tools=tools, routing_context=context):
+            if event.type == PROVIDER_ROUTE_EVENT and isinstance(event.arguments, dict):
+                self.route_events.append(dict(event.arguments))
+            yield event
 
 
 def _run_optional_classifier(
@@ -222,13 +329,44 @@ def _run_optional_classifier(
     *,
     log_context: dict[str, Any] | None = None,
 ) -> Any:
-    timeout_seconds = _classifier_timeout_seconds()
+    outcome = _run_optional_classifier_outcome(
+        classifier_name,
+        classify,
+        fallback,
+        log_context=log_context,
+    )
+    return outcome.value
+
+
+def _run_optional_classifier_outcome(
+    classifier_name: str,
+    classify: Callable[[], Any],
+    fallback: Any,
+    *,
+    log_context: dict[str, Any] | None = None,
+) -> ClassifierRunOutcome:
+    timeout_seconds = _classifier_timeout_seconds(classifier_name)
+    started = time.perf_counter()
     if timeout_seconds <= 0:
-        return classify()
+        result = classify()
+        return ClassifierRunOutcome(
+            value=result,
+            status="completed",
+            duration_ms=_duration_ms(started),
+            timeout_seconds=timeout_seconds,
+            fallback_source=getattr(result, "source", None),
+        )
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"strategy-{classifier_name}")
     future = executor.submit(classify)
     try:
-        return future.result(timeout=timeout_seconds)
+        result = future.result(timeout=timeout_seconds)
+        return ClassifierRunOutcome(
+            value=result,
+            status="completed",
+            duration_ms=_duration_ms(started),
+            timeout_seconds=timeout_seconds,
+            fallback_source=getattr(result, "source", None),
+        )
     except FutureTimeoutError:
         agent_log(
             logger,
@@ -240,10 +378,17 @@ def _run_optional_classifier(
             **(log_context or {}),
         )
         try:
-            return replace(fallback, source="timeout_fallback")
+            value = replace(fallback, source="timeout_fallback")
         except TypeError:
-            return fallback
-    except Exception:
+            value = fallback
+        return ClassifierRunOutcome(
+            value=value,
+            status="timeout",
+            duration_ms=_duration_ms(started),
+            timeout_seconds=timeout_seconds,
+            fallback_source=getattr(value, "source", "timeout_fallback"),
+        )
+    except Exception as exc:
         agent_log(
             logger,
             "error",
@@ -252,20 +397,151 @@ def _run_optional_classifier(
             classifier=classifier_name,
             **(log_context or {}),
         )
-        return fallback
+        return ClassifierRunOutcome(
+            value=fallback,
+            status="failed",
+            duration_ms=_duration_ms(started),
+            timeout_seconds=timeout_seconds,
+            fallback_source=getattr(fallback, "source", "fallback"),
+            error_class=exc.__class__.__name__,
+        )
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _classifier_timeout_seconds() -> float:
-    raw = os.getenv(CLASSIFIER_TIMEOUT_SECONDS_ENV)
+def _duration_ms(started: float) -> int:
+    return max(0, round((time.perf_counter() - started) * 1000))
+
+
+def _classifier_timeout_seconds(classifier_name: str | None = None) -> float:
+    raw = os.getenv(_classifier_timeout_env_name(classifier_name)) if classifier_name else None
+    if raw is None:
+        raw = os.getenv(CLASSIFIER_TIMEOUT_SECONDS_ENV)
     if raw is None or not raw.strip():
-        return DEFAULT_CLASSIFIER_TIMEOUT_SECONDS
+        return CLASSIFIER_DEFAULT_TIMEOUTS.get(classifier_name or "", DEFAULT_CLASSIFIER_TIMEOUT_SECONDS)
     try:
         timeout = float(raw)
     except ValueError:
-        return DEFAULT_CLASSIFIER_TIMEOUT_SECONDS
+        return CLASSIFIER_DEFAULT_TIMEOUTS.get(classifier_name or "", DEFAULT_CLASSIFIER_TIMEOUT_SECONDS)
     return max(0.0, timeout)
+
+
+def _classifier_timeout_env_name(classifier_name: str | None) -> str:
+    if not classifier_name:
+        return CLASSIFIER_TIMEOUT_SECONDS_ENV
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", classifier_name).strip("_").upper()
+    return f"{CLASSIFIER_TIMEOUT_SECONDS_ENV}_{normalized}"
+
+
+def _classifier_route_timeout_seconds(classifier_name: str) -> float | None:
+    timeout = _classifier_timeout_seconds(classifier_name)
+    if timeout <= 0:
+        return None
+    override = _classifier_route_timeout_override(classifier_name)
+    max_allowed = max(0.1, timeout - CLASSIFIER_ROUTE_TIMEOUT_MARGIN_SECONDS)
+    if override is not None:
+        return min(max_allowed, override)
+    per_route = max_allowed / CLASSIFIER_ROUTE_ATTEMPT_TARGET
+    return max(
+        CLASSIFIER_ROUTE_TIMEOUT_MIN_SECONDS,
+        min(CLASSIFIER_ROUTE_TIMEOUT_MAX_SECONDS, per_route),
+    )
+
+
+def _classifier_route_timeout_override(classifier_name: str) -> float | None:
+    raw = os.getenv(_classifier_route_timeout_env_name(classifier_name)) or os.getenv(
+        CLASSIFIER_ROUTE_TIMEOUT_SECONDS_ENV
+    )
+    if raw is None or not raw.strip():
+        return None
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return None
+    return timeout if timeout > 0 else None
+
+
+def _classifier_route_timeout_env_name(classifier_name: str | None) -> str:
+    if not classifier_name:
+        return CLASSIFIER_ROUTE_TIMEOUT_SECONDS_ENV
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", classifier_name).strip("_").upper()
+    return f"{CLASSIFIER_ROUTE_TIMEOUT_SECONDS_ENV}_{normalized}"
+
+
+def _classifier_event_payload(
+    run: AssistantRunRecord,
+    *,
+    classifier_name: str,
+    stage: str,
+    status: str,
+    timeout_seconds: float,
+    prompt_summary: dict[str, Any],
+    duration_ms: int | None = None,
+    fallback_source: str | None = None,
+    error_class: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "actor": "backend",
+        "source": "classifier",
+        "classifier_name": classifier_name,
+        "stage": stage,
+        "status": status,
+        "timeout_seconds": round(max(0.0, timeout_seconds), 3),
+        "conversation_id": run.conversation_id,
+        "run_id": run.id,
+        "request_id": run.request_id,
+        "trace_id": run.trace_id,
+        "safe_prompt_summary": _safe_classifier_prompt_summary(prompt_summary),
+    }
+    if duration_ms is not None:
+        payload["duration_ms"] = max(0, duration_ms)
+    if fallback_source:
+        payload["fallback_source"] = fallback_source
+    if error_class:
+        payload["error_class"] = error_class
+    return payload
+
+
+def _classifier_route_event_payload(
+    run: AssistantRunRecord,
+    *,
+    classifier_name: str,
+    stage: str,
+    route_event: dict[str, Any],
+    prompt_summary: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _classifier_event_payload(
+        run,
+        classifier_name=classifier_name,
+        stage=stage,
+        status="route",
+        timeout_seconds=_classifier_timeout_seconds(classifier_name),
+        prompt_summary=prompt_summary,
+    )
+    for key, value in route_event.items():
+        if isinstance(value, str | bool | int | float):
+            payload[key] = value
+    fallback_attempts = route_event.get("fallback_attempts")
+    if isinstance(fallback_attempts, list):
+        payload["fallback_attempt_count"] = len(fallback_attempts)
+    return payload
+
+
+def _safe_classifier_prompt_summary(value: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key, raw in value.items():
+        if key in SAFE_CLASSIFIER_PROMPT_SUMMARY_SCALAR_KEYS and (
+            isinstance(raw, bool | int | float) or raw is None
+        ):
+            summary[key] = raw
+        elif isinstance(raw, str):
+            summary[f"{key}_chars"] = len(raw)
+        elif isinstance(raw, set | list | tuple):
+            summary[f"{key}_count"] = len(raw)
+        elif isinstance(raw, dict):
+            summary[f"{key}_count"] = len(raw)
+    return summary
 
 
 def _action_planner_enabled() -> bool:
@@ -287,8 +563,6 @@ class ResponseIntentClassifier:
         deterministic = _deterministic_response_intent(message_content, web_search=web_search)
         if deterministic is not None:
             return deterministic
-        if not _has_intent_classifier_signal(message_content):
-            return IntentClassification("general_chat", 0.75, "deterministic")
         return _run_optional_classifier(
             "response_intent",
             lambda: self._classify_with_llm(message_content),
@@ -305,7 +579,7 @@ class ResponseIntentClassifier:
                     {"role": "user", "content": message_content[:2000]},
                 ],
                 tools=[],
-                routing_context={"stage": DEFAULT_MODEL_STAGE},
+                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -393,6 +667,8 @@ class ChatIntentDecision:
     tool_id: str | None = None
     auto_chain: bool = False
     current_context_required: bool = False
+    domain_scope: str = "ambiguous"
+    workflow_intent: str | None = None
     missing_inputs: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     used_signals: tuple[str, ...] = ()
@@ -410,11 +686,14 @@ class ChatIntentDecision:
             "auto_chain": self.auto_chain,
             "confidence": round(max(0.0, min(1.0, self.confidence)), 3),
             "current_context_required": self.current_context_required,
+            "domain_scope": self.domain_scope,
             "intent": self.response_intent,
             "model_stage": self.model_stage,
             "safe": True,
             "source": self.source,
         }
+        if self.workflow_intent:
+            payload["workflow_intent"] = self.workflow_intent
         if self.tool_id:
             payload["tool_id"] = self.tool_id
         if self.missing_inputs:
@@ -424,6 +703,11 @@ class ChatIntentDecision:
         if self.used_signals:
             payload["used_signals"] = list(self.used_signals)
         return payload
+
+
+@dataclass(frozen=True)
+class _StrategyPromptChainResult:
+    final_text: str
 
 
 class ChatIntentDecisionPlanner:
@@ -438,25 +722,75 @@ class ChatIntentDecisionPlanner:
         artifact_kinds: set[str],
         web_search: str,
         language: str,
+        domain_scope_hint: str | None = None,
         log_context: dict[str, Any] | None = None,
-    ) -> ChatIntentDecision:
+        return_outcome: bool = False,
+        action_evaluation: ActionRegistryEvaluation | None = None,
+    ) -> ChatIntentDecision | ClassifierRunOutcome:
         regex_evidence = _chat_regex_evidence(message_content)
-        registry_payload = action_registry_payload(
+        precheck = precheck_domain_scope(message_content, artifact_kinds=artifact_kinds)
+        deterministic = _deterministic_response_intent(message_content, web_search=web_search)
+        if precheck is not None and precheck.reason in {
+            "empty_or_whitespace",
+            "small_talk_or_context_followup",
+            "artifact_context_signal",
+            "explicit_off_topic_request",
+        }:
+            response_intent = deterministic.intent if deterministic is not None else "general_chat"
+            decision = ChatIntentDecision(
+                response_intent=response_intent,
+                action="answer",
+                model_stage=_model_stage_for_intent(response_intent),
+                confidence=max(precheck.confidence, deterministic.confidence if deterministic is not None else 0.0),
+                source="deterministic_precheck",
+                current_context_required=bool(regex_evidence.get("current_info")),
+                domain_scope=precheck.scope,
+                used_signals=evidence_signals_from_regex(regex_evidence),
+            )
+            if return_outcome:
+                return ClassifierRunOutcome(
+                    value=decision,
+                    status="completed",
+                    duration_ms=0,
+                    timeout_seconds=_classifier_timeout_seconds("chat_intent_decision"),
+                    fallback_source=decision.source,
+                )
+            return decision
+        if deterministic is not None:
+            decision = ChatIntentDecision(
+                response_intent=deterministic.intent,
+                action="answer",
+                model_stage=_model_stage_for_intent(deterministic.intent),
+                confidence=deterministic.confidence,
+                source=deterministic.source,
+                current_context_required=bool(regex_evidence.get("current_info")),
+                domain_scope=domain_scope_for_response_intent(deterministic.intent),
+                used_signals=evidence_signals_from_regex(regex_evidence),
+            )
+            if return_outcome:
+                return ClassifierRunOutcome(
+                    value=decision,
+                    status="completed",
+                    duration_ms=0,
+                    timeout_seconds=_classifier_timeout_seconds("chat_intent_decision"),
+                    fallback_source=decision.source,
+                )
+            return decision
+        effective_domain_scope_hint = domain_scope_hint or (precheck.scope if precheck is not None else None)
+        action_evaluation = action_evaluation or evaluate_action_registry(
             artifact_kinds=artifact_kinds,
             context_text=f"{context_text}\n{message_content}",
             web_search=web_search,
         )
-        available_tools = {
-            str(item.get("tool_id"))
-            for item in registry_payload
-            if item.get("available") is True and isinstance(item.get("tool_id"), str)
-        }
+        registry_payload = action_evaluation.payload
+        available_tools = {str(tool_id) for tool_id in action_evaluation.available_tool_ids}
         fallback = _fallback_chat_intent_decision(
             message_content,
             web_search=web_search,
             regex_evidence=regex_evidence,
+            domain_scope_hint=effective_domain_scope_hint,
         )
-        return _run_optional_classifier(
+        outcome = _run_optional_classifier_outcome(
             "chat_intent_decision",
             lambda: self._decide_with_llm(
                 message_content,
@@ -467,11 +801,13 @@ class ChatIntentDecisionPlanner:
                 regex_evidence=regex_evidence,
                 registry_payload=registry_payload,
                 available_tools=available_tools,
+                domain_scope_hint=effective_domain_scope_hint,
                 fallback=fallback,
             ),
             fallback,
             log_context=log_context,
         )
+        return outcome if return_outcome else outcome.value
 
     def _decide_with_llm(
         self,
@@ -484,6 +820,7 @@ class ChatIntentDecisionPlanner:
         regex_evidence: dict[str, bool],
         registry_payload: list[dict[str, Any]],
         available_tools: set[str],
+        domain_scope_hint: str | None,
         fallback: ChatIntentDecision,
     ) -> ChatIntentDecision:
         prompt = {
@@ -491,9 +828,13 @@ class ChatIntentDecisionPlanner:
             "language": language,
             "artifact_kinds": sorted(artifact_kinds),
             "context_excerpt": context_text[-3000:],
+            "domain_scope_hint": domain_scope_hint,
+            "allowed_domain_scopes": sorted(DOMAIN_SCOPES),
+            "allowed_workflow_intents": sorted(WORKFLOW_INTENTS),
             "web_search": web_search,
             "regex_evidence": regex_evidence,
             "actions": registry_payload,
+            "intent_registry_guidance": chat_intent_registry_guidance(),
             "boundaries": [
                 "Regex evidence is a hint only; decide from the user's semantic intent.",
                 "Choose start_auto_chain only when the user asks to generate or preview local backtest evidence.",
@@ -510,7 +851,7 @@ class ChatIntentDecisionPlanner:
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                 ],
                 tools=[],
-                routing_context={"stage": DEFAULT_MODEL_STAGE},
+                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -538,20 +879,28 @@ class ActionPlanner:
         web_search: str,
         regex_evidence: dict[str, bool] | None = None,
         log_context: dict[str, Any] | None = None,
-    ) -> ActionPlanDecision:
-        registry_payload = action_registry_payload(
+        return_outcome: bool = False,
+        action_evaluation: ActionRegistryEvaluation | None = None,
+    ) -> ActionPlanDecision | ClassifierRunOutcome:
+        action_evaluation = action_evaluation or evaluate_action_registry(
             artifact_kinds=artifact_kinds,
             context_text=f"{context_text}\n{message_content}",
             web_search=web_search,
         )
-        available_tools = {
-            item.get("tool_id")
-            for item in registry_payload
-            if item.get("available") is True and isinstance(item.get("tool_id"), str)
-        }
+        registry_payload = action_evaluation.payload
+        available_tools = set(action_evaluation.available_tool_ids)
         if not available_tools:
-            return ActionPlanDecision("answer", "none", 0.0, "none")
-        return _run_optional_classifier(
+            decision = ActionPlanDecision("answer", "none", 0.0, "none")
+            if return_outcome:
+                return ClassifierRunOutcome(
+                    value=decision,
+                    status="completed",
+                    duration_ms=0,
+                    timeout_seconds=_classifier_timeout_seconds("action_planner"),
+                    fallback_source=decision.source,
+                )
+            return decision
+        outcome = _run_optional_classifier_outcome(
             "action_planner",
             lambda: self._plan_with_llm(
                 message_content,
@@ -565,6 +914,7 @@ class ActionPlanner:
             ActionPlanDecision("answer", "none", 0.0, "fallback"),
             log_context=log_context,
         )
+        return outcome if return_outcome else outcome.value
 
     def _plan_with_llm(
         self,
@@ -599,7 +949,7 @@ class ActionPlanner:
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                 ],
                 tools=[],
-                routing_context={"stage": DEFAULT_MODEL_STAGE},
+                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -654,9 +1004,11 @@ class LLMOrchestrator:
         request_id: str | None = None,
         trace_id: str | None = None,
         web_search: str = "auto",
+        workflow_task_resume: dict[str, Any] | None = None,
     ) -> Iterator[str]:
         language = _normalize_language(language)
         web_search = _normalize_web_search(web_search)
+        workflow_task_resume_payload = workflow_task_resume if isinstance(workflow_task_resume, dict) else None
         run = self.repository.create_run(
             auth,
             conversation_id,
@@ -680,17 +1032,157 @@ class LLMOrchestrator:
             web_search=web_search,
         )
         budget = self._new_budget()
+        action_registry_cache = ActionRegistryRequestCache()
         accumulated_text: list[str] = []
+        pre_response_frames: list[str] = []
         terminal_status: str | None = None
+        if workflow_task_resume_payload is not None:
+            pre_response_frames.append(
+                self._append_frame(
+                    auth,
+                    run,
+                    "workflow.continuation.started",
+                    {
+                        **workflow_task_resume_payload,
+                        "source": "workflow_task_resume",
+                        "status": "started",
+                    },
+                )
+            )
+        safety_finding = None if workflow_task_resume_payload is not None else chat_safety_preflight(message_content)
+        if safety_finding is not None:
+            yield from self._chat_safety_blocked(
+                auth,
+                run,
+                safety_finding,
+                language=language,
+                audit_source="chat_safety_preflight",
+            )
+            return
+        policy_candidates = [] if workflow_task_resume_payload is not None else collect_semantic_policy_candidates(message_content)
+        if policy_candidates:
+            classifier_name = "policy_semantic_gate"
+            policy_prompt_summary = {
+                "message_chars": len(message_content or ""),
+                "candidate_count": len(policy_candidates),
+                "artifact_kind_count": 0,
+                "action_count": 0,
+            }
+            policy_capture_client = ClassifierRouteCaptureClient(
+                self.client,
+                stage=MODEL_STAGE_CLASSIFIER,
+                route_timeout_seconds=_classifier_route_timeout_seconds(classifier_name),
+            )
+            pre_response_frames.append(
+                self._classifier_started_frame(
+                    auth,
+                    run,
+                    classifier_name=classifier_name,
+                    stage=MODEL_STAGE_CLASSIFIER,
+                    timeout_seconds=_classifier_timeout_seconds(classifier_name),
+                    prompt_summary=policy_prompt_summary,
+                )
+            )
+            policy_outcome = _run_optional_classifier_outcome(
+                classifier_name,
+                lambda: PolicySemanticGateClassifier(policy_capture_client).classify(
+                    message_content,
+                    candidates=policy_candidates,
+                    surface="agent.chat.input",
+                    evidence_level=EVIDENCE_STRATEGY_IDEA,
+                ),
+                semantic_policy_fallback_decision(policy_candidates),
+                log_context={
+                    "conversation_id": conversation_id,
+                    "run_id": run.id,
+                    "request_id": run.request_id,
+                    "trace_id": run.trace_id,
+                },
+            )
+            pre_response_frames.extend(
+                self._classifier_result_frames(
+                    auth,
+                    run,
+                    classifier_name=classifier_name,
+                    stage=MODEL_STAGE_CLASSIFIER,
+                    capture_client=policy_capture_client,
+                    outcome=policy_outcome,
+                    prompt_summary=policy_prompt_summary,
+                )
+            )
+            semantic_decision = policy_outcome.value
+            if semantic_decision.source == "policy_semantic_gate":
+                pre_response_frames.append(
+                    self._append_audit_frame(
+                        auth,
+                        run,
+                        MODEL_ACTION_PROPOSED,
+                        {
+                            "actor": "model",
+                            "source": "policy_semantic_gate",
+                            "status": "proposed",
+                            "policy_intent": semantic_decision.policy_intent,
+                            "target": semantic_decision.target,
+                            "polarity": semantic_decision.polarity,
+                            "confidence": semantic_decision.confidence,
+                            "reason_code": semantic_decision.reason_code,
+                            "risk_level": "candidate",
+                            "safe_args_summary": {
+                                "candidate_count": len(policy_candidates),
+                                "candidate_rule_ids": list(semantic_decision.candidate_rule_ids),
+                            },
+                        },
+                    )
+                )
+            semantic_blocked = should_block_semantic_policy(semantic_decision)
+            pre_response_frames.append(
+                self._append_audit_frame(
+                    auth,
+                    run,
+                    MODEL_ACTION_VALIDATED,
+                    {
+                        "actor": "backend",
+                        "source": "policy_semantic_gate",
+                        "status": "rejected" if semantic_blocked else "allowed",
+                        "policy_intent": semantic_decision.policy_intent,
+                        "target": semantic_decision.target,
+                        "polarity": semantic_decision.polarity,
+                        "confidence": semantic_decision.confidence,
+                        "reason_code": semantic_decision.reason_code,
+                        "risk_level": "blocker" if semantic_blocked else "candidate",
+                        "safe_args_summary": {
+                            "candidate_count": len(policy_candidates),
+                            "candidate_rule_ids": list(semantic_decision.candidate_rule_ids),
+                            "decision_source": semantic_decision.source,
+                        },
+                    },
+                )
+            )
+            if semantic_blocked:
+                for frame in pre_response_frames:
+                    yield frame
+                pre_response_frames.clear()
+                yield from self._chat_safety_blocked(
+                    auth,
+                    run,
+                    semantic_policy_block_finding(semantic_decision, policy_candidates),
+                    language=language,
+                    audit_source="policy_semantic_gate",
+                )
+                return
         context_builder = ConversationContextBuilder(self.repository)
         artifact_kinds = _conversation_user_artifact_kinds(self.repository, auth, conversation_id, current_run_id=run.id)
-        domain_scope = _classify_domain_scope(message_content, artifact_kinds=artifact_kinds)
-        if not domain_scope.allowed:
+        domain_precheck = (
+            None
+            if workflow_task_resume_payload is not None
+            else precheck_domain_scope(message_content, artifact_kinds=artifact_kinds)
+        )
+        if domain_precheck is not None and not domain_precheck.allowed:
             yield from self._domain_scope_blocked(
                 auth=auth,
                 run=run,
                 conversation_id=conversation_id,
-                domain_scope=domain_scope,
+                domain_scope=domain_precheck,
                 language=language,
             )
             return
@@ -717,31 +1209,132 @@ class LLMOrchestrator:
             conversation_context.prior_context_text,
             language,
         )
-        chat_decision = (
-            ChatIntentDecision(
+        if workflow_task_resume_payload is not None:
+            context_guard_message = None
+            resume_intent = workflow_task_resume_payload.get("resume_intent")
+            if not isinstance(resume_intent, str) or resume_intent not in RESPONSE_INTENTS:
+                resume_intent = "strategy_building"
+            chat_decision = ChatIntentDecision(
+                response_intent=resume_intent,
+                action="answer",
+                model_stage=_model_stage_for_intent(resume_intent),
+                confidence=1.0,
+                source="workflow_task_resume",
+                auto_chain=False,
+                current_context_required=False,
+                domain_scope="trading_workflow",
+                workflow_intent="strategy_to_paper_bot_simulation",
+                reasons=("Resuming from a completed workflow task.",),
+                used_signals=("workflow_task_resume",),
+            )
+        elif context_guard_message is not None:
+            chat_decision = ChatIntentDecision(
                 response_intent="artifact_generation",
                 action="ask_clarification",
                 model_stage=MODEL_STAGE_PINE_CODE_GENERATION,
                 confidence=1.0,
                 source="deterministic_safety",
+                domain_scope=(domain_precheck.scope if domain_precheck is not None else "context_followup"),
                 missing_inputs=("current_strategy_context",),
                 reasons=("The user referenced current strategy context but none is available.",),
             )
-            if context_guard_message is not None
-            else ChatIntentDecisionPlanner(self.client).decide(
+        else:
+            classifier_name = "chat_intent_decision"
+            chat_regex_evidence = _chat_regex_evidence(message_content)
+            chat_action_evaluation = action_registry_cache.get(
+                artifact_kinds=artifact_kinds,
+                context_text=f"{suggestion_context_text}\n{message_content}",
+                web_search=web_search,
+            )
+            chat_prompt_summary = {
+                "message_chars": len(message_content or ""),
+                "artifact_kind_count": len(artifact_kinds),
+                "action_count": len(chat_action_evaluation.payload),
+                "regex_evidence_count": sum(1 for value in chat_regex_evidence.values() if value),
+            }
+            chat_capture_client = ClassifierRouteCaptureClient(
+                self.client,
+                stage=MODEL_STAGE_CLASSIFIER,
+                route_timeout_seconds=_classifier_route_timeout_seconds(classifier_name),
+            )
+            pre_response_frames.append(
+                self._classifier_started_frame(
+                    auth,
+                    run,
+                    classifier_name=classifier_name,
+                    stage=MODEL_STAGE_CLASSIFIER,
+                    timeout_seconds=_classifier_timeout_seconds(classifier_name),
+                    prompt_summary=chat_prompt_summary,
+                )
+            )
+            chat_outcome = ChatIntentDecisionPlanner(chat_capture_client).decide(
                 message_content,
                 context_text=suggestion_context_text,
                 artifact_kinds=artifact_kinds,
                 web_search=web_search,
                 language=language,
+                domain_scope_hint=domain_precheck.scope if domain_precheck is not None else None,
                 log_context={
                     "conversation_id": conversation_id,
                     "request_id": run.request_id,
                     "run_id": run.id,
                     "trace_id": run.trace_id,
                 },
+                return_outcome=True,
+                action_evaluation=chat_action_evaluation,
             )
-        )
+            pre_response_frames.extend(
+                self._classifier_result_frames(
+                    auth,
+                    run,
+                    classifier_name=classifier_name,
+                    stage=MODEL_STAGE_CLASSIFIER,
+                    capture_client=chat_capture_client,
+                    outcome=chat_outcome,
+                    prompt_summary=chat_prompt_summary,
+                )
+            )
+            chat_decision = chat_outcome.value
+            if chat_outcome.status == "timeout":
+                workflow_timeout_decision = _workflow_timeout_fallback_decision(message_content)
+                if workflow_timeout_decision is not None:
+                    chat_decision = workflow_timeout_decision
+        if chat_decision.source == "llm":
+            yield self._append_audit_frame(
+                auth,
+                run,
+                MODEL_ACTION_PROPOSED,
+                {
+                    "actor": "model",
+                    "source": "classifier",
+                    "status": "proposed",
+                    "intent_id": chat_decision.response_intent,
+                    "decision": chat_decision.action,
+                    "tool_id": chat_decision.tool_id,
+                    "confidence": chat_decision.confidence,
+                    "reason_code": chat_decision.domain_scope,
+                    "safe_args_summary": {
+                        "domain_scope": chat_decision.domain_scope,
+                        "workflow_intent": chat_decision.workflow_intent,
+                        "model_stage": chat_decision.model_stage,
+                        "used_signals": list(chat_decision.used_signals),
+                    },
+                },
+            )
+        if should_block_domain_scope(chat_decision.domain_scope, chat_decision.confidence):
+            yield from self._domain_scope_blocked(
+                auth=auth,
+                run=run,
+                conversation_id=conversation_id,
+                domain_scope=DomainScopeDecision(
+                    False,
+                    chat_decision.domain_scope,
+                    f"{chat_decision.source}_semantic_off_topic",
+                    chat_decision.confidence,
+                ),
+                language=language,
+            )
+            return
         response_intent = chat_decision.response_intent
         budget.auto_chain_allowed = chat_decision.should_start_auto_chain()
         budget.auto_chain_source = chat_decision.source if budget.auto_chain_allowed else "none"
@@ -774,8 +1367,42 @@ class LLMOrchestrator:
             "pine_generation",
             "strategy_building",
         } and bool(artifact_kinds)
-        action_plan = (
-            ActionPlanner(self.client).plan(
+        should_run_action_planner = (
+            _action_planner_enabled()
+            and context_guard_message is None
+            and workflow_task_resume_payload is None
+            and not _is_classifier_fallback_source(chat_decision.source)
+        )
+        if should_run_action_planner:
+            classifier_name = "action_planner"
+            action_planner_context_text = f"{suggestion_context_text}\n{message_content}"
+            action_planner_evaluation = action_registry_cache.get(
+                artifact_kinds=artifact_kinds,
+                context_text=action_planner_context_text,
+                web_search=web_search,
+            )
+            action_prompt_summary = {
+                "message_chars": len(message_content or ""),
+                "artifact_kind_count": len(artifact_kinds),
+                "action_count": len(action_planner_evaluation.payload),
+                "regex_evidence_count": sum(1 for value in _chat_regex_evidence(message_content).values() if value),
+            }
+            action_capture_client = ClassifierRouteCaptureClient(
+                self.client,
+                stage=MODEL_STAGE_CLASSIFIER,
+                route_timeout_seconds=_classifier_route_timeout_seconds(classifier_name),
+            )
+            pre_response_frames.append(
+                self._classifier_started_frame(
+                    auth,
+                    run,
+                    classifier_name=classifier_name,
+                    stage=MODEL_STAGE_CLASSIFIER,
+                    timeout_seconds=_classifier_timeout_seconds(classifier_name),
+                    prompt_summary=action_prompt_summary,
+                )
+            )
+            action_outcome = ActionPlanner(action_capture_client).plan(
                 message_content,
                 response_intent=response_intent,
                 context_text=suggestion_context_text,
@@ -788,9 +1415,36 @@ class LLMOrchestrator:
                     "run_id": run.id,
                     "trace_id": run.trace_id,
                 },
+                return_outcome=True,
+                action_evaluation=action_planner_evaluation,
             )
-            if _action_planner_enabled() and context_guard_message is None
-            else ActionPlanDecision("answer", "none", 0.0, "none")
+            pre_response_frames.extend(
+                self._classifier_result_frames(
+                    auth,
+                    run,
+                    classifier_name=classifier_name,
+                    stage=MODEL_STAGE_CLASSIFIER,
+                    capture_client=action_capture_client,
+                    outcome=action_outcome,
+                    prompt_summary=action_prompt_summary,
+                )
+            )
+            action_plan = action_outcome.value
+        else:
+            action_plan = ActionPlanDecision("answer", "none", 0.0, "none")
+        workflow_payload = _maybe_strategy_bot_workflow_payload(
+            repository=self.repository,
+            auth=auth,
+            conversation_id=conversation_id,
+            chat_decision=chat_decision,
+            message_content=message_content,
+            context_text=suggestion_context_text,
+            artifact_kinds=artifact_kinds,
+        )
+        suggestions_action_evaluation = action_registry_cache.get(
+            artifact_kinds=artifact_kinds,
+            context_text=suggestion_context_text,
+            web_search=web_search,
         )
         suggestions_payload = _suggestions_payload(
             response_intent=response_intent,
@@ -801,11 +1455,8 @@ class LLMOrchestrator:
             artifact_kinds=artifact_kinds,
             web_search=web_search,
             action_plan=action_plan,
-        )
-        workflow_payload = _strategy_bot_workflow_payload(
-            message_content=message_content,
-            context_text=suggestion_context_text,
-            artifact_kinds=artifact_kinds,
+            workflow_enabled=workflow_payload is not None,
+            action_evaluation=suggestions_action_evaluation,
         )
         if action_plan.source != "none":
             agent_log(
@@ -838,14 +1489,78 @@ class LLMOrchestrator:
             },
         )
         try:
+            for frame in pre_response_frames:
+                yield frame
+            pre_response_frames.clear()
             yield self._append_frame(
                 auth,
                 run,
                 "chat.response_intent",
                 chat_decision.payload(),
             )
+            yield self._append_audit_frame(
+                auth,
+                run,
+                MODEL_ACTION_VALIDATED,
+                {
+                    "actor": "backend",
+                    "source": "classifier",
+                    "status": "allowed",
+                    "intent_id": chat_decision.response_intent,
+                    "decision": chat_decision.action,
+                    "tool_id": chat_decision.tool_id,
+                    "confidence": chat_decision.confidence,
+                    "reason_code": chat_decision.source,
+                    "missing_fields": list(chat_decision.missing_inputs),
+                    "safe_args_summary": {
+                        "domain_scope": chat_decision.domain_scope,
+                        "workflow_intent": chat_decision.workflow_intent,
+                        "model_stage": chat_decision.model_stage,
+                        "auto_chain": chat_decision.auto_chain,
+                        "current_context_required": chat_decision.current_context_required,
+                    },
+                },
+            )
+            if action_plan.source != "none":
+                yield self._append_audit_frame(
+                    auth,
+                    run,
+                    MODEL_ACTION_PROPOSED,
+                    {
+                        "actor": "model",
+                        "source": "planner",
+                        "status": "proposed",
+                        "intent_id": action_plan.intent_id,
+                        "decision": action_plan.decision,
+                        "tool_id": action_plan.tool_id,
+                        "confidence": action_plan.confidence,
+                        "reason_code": action_plan.source,
+                        "suggested_actions": list(action_plan.suggested_actions),
+                        "safe_args_summary": action_plan.arguments or {},
+                    },
+                )
             if workflow_payload is not None:
+                workflow_payload = self._sync_workflow_tasks(auth, run, workflow_payload)
                 yield self._append_frame(auth, run, STRATEGY_WORKFLOW_EVENT, workflow_payload)
+                if _workflow_payload_has_blocking_user_task(workflow_payload):
+                    yield self._append_frame(auth, run, SUGGESTIONS_EVENT, suggestions_payload)
+                    terminal_status = "completed"
+                    completed = self.repository.set_run_status(auth, run.id, terminal_status)
+                    append_stage_event(
+                        self.repository,
+                        auth,
+                        completed or run,
+                        "response_finalization",
+                        0,
+                        status=terminal_status,
+                    )
+                    yield self._append_frame(
+                        auth,
+                        completed or run,
+                        "run.completed",
+                        {"status": terminal_status, "source": "workflow_task_prompt"},
+                    )
+                    return
             if market_snapshot is not None:
                 response_state["market_snapshot_emitted"] = True
                 response_state["market_data_emitted"] = True
@@ -890,6 +1605,16 @@ class LLMOrchestrator:
                 completed = self.repository.set_run_status(auth, run.id, terminal_status)
                 append_stage_event(self.repository, auth, completed or run, "response_finalization", 0, status=terminal_status)
                 yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
+                return
+
+            if should_use_bounded_scout(message_content, response_intent=response_intent):
+                yield from self._run_bounded_scout(
+                    auth=auth,
+                    run=run,
+                    conversation_id=conversation_id,
+                    conversation_context=conversation_context,
+                    language=language,
+                )
                 return
 
             planned_tool_call = _direct_action_plan_tool_args(
@@ -939,12 +1664,13 @@ class LLMOrchestrator:
 
             active_tools = (
                 []
-                if market_snapshot is not None
+                if market_snapshot is not None or workflow_task_resume_payload is not None
                 else _provider_tools_for_web_search(
                     web_search,
                     message_content,
                     response_intent=response_intent,
                     current_context_required=chat_decision.current_context_required,
+                    decision_source=chat_decision.source,
                 )
             )
             model_stage = _model_stage_for_chat(
@@ -971,29 +1697,58 @@ class LLMOrchestrator:
                 },
             )
             yield self._safe_reasoning_frame(auth, run, "model", language)
-            for event in _stream_client(
-                self.client,
-                messages=conversation_context.messages,
-                tools=active_tools,
-                routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": model_stage},
+            chain_result = None
+            if _should_run_strategy_prompt_chain(
+                message_content,
+                response_intent=response_intent,
+                active_tools=active_tools,
             ):
-                yield from self._handle_client_event(
-                    auth,
-                    run,
-                    event,
-                    budget,
-                    accumulated_text,
-                    output_surface="agent.chat.output",
-                    response_intent=response_intent,
-                    response_state=response_state,
-                    stream_transient_delta=True,
-                    user_message=message_content,
+                chain_result = yield from self._run_strategy_prompt_chain(
+                    auth=auth,
+                    run=run,
+                    budget=budget,
+                    message_content=message_content,
                     context_text=suggestion_context_text,
-                    web_search=web_search,
+                    response_intent=response_intent,
                     language=language,
                 )
-                if budget.blocked:
-                    break
+            if chain_result is not None and not budget.blocked:
+                chain_text = _sanitize_user_facing_model_text(redact_text(chain_result.final_text))
+                finding = _first_policy_finding(
+                    surface="agent.chat.output",
+                    payload=chain_text,
+                    evidence_level=EVIDENCE_STRATEGY_IDEA,
+                    response_intent=response_intent,
+                )
+                if finding is not None:
+                    budget.blocked = True
+                    yield from self._policy_blocked(auth, run, None, finding, language=language)
+                else:
+                    accumulated_text.append(chain_text)
+            if chain_result is None and not budget.blocked:
+                for event in _stream_client(
+                    self.client,
+                    messages=conversation_context.messages,
+                    tools=active_tools,
+                    routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": model_stage},
+                ):
+                    yield from self._handle_client_event(
+                        auth,
+                        run,
+                        event,
+                        budget,
+                        accumulated_text,
+                        output_surface="agent.chat.output",
+                        response_intent=response_intent,
+                        response_state=response_state,
+                        stream_transient_delta=True,
+                        user_message=message_content,
+                        context_text=suggestion_context_text,
+                        web_search=web_search,
+                        language=language,
+                    )
+                    if budget.blocked:
+                        break
             append_stage_event(self.repository, auth, run, "model", model_timer.elapsed_ms())
             if accumulated_text and not budget.blocked:
                 final_text = "".join(accumulated_text)
@@ -1067,6 +1822,22 @@ class LLMOrchestrator:
             terminal_status = "blocked" if budget.blocked else "completed"
             completed = self.repository.set_run_status(auth, run.id, terminal_status)
             append_stage_event(self.repository, auth, completed or run, "response_finalization", 0, status=terminal_status)
+            if workflow_task_resume_payload is not None:
+                continuation_event = (
+                    "workflow.continuation.completed"
+                    if terminal_status == "completed"
+                    else "workflow.continuation.failed"
+                )
+                yield self._append_frame(
+                    auth,
+                    completed or run,
+                    continuation_event,
+                    {
+                        **workflow_task_resume_payload,
+                        "source": "workflow_task_resume",
+                        "status": terminal_status,
+                    },
+                )
             yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
             if terminal_status == "completed":
                 self._maybe_compact_conversation(auth, conversation_id, run.id, language=language)
@@ -1079,6 +1850,21 @@ class LLMOrchestrator:
                     "run.cancelled",
                     {"status": "cancelled", "reason": "client_disconnected"},
                 )
+                if workflow_task_resume_payload is not None:
+                    self.repository.append_run_event(
+                        auth,
+                        run.id,
+                        "workflow.continuation.failed",
+                        _redact_event_payload(
+                            "workflow.continuation.failed",
+                            {
+                                **workflow_task_resume_payload,
+                                "source": "workflow_task_resume",
+                                "status": "cancelled",
+                                "reason": "client_disconnected",
+                            },
+                        ),
+                    )
                 append_stage_event(self.repository, auth, cancelled or run, "model", 0, status="cancelled")
             raise
         except Exception as exc:
@@ -1095,6 +1881,17 @@ class LLMOrchestrator:
                 LLM_EVENT_MESSAGE_DELTA,
                 {"text": failure_text, "compact": True},
             )
+            if workflow_task_resume_payload is not None:
+                yield self._append_frame(
+                    auth,
+                    failed or run,
+                    "workflow.continuation.failed",
+                    {
+                        **workflow_task_resume_payload,
+                        "source": "workflow_task_resume",
+                        "status": "failed",
+                    },
+                )
             yield self._append_frame(
                 auth,
                 failed or run,
@@ -1150,6 +1947,215 @@ class LLMOrchestrator:
                 "context.compaction_skipped",
                 {"error": exc.__class__.__name__, "message": redact_text(str(exc))},
             )
+
+    def _run_strategy_prompt_chain(
+        self,
+        *,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        budget: RunBudget,
+        message_content: str,
+        context_text: str,
+        response_intent: str,
+        language: str,
+    ):
+        chain_timer = StageTimer()
+        context_packet = _strategy_prompt_chain_initial_packet(
+            message_content,
+            context_text=context_text,
+            response_intent=response_intent,
+            language=language,
+        )
+
+        def prompt_chain_frame(event_type: str, **payload_fields: Any):
+            return self._append_frame(
+                auth,
+                run,
+                event_type,
+                _prompt_chain_event_payload(run, **payload_fields),
+            )
+
+        yield prompt_chain_frame(
+            PROMPT_CHAIN_STARTED_EVENT,
+            status="started",
+            response_intent=response_intent,
+            stages=list(STRATEGY_PROMPT_CHAIN_STAGES),
+        )
+        stage_outputs: dict[str, dict[str, Any]] = {}
+        for stage in STRATEGY_PROMPT_CHAIN_STAGES:
+            chunks: list[str] = []
+            provider_route: str | None = None
+            stage_timer = StageTimer()
+            stage_usage = {"input_tokens": 0, "output_tokens": 0}
+
+            def stage_prompt_chain_frame(event_type: str, **payload_fields: Any):
+                return prompt_chain_frame(
+                    event_type,
+                    stage=stage,
+                    model_stage=stage,
+                    provider_route=provider_route,
+                    latency_ms=stage_timer.elapsed_ms(),
+                    usage=_prompt_chain_usage(stage_usage),
+                    **payload_fields,
+                )
+
+            stage_context = _strategy_prompt_chain_stage_context(stage, context_packet)
+            messages = prompt_stage_messages(
+                stage,
+                stage_context,
+                conservative_sizing_guidance=STRATEGY_PROMPT_CHAIN_SIZING_GUIDANCE,
+                repair_iteration=None,
+            )
+            try:
+                self.security_controls.check_model_call(auth, model=self.client.model)
+                for event in _stream_client(
+                    self.client,
+                    messages=messages,
+                    tools=[],
+                    routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": stage},
+                ):
+                    if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
+                        chunks.append(event.text)
+                        continue
+                    if event.type == PROVIDER_ROUTE_EVENT:
+                        route_payload = event.arguments or {}
+                        provider_route = _safe_string(route_payload.get("provider_route"))
+                        yield self._append_frame(auth, run, PROVIDER_ROUTE_EVENT, event.arguments or {})
+                        continue
+                    if event.type == LLM_EVENT_USAGE:
+                        budget.add_usage(event.input_tokens, event.output_tokens)
+                        stage_usage["input_tokens"] += event.input_tokens
+                        stage_usage["output_tokens"] += event.output_tokens
+                        model_metadata = _model_metadata_from_event(event)
+                        self.repository.create_usage_ledger(
+                            auth,
+                            run_id=run.id,
+                            model=event.model or self.client.model,
+                            tool_id=None,
+                            input_tokens=event.input_tokens,
+                            output_tokens=event.output_tokens,
+                        )
+                        yield self._append_frame(
+                            auth,
+                            run,
+                            "model.usage",
+                            _usage_payload(
+                                event.model or self.client.model,
+                                event.input_tokens,
+                                event.output_tokens,
+                                metadata=model_metadata,
+                            ),
+                        )
+                        try:
+                            budget.check_usage()
+                            self.security_controls.check_usage_budget(
+                                total_tokens=budget.input_tokens + budget.output_tokens,
+                                output_tokens=budget.output_tokens,
+                            )
+                        except BudgetExceeded as exc:
+                            budget.blocked = True
+                            yield stage_prompt_chain_frame(
+                                PROMPT_CHAIN_FAILED_EVENT,
+                                status="blocked",
+                                handoff_status="not_evaluated",
+                                error_class=exc.__class__.__name__,
+                            )
+                            yield from self._policy_blocked(auth, run, None, budget_policy_finding(exc), language=language)
+                            return None
+                        continue
+                    if event.type == LLM_EVENT_SOURCES:
+                        continue
+                    agent_log(
+                        logger,
+                        "warn",
+                        "strategy.prompt_chain.unsupported_event",
+                        component="llm_orchestrator",
+                        event_type=event.type,
+                        request_id=run.request_id,
+                        run_id=run.id,
+                        stage=stage,
+                        trace_id=run.trace_id,
+                    )
+                    yield stage_prompt_chain_frame(
+                        PROMPT_CHAIN_FALLBACK_EVENT,
+                        status="fallback",
+                        handoff_status="not_evaluated",
+                        fallback_reason="unsupported_event",
+                        error_class=event.type,
+                    )
+                    return None
+            except SecurityControlError as exc:
+                yield stage_prompt_chain_frame(
+                    PROMPT_CHAIN_FAILED_EVENT,
+                    status="failed",
+                    handoff_status="not_evaluated",
+                    error_class=exc.__class__.__name__,
+                )
+                raise
+            except Exception as exc:
+                agent_log(
+                    logger,
+                    "warn",
+                    "strategy.prompt_chain.failed",
+                    component="llm_orchestrator",
+                    error=exc.__class__.__name__,
+                    request_id=run.request_id,
+                    run_id=run.id,
+                    stage=stage,
+                    trace_id=run.trace_id,
+                )
+                yield stage_prompt_chain_frame(
+                    PROMPT_CHAIN_FAILED_EVENT,
+                    status="failed",
+                    handoff_status="not_evaluated",
+                    error_class=exc.__class__.__name__,
+                )
+                return None
+            payload = _parse_strategy_prompt_chain_stage_payload("".join(chunks), stage)
+            if payload is None:
+                agent_log(
+                    logger,
+                    "warn",
+                    "strategy.prompt_chain.invalid_handoff",
+                    component="llm_orchestrator",
+                    request_id=run.request_id,
+                    run_id=run.id,
+                    stage=stage,
+                    trace_id=run.trace_id,
+                )
+                yield stage_prompt_chain_frame(
+                    PROMPT_CHAIN_FALLBACK_EVENT,
+                    status="fallback",
+                    handoff_status="failed",
+                    fallback_reason="invalid_handoff",
+                )
+                return None
+            stage_outputs[stage] = payload
+            yield stage_prompt_chain_frame(
+                PROMPT_CHAIN_STAGE_COMPLETED_EVENT,
+                status="completed",
+                handoff_status="passed",
+            )
+            context_packet = _strategy_prompt_chain_advance_context(context_packet, stage, payload)
+
+        final_text = _strategy_prompt_chain_final_text(stage_outputs, language=language)
+        if not final_text:
+            yield prompt_chain_frame(
+                PROMPT_CHAIN_FALLBACK_EVENT,
+                status="fallback",
+                handoff_status="passed",
+                fallback_reason="empty_final_text",
+                latency_ms=chain_timer.elapsed_ms(),
+            )
+            return None
+        yield prompt_chain_frame(
+            PROMPT_CHAIN_COMPLETED_EVENT,
+            status="completed",
+            handoff_status="passed",
+            latency_ms=chain_timer.elapsed_ms(),
+            stage_count=len(stage_outputs),
+        )
+        return _StrategyPromptChainResult(final_text=final_text)
 
     def execute_agent_run(
         self,
@@ -1367,12 +2373,53 @@ class LLMOrchestrator:
         language: str = "en",
         auto_chain_allowed: bool = False,
     ) -> Iterator[str]:
+        yield self._append_audit_frame(
+            auth,
+            run,
+            MODEL_ACTION_PROPOSED,
+            {
+                "actor": "model",
+                "source": "llm_tool_call",
+                "status": "proposed",
+                "intent_id": response_intent,
+                "tool_id": tool_name,
+                "safe_args_summary": arguments,
+            },
+        )
         block = self._gate_tool(auth, run, tool_name, arguments, budget)
         if block is not None:
             budget.blocked = True
+            yield self._append_audit_frame(
+                auth,
+                run,
+                MODEL_ACTION_REJECTED,
+                {
+                    "actor": "backend",
+                    "source": "llm_tool_call",
+                    "status": "rejected",
+                    "intent_id": response_intent,
+                    "tool_id": tool_name,
+                    "reason_code": block.code,
+                    "risk_level": block.severity,
+                    "safe_args_summary": arguments,
+                },
+            )
             yield from self._policy_blocked(auth, run, tool_name, block, language=language)
             return
 
+        yield self._append_audit_frame(
+            auth,
+            run,
+            MODEL_ACTION_VALIDATED,
+            {
+                "actor": "backend",
+                "source": "llm_tool_call",
+                "status": "allowed",
+                "intent_id": response_intent,
+                "tool_id": tool_name,
+                "safe_args_summary": arguments,
+            },
+        )
         agent_log(
             logger,
             "info",
@@ -1402,6 +2449,8 @@ class LLMOrchestrator:
         tool_timer = StageTimer()
         append_stage_started_event(self.repository, auth, run, "tool")
         try:
+            pre_tool_events = self.repository.list_run_events(auth, run.id) or []
+            pre_tool_sequence = pre_tool_events[-1].sequence if pre_tool_events else 0
             output = execute_tool(
                 tool_name,
                 arguments,
@@ -1420,6 +2469,9 @@ class LLMOrchestrator:
             budget.completed_tool_ids.append(tool_name)
             budget.completed_tool_results.append(_tool_success_result(tool_name, arguments, output))
             output_status, row_count, artifact_kind = _tool_log_summary(compact_output)
+            input_tokens = _token_estimate(arguments)
+            output_tokens = _token_estimate(compact_output)
+            yield from self._stream_existing_run_events_after(auth, run, pre_tool_sequence)
             agent_log(
                 logger,
                 "info",
@@ -1441,8 +2493,26 @@ class LLMOrchestrator:
                 run_id=run.id,
                 model=self.client.model,
                 tool_id=tool_name,
-                input_tokens=_token_estimate(arguments),
-                output_tokens=_token_estimate(compact_output),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            yield self._append_audit_frame(
+                auth,
+                run,
+                MODEL_ACTION_EXECUTED,
+                {
+                    "actor": "backend",
+                    "source": "llm_tool_call",
+                    "status": "executed",
+                    "intent_id": response_intent,
+                    "tool_id": tool_name,
+                    "duration_ms": tool_timer.elapsed_ms(),
+                    "output_status": output_status,
+                    "row_count": row_count,
+                    "artifact_kind": artifact_kind,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
             )
             yield self._append_frame(
                 auth,
@@ -1475,14 +2545,14 @@ class LLMOrchestrator:
                         ),
                     },
                 )
-            workflow_candidate = _is_strategy_bot_workflow_request(
-                user_message or "",
-                context_text=context_text,
-                artifact_kinds=set(),
-                tool_name=tool_name,
-            )
+            workflow_relevant_tool = tool_name in {
+                "generate_pine",
+                "create_backtest_plan",
+                "run_backtest_preview",
+                "draft_bot",
+            }
             post_tool_artifact_kinds: set[str] | None = None
-            if workflow_candidate or tool_name == "generate_pine":
+            if workflow_relevant_tool:
                 post_tool_artifact_kinds = _conversation_user_artifact_kinds(
                     self.repository,
                     auth,
@@ -1490,18 +2560,38 @@ class LLMOrchestrator:
                     current_run_id=run.id,
                 )
                 post_tool_artifact_kinds.update(_current_run_user_artifact_kinds(self.repository, auth, run.id))
+            tool_workflow_intent = (
+                "strategy_to_paper_bot_simulation"
+                if workflow_relevant_tool
+                and response_intent_allows_workflow(response_intent, "strategy_to_paper_bot_simulation")
+                else None
+            )
+            tool_chat_decision = ChatIntentDecision(
+                response_intent=response_intent or "general_chat",
+                action="answer",
+                model_stage=_model_stage_for_intent(response_intent),
+                confidence=1.0,
+                source="tool_result",
+                domain_scope=domain_scope_for_response_intent(response_intent),
+                workflow_intent=tool_workflow_intent,
+            )
             workflow_payload = (
-                _strategy_bot_workflow_payload(
+                _maybe_strategy_bot_workflow_payload(
+                    repository=self.repository,
+                    auth=auth,
+                    conversation_id=run.conversation_id,
+                    chat_decision=tool_chat_decision,
                     message_content=user_message or "",
                     context_text=context_text,
                     artifact_kinds=post_tool_artifact_kinds or set(),
                     tool_name=tool_name,
                     tool_result=output,
                 )
-                if workflow_candidate
+                if workflow_relevant_tool
                 else None
             )
             if workflow_payload is not None:
+                workflow_payload = self._sync_workflow_tasks(auth, run, workflow_payload)
                 yield self._append_frame(auth, run, STRATEGY_WORKFLOW_EVENT, workflow_payload)
             refreshed_suggestions = _post_tool_suggestions_payload(
                 repository=self.repository,
@@ -1569,9 +2659,36 @@ class LLMOrchestrator:
                 tool_id=tool_name,
                 trace_id=run.trace_id,
             )
+            yield self._append_audit_frame(
+                auth,
+                run,
+                MODEL_ACTION_EXECUTED,
+                {
+                    "actor": "backend",
+                    "source": "llm_tool_call",
+                    "status": "failed",
+                    "intent_id": response_intent,
+                    "tool_id": tool_name,
+                    "duration_ms": tool_timer.elapsed_ms(),
+                    "output_status": "failed",
+                    "reason_code": failure_fields.get("code") if isinstance(failure_fields.get("code"), str) else None,
+                    "error_class": exc.__class__.__name__,
+                },
+            )
             yield self._append_frame(auth, run, "tool.completed", error_payload)
             append_stage_event(self.repository, auth, run, "tool", tool_timer.elapsed_ms(), status="failed")
             raise
+
+    def _stream_existing_run_events_after(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        sequence: int,
+    ) -> Iterator[str]:
+        events = self.repository.list_run_events(auth, run.id) or []
+        for event in events:
+            if event.sequence > sequence:
+                yield sse_frame(event)
 
     def _run_backtest_auto_chain(
         self,
@@ -1724,6 +2841,46 @@ class LLMOrchestrator:
             evidence_level=EVIDENCE_GENERATED_ARTIFACT,
         )
 
+    def _chat_safety_blocked(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        safety_finding: PolicyFinding,
+        *,
+        language: str,
+        audit_source: str,
+    ) -> Iterator[str]:
+        yield self._append_audit_frame(
+            auth,
+            run,
+            MODEL_ACTION_REJECTED,
+            {
+                "actor": "backend",
+                "source": audit_source,
+                "status": "rejected",
+                "reason_code": safety_finding.code,
+                "risk_level": safety_finding.severity,
+                "safe_args_summary": {
+                    "surface": safety_finding.surface,
+                    "rule_id": safety_finding.rule_id,
+                    "category": safety_finding.category,
+                },
+            },
+        )
+        blocked_message = _safe_blocked_message(language)
+        self.repository.create_message(auth, run.conversation_id, blocked_message, role="assistant")
+        yield from self._policy_blocked(auth, run, None, safety_finding, language=language)
+        completed = self.repository.set_run_status(auth, run.id, "blocked")
+        append_stage_event(
+            self.repository,
+            auth,
+            completed or run,
+            "chat_safety_preflight",
+            0,
+            status="blocked",
+        )
+        yield self._append_frame(auth, completed or run, "run.completed", {"status": "blocked"})
+
     def _policy_blocked(
         self,
         auth: AuthContext,
@@ -1753,6 +2910,58 @@ class LLMOrchestrator:
             {"text": _safe_blocked_message(language), "compact": True},
         )
 
+    def _run_bounded_scout(
+        self,
+        *,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        conversation_id: str,
+        conversation_context: Any,
+        language: str,
+    ) -> Iterator[str]:
+        tool_context = ToolExecutionContext(
+            repository=self.repository,
+            artifact_store=self.artifact_store,
+            auth=auth,
+            run=run,
+        )
+        runner = BoundedScoutRunner(
+            llm_client=self.client,
+            tool_context=tool_context,
+            run_id=run.id,
+            budget=AgentLoopBudget(max_iterations=2, max_tool_calls=2, max_tokens=4_000, max_runtime_seconds=20.0),
+        )
+        result = runner.run(
+            conversation_context.messages,
+            routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": "bounded_scout"},
+        )
+        for event in result.events:
+            event_type = str(event.get("event_type") or "agent_loop.event")
+            payload = {
+                key: value
+                for key, value in event.items()
+                if key not in {"event_type", "sequence", "created_at", "run_id"}
+            }
+            yield self._append_frame(auth, run, event_type, payload)
+
+        final_text = result.response_text.strip() or _bounded_scout_fallback_message(result.status, language)
+        if result.status == "blocked":
+            final_text = _safe_blocked_message(language)
+        self.repository.create_message(auth, conversation_id, final_text, role="assistant")
+        yield self._safe_reasoning_frame(auth, run, "finalizing", language)
+        yield self._append_frame(
+            auth,
+            run,
+            LLM_EVENT_MESSAGE_DELTA,
+            {"text": final_text, "compact": True, "source": "bounded_scout"},
+        )
+        terminal_status = "blocked" if result.status == "blocked" else "completed"
+        completed = self.repository.set_run_status(auth, run.id, terminal_status)
+        append_stage_event(self.repository, auth, completed or run, "bounded_scout", 0, status=terminal_status)
+        yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
+        if terminal_status == "completed":
+            self._maybe_compact_conversation(auth, conversation_id, run.id, language=language)
+
     def _domain_scope_blocked(
         self,
         *,
@@ -1771,6 +2980,22 @@ class LLMOrchestrator:
         }
         suggestions_payload = _domain_scope_suggestions_payload(language, domain_scope)
         message = _domain_scope_blocked_message(language)
+        yield self._append_audit_frame(
+            auth,
+            run,
+            MODEL_ACTION_REJECTED,
+            {
+                "actor": "backend",
+                "source": "domain_intent_gate",
+                "status": "rejected",
+                "reason_code": domain_scope.reason,
+                "risk_level": "low",
+                "safe_args_summary": {
+                    "domain_scope": domain_scope.scope,
+                    "confidence": domain_scope.confidence,
+                },
+            },
+        )
         yield self._append_frame(auth, run, "chat.response_intent", response_payload)
         yield self._append_frame(auth, run, SUGGESTIONS_EVENT, suggestions_payload)
         self.repository.create_message(auth, conversation_id, message, role="assistant")
@@ -1833,6 +3058,204 @@ class LLMOrchestrator:
             KnowledgeLearningService(self.repository, self.artifact_store).maybe_extract_run_candidates(auth, run)
         return sse_frame(event)
 
+    def _append_audit_frame(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> str:
+        return self._append_frame(auth, run, event_type, model_audit_payload(run, payload))
+
+    def _classifier_started_frame(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        *,
+        classifier_name: str,
+        stage: str,
+        timeout_seconds: float,
+        prompt_summary: dict[str, Any],
+    ) -> str:
+        return self._append_frame(
+            auth,
+            run,
+            CLASSIFIER_EVENT_STARTED,
+            _classifier_event_payload(
+                run,
+                classifier_name=classifier_name,
+                stage=stage,
+                status="started",
+                timeout_seconds=timeout_seconds,
+                prompt_summary=prompt_summary,
+            ),
+        )
+
+    def _classifier_result_frames(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        *,
+        classifier_name: str,
+        stage: str,
+        capture_client: ClassifierRouteCaptureClient,
+        outcome: ClassifierRunOutcome,
+        prompt_summary: dict[str, Any],
+    ) -> Iterator[str]:
+        for route_event in capture_client.route_events:
+            yield self._append_frame(
+                auth,
+                run,
+                CLASSIFIER_EVENT_ROUTE,
+                _classifier_route_event_payload(
+                    run,
+                    classifier_name=classifier_name,
+                    stage=stage,
+                    route_event=route_event,
+                    prompt_summary=prompt_summary,
+                ),
+            )
+        event_type = {
+            "completed": CLASSIFIER_EVENT_COMPLETED,
+            "timeout": CLASSIFIER_EVENT_TIMEOUT,
+            "failed": CLASSIFIER_EVENT_FAILED,
+        }.get(outcome.status, CLASSIFIER_EVENT_COMPLETED)
+        yield self._append_frame(
+            auth,
+            run,
+            event_type,
+            _classifier_event_payload(
+                run,
+                classifier_name=classifier_name,
+                stage=stage,
+                status=outcome.status,
+                duration_ms=outcome.duration_ms,
+                timeout_seconds=outcome.timeout_seconds,
+                fallback_source=outcome.fallback_source,
+                error_class=outcome.error_class,
+                prompt_summary=prompt_summary,
+            ),
+        )
+
+    def _sync_workflow_tasks(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        workflow_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        workflow_id = workflow_payload.get("workflow_id")
+        if not isinstance(workflow_id, str):
+            return workflow_payload
+        bot_proposal_id = workflow_payload.get("bot_proposal_id")
+        task_payloads = normalize_workflow_tasks(
+            workflow_id,
+            workflow_payload.get("tasks"),
+            start_allowed=workflow_payload.get("start_allowed") is True,
+            bot_proposal_id=bot_proposal_id if isinstance(bot_proposal_id, str) else None,
+        )
+        completed_steps = {
+            step for step in workflow_payload.get("completed_steps", []) if isinstance(step, str)
+        }
+        sync_result = self.repository.sync_workflow_tasks(
+            auth,
+            conversation_id=run.conversation_id,
+            run_id=run.id,
+            workflow_id=workflow_id,
+            task_payloads=task_payloads,
+            completed_steps=completed_steps,
+        )
+        if sync_result is None:
+            return workflow_payload
+        raw_tasks = workflow_payload.get("tasks")
+        raw_task_count = len(raw_tasks) if isinstance(raw_tasks, list) else 0
+        missing_fields = [
+            field
+            for field in workflow_payload.get("missing_fields", [])
+            if isinstance(field, str)
+        ]
+        append_model_audit_event(
+            self.repository,
+            auth,
+            run,
+            MODEL_ACTION_VALIDATED,
+            {
+                "actor": "backend",
+                "source": "workflow_registry",
+                "status": "allowed",
+                "workflow_id": workflow_id,
+                "proposal_id": bot_proposal_id if isinstance(bot_proposal_id, str) else None,
+                "missing_fields": missing_fields,
+                "workflow_summary": {
+                    "current_step": workflow_payload.get("current_step"),
+                    "status": workflow_payload.get("status"),
+                    "task_count": len(sync_result.records),
+                    "input_request_count": sum(
+                        len(task.payload_json.get("input_requests", []))
+                        for task in sync_result.records
+                        if isinstance(task.payload_json.get("input_requests"), list)
+                    ),
+                    "start_allowed": workflow_payload.get("start_allowed") is True,
+                },
+                "dropped_counts": {
+                    "tasks": max(0, raw_task_count - len(task_payloads)),
+                },
+            },
+        )
+        has_open_gate = any(task.status in {"pending_user", "blocked"} for task in sync_result.records)
+        if missing_fields or has_open_gate or (
+            isinstance(bot_proposal_id, str) and workflow_payload.get("start_allowed") is not True
+        ):
+            append_model_audit_event(
+                self.repository,
+                auth,
+                run,
+                WORKFLOW_GATE_REQUIRED,
+                {
+                    "actor": "backend",
+                    "source": "workflow_task",
+                    "status": "gated",
+                    "workflow_id": workflow_id,
+                    "proposal_id": bot_proposal_id if isinstance(bot_proposal_id, str) else None,
+                    "reason_code": "missing_fields" if missing_fields else "pending_workflow_task",
+                    "risk_level": "review_gate",
+                    "missing_fields": missing_fields,
+                    "workflow_summary": {
+                        "open_task_count": sum(
+                            1 for task in sync_result.records if task.status in {"pending_user", "blocked"}
+                        ),
+                        "start_allowed": workflow_payload.get("start_allowed") is True,
+                    },
+                },
+            )
+        task_events = [
+            ("workflow.task.created", _workflow_task_event_payload(record))
+            for record in sync_result.created
+        ]
+        task_events.extend(
+            ("workflow.task.updated", _workflow_task_event_payload(record))
+            for record in sync_result.updated
+        )
+        task_events.extend(
+            ("workflow.task.resolved", _workflow_task_event_payload(record))
+            for record in sync_result.resolved
+        )
+        if task_events:
+            self.repository.append_run_events(auth, run.id, task_events)
+
+        hydrated_tasks = [workflow_task_state(task) for task in sync_result.records]
+        if not hydrated_tasks:
+            return workflow_payload
+        hydrated = dict(workflow_payload)
+        hydrated["tasks"] = hydrated_tasks
+        hydrated["input_requests"] = [
+            request
+            for task in hydrated_tasks
+            for request in task.get("input_requests", [])
+            if isinstance(request, dict)
+        ]
+        hydrated["task_values"] = _workflow_task_values_from_state(hydrated_tasks)
+        return validate_workflow_payload(hydrated) or hydrated
+
     def _safe_reasoning_frame(self, auth: AuthContext, run: AssistantRunRecord, phase: str, language: str = "en") -> str:
         return sse_frame(transient_reasoning_event(run, payload=redact_value(_safe_reasoning_payload(phase, language))))
 
@@ -1875,19 +3298,275 @@ def _restore_user_facing_prompt(source: Any, target: Any) -> None:
         _restore_user_facing_prompt(source_variant, target_variant)
 
 
-def _stream_client(
-    client: LLMClient,
+def _should_run_strategy_prompt_chain(
+    message_content: str,
     *,
-    messages: list[dict[str, str]],
-    tools: list[dict[str, Any]],
-    routing_context: dict[str, Any],
-) -> Iterator[LLMClientEvent]:
-    try:
-        yield from client.stream(messages=messages, tools=tools, routing_context=routing_context)
-    except TypeError as exc:
-        if "routing_context" not in str(exc):
-            raise
-        yield from client.stream(messages=messages, tools=tools)
+    response_intent: str | None,
+    active_tools: list[dict[str, Any]],
+) -> bool:
+    if response_intent not in STRATEGY_PROMPT_CHAIN_INTENTS:
+        return False
+    if _has_web_search_tool(active_tools):
+        return False
+    if response_intent == "strategy_building":
+        return _strategy_prompt_chain_generation_signal(message_content)
+    return True
+
+
+def _strategy_prompt_chain_generation_signal(message_content: str) -> bool:
+    normalized = " ".join((message_content or "").lower().split())
+    return bool(
+        re.search(
+            r"\b(build|create|generate|draft|design|write|make|construct|code|script|pine|pinescript)\b"
+            r"|xây\s*dựng|xay\s*dung|tạo|tao|viết|viet|sinh|dựng|dung",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _strategy_prompt_chain_initial_packet(
+    message_content: str,
+    *,
+    context_text: str,
+    response_intent: str,
+    language: str,
+) -> dict[str, Any]:
+    return {
+        "original_prompt": message_content,
+        "language": language,
+        "response_intent": response_intent,
+        "conversation_context_excerpt": context_text[-3000:],
+        "policy": "reviewable_strategy_artifact_generation_only",
+        "policy_boundaries": [
+            "Generate reviewable strategy artifacts only.",
+            "Do not claim profitability, live-trading readiness, broker execution, or deployment readiness.",
+            "Pine output must be Pine Script v6 and must preserve the accepted strategy intent.",
+            STRATEGY_PROMPT_CHAIN_SIZING_GUIDANCE,
+        ],
+        "schema_summary": {
+            "stages": list(STRATEGY_PROMPT_CHAIN_STAGES),
+            "strategy_reasoning": ["summary", "constraints", "indicators", "entries", "exits", "risk_rules", "non_goals"],
+            "strategy_coding": ["strategy_spec"],
+            "pine_code_generation": ["pine_code"],
+        },
+        "current_artifacts": {},
+        "stage_outputs": {},
+        "previous_stage_output": {},
+        "context_refs": ["prompt", "policy_boundaries", "schemas/strategy-spec.schema.json"],
+    }
+
+
+def _prompt_chain_event_payload(
+    run: AssistantRunRecord,
+    *,
+    status: str,
+    response_intent: str | None = None,
+    stage: str | None = None,
+    model_stage: str | None = None,
+    provider_route: str | None = None,
+    handoff_status: str | None = None,
+    fallback_reason: str | None = None,
+    latency_ms: int | None = None,
+    usage: dict[str, int] | None = None,
+    error_class: str | None = None,
+    stages: list[str] | None = None,
+    stage_count: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": run.id,
+        "trace_id": run.trace_id,
+        "workflow": PROMPT_CHAIN_WORKFLOW,
+        "status": status,
+    }
+    optional = {
+        "response_intent": response_intent,
+        "stage": stage,
+        "model_stage": model_stage,
+        "provider_route": provider_route,
+        "handoff_status": handoff_status,
+        "fallback_reason": fallback_reason,
+        "latency_ms": latency_ms,
+        "usage": usage,
+        "error_class": error_class,
+        "stages": stages,
+        "stage_count": stage_count,
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
+    return payload
+
+
+def _prompt_chain_usage(usage: dict[str, int]) -> dict[str, int]:
+    input_tokens = int(usage.get("input_tokens", 0))
+    output_tokens = int(usage.get("output_tokens", 0))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def _strategy_prompt_chain_stage_context(stage: str, context_packet: dict[str, Any]) -> dict[str, Any]:
+    stage_outputs = context_packet.get("stage_outputs") if isinstance(context_packet.get("stage_outputs"), dict) else {}
+    current_artifacts = (
+        context_packet.get("current_artifacts") if isinstance(context_packet.get("current_artifacts"), dict) else {}
+    )
+    common = {
+        "original_prompt": context_packet.get("original_prompt"),
+        "language": context_packet.get("language"),
+        "response_intent": context_packet.get("response_intent"),
+        "conversation_context_excerpt": context_packet.get("conversation_context_excerpt"),
+        "policy": context_packet.get("policy"),
+        "policy_boundaries": context_packet.get("policy_boundaries", []),
+    }
+    if stage == STAGE_STRATEGY_CODING:
+        return {
+            **common,
+            "schema_summary": {"stage": STAGE_STRATEGY_CODING, "expected_output": ["strategy_spec"]},
+            "previous_stage_output": stage_outputs.get(STAGE_STRATEGY_REASONING, {}),
+            "current_artifacts": {},
+            "context_refs": [
+                "prompt",
+                "policy_boundaries",
+                "schemas/strategy-spec.schema.json",
+                STAGE_STRATEGY_REASONING,
+            ],
+        }
+    if stage == STAGE_PINE_CODE_GENERATION:
+        strategy_spec = current_artifacts.get("strategy_spec")
+        return {
+            **common,
+            "schema_summary": {
+                "stage": STAGE_PINE_CODE_GENERATION,
+                "expected_output": ["pine_code"],
+                "pine_version": "v6",
+            },
+            "previous_stage_output": stage_outputs.get(STAGE_STRATEGY_CODING, {}),
+            "current_artifacts": {"strategy_spec": strategy_spec},
+            "context_refs": [
+                "prompt",
+                "policy_boundaries",
+                "schemas/strategy-spec.schema.json",
+                STAGE_STRATEGY_CODING,
+            ],
+        }
+    return context_packet
+
+
+def _strategy_prompt_chain_advance_context(
+    context_packet: dict[str, Any],
+    stage: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    stage_outputs = dict(context_packet.get("stage_outputs") or {})
+    stage_outputs[stage] = payload
+    current_artifacts = dict(context_packet.get("current_artifacts") or {})
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    if stage == STAGE_STRATEGY_CODING and isinstance(output.get("strategy_spec"), dict):
+        current_artifacts["strategy_spec"] = output["strategy_spec"]
+    if stage == STAGE_PINE_CODE_GENERATION and isinstance(output.get("pine_code"), str):
+        current_artifacts["pine_code"] = output["pine_code"]
+    context_refs = [
+        *[str(ref) for ref in context_packet.get("context_refs", [])],
+        stage,
+    ]
+    return {
+        **context_packet,
+        "previous_stage_output": payload,
+        "stage_outputs": stage_outputs,
+        "current_artifacts": current_artifacts,
+        "context_refs": context_refs,
+    }
+
+
+def _parse_strategy_prompt_chain_stage_payload(text: str, stage: str) -> dict[str, Any] | None:
+    payload = _extract_json_object(text)
+    if not isinstance(payload, dict) or payload.get("stage") != stage:
+        return None
+    output = payload.get("output")
+    if not isinstance(output, dict):
+        return None
+    if not isinstance(payload.get("assumptions"), list):
+        return None
+    if not isinstance(payload.get("handoff_notes"), str):
+        return None
+    if not isinstance(payload.get("policy_observations"), list):
+        return None
+    if stage == STAGE_STRATEGY_REASONING:
+        required = ("summary", "constraints", "indicators", "entries", "exits", "risk_rules", "non_goals")
+        if not isinstance(output.get("summary"), str) or not output["summary"].strip():
+            return None
+        if any(not isinstance(output.get(key), list) for key in required[1:]):
+            return None
+        return payload
+    if stage == STAGE_STRATEGY_CODING:
+        strategy_spec = output.get("strategy_spec")
+        if not isinstance(strategy_spec, dict) or not strategy_spec:
+            return None
+        return payload
+    if stage == STAGE_PINE_CODE_GENERATION:
+        pine_code = output.get("pine_code")
+        if not isinstance(pine_code, str) or not pine_code.strip():
+            return None
+        if "//@version=6" not in pine_code[:200]:
+            return None
+        return payload
+    return None
+
+
+def _strategy_prompt_chain_final_text(stage_outputs: dict[str, dict[str, Any]], *, language: str) -> str:
+    reasoning_output = (stage_outputs.get(STAGE_STRATEGY_REASONING) or {}).get("output")
+    coding_output = (stage_outputs.get(STAGE_STRATEGY_CODING) or {}).get("output")
+    pine_output = (stage_outputs.get(STAGE_PINE_CODE_GENERATION) or {}).get("output")
+    if not isinstance(reasoning_output, dict) or not isinstance(coding_output, dict) or not isinstance(pine_output, dict):
+        return ""
+    strategy_spec = coding_output.get("strategy_spec")
+    pine_code = pine_output.get("pine_code")
+    if not isinstance(strategy_spec, dict) or not isinstance(pine_code, str) or not pine_code.strip():
+        return ""
+    summary = _safe_string(reasoning_output.get("summary")) or "Reviewable strategy draft."
+    name = _safe_string(strategy_spec.get("name")) or "Strategy"
+    risk = _safe_string(strategy_spec.get("position_sizing"))
+    entry_rules = _safe_string_list(reasoning_output.get("entries"), limit=2)
+    exit_rules = _safe_string_list(reasoning_output.get("exits"), limit=2)
+    risk_rules = _safe_string_list(reasoning_output.get("risk_rules"), limit=2)
+    if _normalize_language(language) == "vi":
+        lines = [
+            f"Mình đã dựng artifact Pine Script v6 cho `{name}`.",
+            "",
+            f"Tóm tắt: {summary}",
+        ]
+        if risk:
+            lines.append(f"Quản trị vốn: {risk}")
+        detail_heading = "Điểm chính"
+    else:
+        lines = [
+            f"Generated a reviewable Pine Script v6 artifact for `{name}`.",
+            "",
+            f"Summary: {summary}",
+        ]
+        if risk:
+            lines.append(f"Position sizing: {risk}")
+        detail_heading = "Key points"
+    details = [*entry_rules, *exit_rules, *risk_rules]
+    if details:
+        lines.extend(["", f"{detail_heading}:"])
+        lines.extend(f"- {item}" for item in details[:6])
+    lines.extend(["", "```pine", pine_code.strip(), "```"])
+    return "\n".join(lines)
+
+
+def _safe_string_list(value: Any, *, limit: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    for item in value:
+        text = _safe_string(item)
+        if text:
+            items.append(text)
+        if len(items) >= limit:
+            break
+    return items
 
 
 def _model_stage_for_chat(
@@ -2022,192 +3701,7 @@ def _classify_domain_scope(
     *,
     artifact_kinds: set[str] | None = None,
 ) -> DomainScopeDecision:
-    normalized = " ".join(message_content.lower().split())
-    artifact_kinds = artifact_kinds or set()
-    if not normalized:
-        return DomainScopeDecision(True, "product_help", "empty_or_whitespace", 0.8)
-    if _is_trading_or_product_domain_request(normalized):
-        return DomainScopeDecision(True, "trading_or_product", "domain_signal", 0.95)
-    if _is_artifact_context_followup_request(normalized, artifact_kinds):
-        return DomainScopeDecision(True, "context_followup", "artifact_context_signal", 0.86)
-    if _is_small_talk_or_context_followup(normalized):
-        return DomainScopeDecision(True, "context_followup", "small_talk_or_context_followup", 0.72)
-    if _is_explicit_off_topic_request(normalized):
-        return DomainScopeDecision(False, "off_topic", "explicit_off_topic_request", 0.9)
-    if _looks_like_general_task_request(normalized):
-        return DomainScopeDecision(False, "off_topic", "general_task_without_trading_context", 0.78)
-    return DomainScopeDecision(True, "context_followup", "ambiguous_short_followup", 0.62)
-
-
-def _is_trading_or_product_domain_request(normalized: str) -> bool:
-    domain_terms = (
-        "action awareness",
-        "artifact",
-        "backtest",
-        "backtest kit",
-        "broker boundary",
-        "crypto",
-        "drawdown",
-        "fees",
-        "forex",
-        "indicator",
-        "knowledge",
-        "market research",
-        "mql5",
-        "openrouter",
-        "orderintent",
-        "out-of-sample",
-        "oos",
-        "pine",
-        "price action",
-        "proposed intent",
-        "risk gate",
-        "robustness",
-        "review-only",
-        "sample size",
-        "slippage",
-        "strategy",
-        "trade log",
-        "trades",
-        "trading",
-        "tradingview",
-        "variant lab",
-        "web search",
-        "win rate",
-        "bot boundary",
-        "chiến lược",
-        "giao dịch",
-        "quản trị rủi ro",
-        "rủi ro",
-        "thị trường",
-        "vào lệnh",
-    )
-    market_terms = ("btc", "bitcoin", "eth", "ethereum", "xau", "gold", "usdt")
-    capability_terms = ("what can you do", "strategy codebot", "bạn làm được gì", "khả năng", "hỗ trợ app")
-    return any(term in normalized for term in domain_terms + market_terms + capability_terms)
-
-
-def _is_artifact_context_followup_request(normalized: str, artifact_kinds: set[str]) -> bool:
-    if not artifact_kinds:
-        return False
-    has_strategy_context = any(
-        _artifact_kind_matches(
-            kind,
-            (
-                BACKTEST_REPORT_ARTIFACT_KIND,
-                BACKTEST_RUN_METADATA_ARTIFACT_KIND,
-                ROBUSTNESS_REPORT_ARTIFACT_KIND,
-                RISK_GATE_REPORT_ARTIFACT_KIND,
-                "backtest_dashboard",
-                "backtest_trades",
-                "backtest_equity_curve",
-                "pine",
-                "strategy",
-            ),
-        )
-        for kind in artifact_kinds
-    )
-    if not has_strategy_context:
-        return False
-    context_terms = (
-        "current evidence",
-        "current preview",
-        "current report",
-        "current result",
-        "current results",
-        "preview evidence",
-        "review the result",
-        "the evidence",
-        "the preview",
-        "the report",
-        "the result",
-        "the results",
-        "this evidence",
-        "this preview",
-        "this report",
-        "this result",
-    )
-    return any(term in normalized for term in context_terms)
-
-
-def _is_small_talk_or_context_followup(normalized: str) -> bool:
-    small_talk = {
-        "hi",
-        "hello",
-        "hey",
-        "thanks",
-        "thank you",
-        "ok",
-        "okay",
-        "chào",
-        "cảm ơn",
-        "oke",
-    }
-    if normalized in small_talk:
-        return True
-    followup_terms = (
-        "what next",
-        "what should i do next",
-        "what did i mention",
-        "cái này",
-        "giờ sao",
-        "làm gì tiếp",
-        "nên làm gì",
-    )
-    return any(term in normalized for term in followup_terms)
-
-
-def _is_explicit_off_topic_request(normalized: str) -> bool:
-    if any(term in normalized for term in ("pine script", "trading script", "strategy code", "mql5")):
-        return False
-    off_topic_terms = (
-        "cover letter",
-        "essay",
-        "homework",
-        "javascript",
-        "legal contract",
-        "marketing copy",
-        "math problem",
-        "medical",
-        "poem",
-        "python script",
-        "react component",
-        "recipe",
-        "resume",
-        "song lyrics",
-        "sql query",
-        "travel itinerary",
-        "viết email",
-        "làm thơ",
-        "nấu ăn",
-        "du lịch",
-        "bài tập",
-        "hợp đồng",
-    )
-    return any(term in normalized for term in off_topic_terms)
-
-
-def _looks_like_general_task_request(normalized: str) -> bool:
-    request_terms = (
-        "build",
-        "create",
-        "draft",
-        "explain",
-        "generate",
-        "how do i",
-        "how to",
-        "summarize",
-        "translate",
-        "what is",
-        "write",
-        "dịch",
-        "giải thích",
-        "là gì",
-        "tạo",
-        "tóm tắt",
-        "viết",
-    )
-    return len(normalized.split()) >= 3 and any(term in normalized for term in request_terms)
+    return classify_domain_scope_compat(message_content, artifact_kinds=artifact_kinds)
 
 
 def _domain_scope_blocked_message(language: str = "en") -> str:
@@ -2268,17 +3762,19 @@ def _suggestions_payload(
     web_search: str = "auto",
     semantic_action: SemanticActionClassification | None = None,
     action_plan: ActionPlanDecision | None = None,
+    workflow_enabled: bool = False,
+    action_evaluation: ActionRegistryEvaluation | None = None,
 ) -> dict[str, Any]:
     language = _normalize_language(language)
     combined_context = f"{context_text}\n{message_content}".lower()
     normalized_message = message_content.lower()
     artifact_kinds = artifact_kinds or set()
-    missing_fields = _strategy_missing_fields(combined_context)
+    missing_fields = _strategy_missing_fields(combined_context) if workflow_enabled else []
     readiness = "ready_for_artifact" if not missing_fields else "needs_detail"
     actions: list[dict[str, Any]] = []
     composer_blocks = (
         _composer_block_suggestions(language, missing_fields)
-        if response_intent in {"strategy_building", "artifact_generation"}
+        if workflow_enabled and response_intent in {"strategy_building", "artifact_generation"}
         else []
     )
 
@@ -2290,6 +3786,7 @@ def _suggestions_payload(
             web_search=web_search,
             action_plan=action_plan,
             start_priority=-10,
+            action_evaluation=action_evaluation,
         )
     )
     context_payload: dict[str, Any] = {
@@ -2321,6 +3818,7 @@ def _registry_action_suggestions(
     web_search: str,
     action_plan: ActionPlanDecision | None,
     start_priority: int,
+    action_evaluation: ActionRegistryEvaluation | None = None,
 ) -> list[dict[str, Any]]:
     if action_plan is None or not action_plan.is_active():
         return []
@@ -2335,7 +3833,11 @@ def _registry_action_suggestions(
 
     registry_entries = {
         str(entry.get("tool_id")): entry
-        for entry in action_registry_payload(artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search)
+        for entry in (
+            action_evaluation.payload
+            if action_evaluation is not None
+            else action_registry_payload(artifact_kinds=artifact_kinds, context_text=context_text, web_search=web_search)
+        )
         if isinstance(entry.get("tool_id"), str)
     }
     actions: list[dict[str, Any]] = []
@@ -2385,11 +3887,6 @@ def _artifact_kind_matches(kind: str, terms: tuple[str, ...]) -> bool:
 
 def _has_strategy_artifact_kind(artifact_kinds: set[str]) -> bool:
     return any(_artifact_kind_matches(kind, ("pine", "strategy_spec", "strategy", "code", "source_bundle")) for kind in artifact_kinds)
-
-
-def _is_bot_boundary_request(normalized: str) -> bool:
-    terms = ("bot", "live", "paper", "order", "intent", "signal", "vào lệnh", "đặt lệnh", "chạy bot", "trade setup", "nếu trade")
-    return any(term in normalized for term in terms)
 
 
 def _composer_block_suggestions(language: str, missing_fields: list[str]) -> list[dict[str, Any]]:
@@ -2568,29 +4065,62 @@ def _strategy_missing_fields(context: str) -> list[str]:
 
 
 def _strategy_bot_missing_fields(context: str) -> list[str]:
-    normalized = context.lower()
+    evidence_lines: list[str] = []
+    for line in context.splitlines() or [context]:
+        lowered = line.lower()
+        if any(marker in lowered for marker in ("ví dụ", "vi du", "for example", "example:", "e.g.", "vd:")):
+            continue
+        if "?" in line and any(
+            label in lowered
+            for label in (
+                "market",
+                "symbol",
+                "timeframe",
+                "style",
+                "risk",
+                "thị trường",
+                "mã giao dịch",
+                "khung thời gian",
+                "phong cách",
+                "rủi ro",
+            )
+        ):
+            continue
+        evidence_lines.append(line)
+    evidence_context = "\n".join(evidence_lines)
+    normalized = evidence_context.lower()
     symbol_pattern = re.compile(
         r"\b(?:BTC|ETH|SOL|BNB|XRP|EUR|GBP|JPY|XAU|AAPL|TSLA|NVDA)"
         r"(?:[/:-]?(?:USD|USDT|USDC|BTC|ETH|JPY))?\b",
         re.IGNORECASE,
     )
     timeframe_pattern = re.compile(r"\b(?:[1-9]\d?\s?(?:m|min|h|d|w)|[1-9]\d?[mhdw]|daily|hourly|weekly)\b")
+    market_pattern = re.compile(
+        r"\b(?:crypto|forex|stock|equity|futures|chứng khoán|co phieu|cổ phiếu)\b",
+        re.IGNORECASE,
+    )
+    style_pattern = re.compile(r"\b(?:trend(?: following)?|mean reversion|breakout|scalping|dca)\b", re.IGNORECASE)
+    risk_pattern = re.compile(
+        r"\b(?:conservative|balanced|moderate|aggressive|low risk|medium risk|high risk|an toàn|can bang|cân bằng|mạo hiểm)\b"
+        r"|(?:\brisk\b|\brủi ro\b).{0,24}\b\d+(?:\.\d+)?\s?%",
+        re.IGNORECASE,
+    )
+    style_matches = {match.group(0).lower() for match in style_pattern.finditer(evidence_context)}
+    has_style_catalog = len(style_matches) > 1 and any(
+        label in normalized for label in ("style", "phong cách", "loại chiến lược")
+    )
     checks = {
-        "market": ("market", "crypto", "forex", "stock", "equity", "futures", "thị trường", "chứng khoán"),
-        "symbol": ("symbol", "ticker", "btcusdt", "ethusdt", "eurusd", "xauusd"),
-        "timeframe": ("timeframe", "khung thời gian", "khung", "daily", "hourly", "intraday"),
-        "style": ("trend", "mean reversion", "breakout", "scalping", "dca", "style", "phong cách"),
-        "risk_preference": ("risk", "rủi ro", "conservative", "balanced", "aggressive", "an toàn", "mạo hiểm"),
+        "market": bool(market_pattern.search(evidence_context)),
+        "symbol": bool(symbol_pattern.search(evidence_context)),
+        "timeframe": bool(timeframe_pattern.search(normalized)),
+        "style": bool(style_matches) and not has_style_catalog,
+        "risk_preference": bool(risk_pattern.search(evidence_context)),
     }
-    missing = [field for field, terms in checks.items() if not any(term in normalized for term in terms)]
-    if "symbol" in missing and symbol_pattern.search(context):
-        missing.remove("symbol")
-    if "timeframe" in missing and timeframe_pattern.search(normalized):
-        missing.remove("timeframe")
+    missing = [field for field, is_present in checks.items() if not is_present]
     return missing
 
 
-def _has_strategy_bot_signal(context: str) -> bool:
+def _strategy_bot_lexical_hint(context: str) -> bool:
     return any(
         term in context
         for term in (
@@ -2605,7 +4135,7 @@ def _has_strategy_bot_signal(context: str) -> bool:
     )
 
 
-def _is_strategy_bot_workflow_request(
+def _strategy_bot_workflow_lexical_hint(
     message_content: str,
     *,
     context_text: str,
@@ -2622,9 +4152,9 @@ def _is_strategy_bot_workflow_request(
         "draft_bot",
     }:
         combined_for_tool = f"{message_content}\n{context_text}".lower()
-        return tool_name == "draft_bot" or _has_strategy_bot_signal(combined_for_tool)
+        return tool_name == "draft_bot" or _strategy_bot_lexical_hint(combined_for_tool)
     combined = f"{message_content}\n{context_text}".lower()
-    bot_signal = _has_strategy_bot_signal(combined)
+    bot_signal = _strategy_bot_lexical_hint(combined)
     strategy_signal = any(
         term in combined
         for term in (
@@ -2663,6 +4193,244 @@ def _workflow_ref(refs: dict[str, str], key: str, value: Any) -> None:
         refs[key] = text
 
 
+STRATEGY_BOT_SKIP_PINE_STEPS = ("generate_pine", "static_validation")
+STRATEGY_BOT_SKIP_BACKTEST_STEPS = ("backtest_preview", "evidence_review")
+STRATEGY_BOT_SKIP_STEP_REASONS = {
+    "generate_pine": "User asked to skip Pine generation.",
+    "static_validation": "No generated Pine artifact to validate.",
+    "backtest_preview": "User asked to skip backtest preview.",
+    "evidence_review": "Draft-only review without backtest evidence.",
+}
+STRATEGY_BOT_SKIP_PINE_TERMS = (
+    "không cần pine",
+    "khong can pine",
+    "không muốn pine",
+    "khong muon pine",
+    "bỏ pine",
+    "bo pine",
+    "skip pine",
+    "without pine",
+    "existing strategy spec",
+    "existing spec",
+    "spec có sẵn",
+    "spec co san",
+    "strategy spec có sẵn",
+    "strategy spec co san",
+)
+STRATEGY_BOT_SKIP_PINE_NEGATED_TERMS = (
+    "do not skip pine",
+    "don't skip pine",
+    "dont skip pine",
+    "not skip pine",
+    "không bỏ pine",
+    "khong bo pine",
+    "đừng bỏ pine",
+    "dung bo pine",
+    "đừng skip pine",
+    "dung skip pine",
+    "no existing spec",
+    "no existing strategy spec",
+    "không có spec có sẵn",
+    "khong co spec co san",
+    "không có existing spec",
+    "khong co existing spec",
+)
+STRATEGY_BOT_SKIP_BACKTEST_TERMS = (
+    "bỏ backtest",
+    "bo backtest",
+    "không cần backtest",
+    "khong can backtest",
+    "skip backtest",
+    "without backtest",
+    "bỏ backtest preview",
+    "bo backtest preview",
+    "skip backtest preview",
+    "draft proposal only",
+    "chỉ draft proposal",
+    "chi draft proposal",
+    "chỉ draft bot proposal",
+    "chi draft bot proposal",
+)
+STRATEGY_BOT_SKIP_BACKTEST_NEGATED_TERMS = (
+    "do not skip backtest",
+    "don't skip backtest",
+    "dont skip backtest",
+    "not skip backtest",
+    "do not skip backtest preview",
+    "don't skip backtest preview",
+    "dont skip backtest preview",
+    "not skip backtest preview",
+    "không bỏ backtest",
+    "khong bo backtest",
+    "đừng bỏ backtest",
+    "dung bo backtest",
+    "đừng skip backtest",
+    "dung skip backtest",
+)
+
+
+def _has_explicit_skip_intent(
+    normalized: str,
+    *,
+    positive_terms: tuple[str, ...],
+    negated_terms: tuple[str, ...],
+) -> bool:
+    return any(term in normalized for term in positive_terms) and not any(
+        term in normalized for term in negated_terms
+    )
+
+
+def _append_optional_skip_steps(
+    skipped: list[str],
+    reasons: dict[str, str],
+    steps: tuple[str, ...],
+) -> None:
+    for step in steps:
+        if step not in STRATEGY_BOT_OPTIONAL_STEPS or step in skipped:
+            continue
+        skipped.append(step)
+        reasons[step] = STRATEGY_BOT_SKIP_STEP_REASONS[step]
+
+
+def _strategy_bot_skip_preferences(context: str, *, has_pine: bool) -> tuple[list[str], dict[str, str]]:
+    normalized = context.lower()
+    skipped: list[str] = []
+    reasons: dict[str, str] = {}
+
+    skip_pine = not has_pine and _has_explicit_skip_intent(
+        normalized,
+        positive_terms=STRATEGY_BOT_SKIP_PINE_TERMS,
+        negated_terms=STRATEGY_BOT_SKIP_PINE_NEGATED_TERMS,
+    )
+    if skip_pine:
+        _append_optional_skip_steps(skipped, reasons, STRATEGY_BOT_SKIP_PINE_STEPS)
+
+    skip_backtest = _has_explicit_skip_intent(
+        normalized,
+        positive_terms=STRATEGY_BOT_SKIP_BACKTEST_TERMS,
+        negated_terms=STRATEGY_BOT_SKIP_BACKTEST_NEGATED_TERMS,
+    )
+    if skip_backtest:
+        _append_optional_skip_steps(skipped, reasons, STRATEGY_BOT_SKIP_BACKTEST_STEPS)
+
+    return skipped, reasons
+
+
+_WORKFLOW_BLOCKING_RESPONSE_INTENTS = frozenset({"capability_help", "docs_research", "market_research", "market_snapshot"})
+
+
+def _has_active_workflow(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    workflow_id: str,
+) -> bool:
+    tasks = repository.list_workflow_tasks(auth, conversation_id) or []
+    return any(
+        task.workflow_id == workflow_id and task.status not in WORKFLOW_TASK_RESOLVED_STATUSES
+        for task in tasks
+    )
+
+
+def _should_create_workflow_from_decision(chat_decision: ChatIntentDecision, workflow_id: str) -> bool:
+    if _is_classifier_fallback_source(chat_decision.source) and chat_decision.source != WORKFLOW_TIMEOUT_FALLBACK_SOURCE:
+        return False
+    workflow_intent = normalize_workflow_intent(chat_decision.workflow_intent)
+    if workflow_id_for_intent(workflow_intent) != workflow_id:
+        return False
+    if not response_intent_allows_workflow(chat_decision.response_intent, workflow_intent):
+        return False
+    policy = workflow_intent_policy(workflow_intent)
+    creation_intents = policy.get("creation_response_intents", [])
+    if chat_decision.response_intent not in creation_intents:
+        return False
+    return not bool(policy.get("requires_explicit_intent")) or workflow_intent is not None
+
+
+def _workflow_timeout_fallback_decision(message_content: str) -> ChatIntentDecision | None:
+    regex_evidence = _chat_regex_evidence(message_content)
+    evidence_signals = set(evidence_signals_from_regex(regex_evidence))
+    for workflow_intent in WORKFLOW_INTENTS:
+        policy = workflow_timeout_fallback_policy(workflow_intent)
+        if not policy.get("enabled"):
+            continue
+        required = set(normalize_evidence_signals(policy.get("required_evidence_signals", [])))
+        denied = set(normalize_evidence_signals(policy.get("denied_evidence_signals", [])))
+        if not required.issubset(evidence_signals):
+            continue
+        if denied & evidence_signals:
+            continue
+        response_intent = policy.get("response_intent")
+        domain_scope = policy.get("domain_scope")
+        source = policy.get("source")
+        if not isinstance(response_intent, str) or response_intent not in RESPONSE_INTENTS:
+            continue
+        if not isinstance(domain_scope, str) or domain_scope not in DOMAIN_SCOPES:
+            continue
+        if not isinstance(source, str) or not source:
+            source = WORKFLOW_TIMEOUT_FALLBACK_SOURCE
+        return ChatIntentDecision(
+            response_intent=response_intent,
+            action="answer",
+            model_stage=_model_stage_for_intent(response_intent),
+            confidence=RESPONSE_INTENT_FALLBACK_CONFIDENCE,
+            source=source,
+            auto_chain=False,
+            current_context_required=False,
+            domain_scope=domain_scope,
+            workflow_intent=workflow_intent,
+            used_signals=tuple(sorted(evidence_signals)),
+            reasons=("Classifier timed out; registry evidence allowed input-only workflow kickoff.",),
+        )
+    return None
+
+
+def _should_resume_active_workflow(chat_decision: ChatIntentDecision, workflow_id: str, *, active: bool) -> bool:
+    if not active or _is_classifier_fallback_source(chat_decision.source):
+        return False
+    if chat_decision.response_intent in _WORKFLOW_BLOCKING_RESPONSE_INTENTS:
+        return False
+    workflow_intent = normalize_workflow_intent(chat_decision.workflow_intent)
+    if workflow_intent is not None and workflow_id_for_intent(workflow_intent) == workflow_id:
+        return bool(workflow_intent_policy(workflow_intent).get("resume_existing"))
+    for candidate_intent in WORKFLOW_INTENTS:
+        policy = workflow_intent_policy(candidate_intent)
+        if policy.get("workflow_id") != workflow_id or not policy.get("resume_existing"):
+            continue
+        creation_intents = policy.get("creation_response_intents", [])
+        if chat_decision.response_intent in creation_intents:
+            return True
+    return chat_decision.response_intent == "general_chat" and chat_decision.domain_scope != "product_help"
+
+
+def _maybe_strategy_bot_workflow_payload(
+    *,
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    chat_decision: ChatIntentDecision,
+    message_content: str,
+    context_text: str,
+    artifact_kinds: set[str],
+    tool_name: str | None = None,
+    tool_result: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    active = _has_active_workflow(repository, auth, conversation_id, STRATEGY_BOT_WORKFLOW_ID)
+    if not (
+        _should_create_workflow_from_decision(chat_decision, STRATEGY_BOT_WORKFLOW_ID)
+        or _should_resume_active_workflow(chat_decision, STRATEGY_BOT_WORKFLOW_ID, active=active)
+    ):
+        return None
+    return _strategy_bot_workflow_payload(
+        message_content=message_content,
+        context_text=context_text,
+        artifact_kinds=artifact_kinds,
+        tool_name=tool_name,
+        tool_result=tool_result,
+        force=True,
+    )
+
+
 def _strategy_bot_workflow_payload(
     *,
     message_content: str,
@@ -2670,8 +4438,9 @@ def _strategy_bot_workflow_payload(
     artifact_kinds: set[str],
     tool_name: str | None = None,
     tool_result: dict[str, Any] | None = None,
+    force: bool = False,
 ) -> dict[str, Any] | None:
-    if not _is_strategy_bot_workflow_request(
+    if not force and not _strategy_bot_workflow_lexical_hint(
         message_content,
         context_text=context_text,
         artifact_kinds=artifact_kinds,
@@ -2692,7 +4461,6 @@ def _strategy_bot_workflow_payload(
     if proposal is not None:
         proposal_id = proposal_id or _safe_string(proposal.get("proposal_id")) or _safe_string(proposal.get("id"))
     setup_missing = _proposal_missing_setup_fields(proposal, explicit_missing) if proposal is not None else []
-    start_allowed = proposal is not None and not setup_missing
 
     has_pine = bool({"pine_file", "pine_strategy_source"} & artifact_kinds) or tool_name in {
         "generate_pine",
@@ -2721,12 +4489,29 @@ def _strategy_bot_workflow_payload(
         {BACKTEST_REPORT_ARTIFACT_KIND, ROBUSTNESS_REPORT_ARTIFACT_KIND, RISK_GATE_REPORT_ARTIFACT_KIND}
         & artifact_kinds
     ) or tool_name in {"get_backtest_summary", "build_robustness_report"}
+    skipped_steps, step_reasons = _strategy_bot_skip_preferences(combined_context, has_pine=has_pine)
+    skipped = set(skipped_steps)
+    pine_satisfied = has_pine or "generate_pine" in skipped
+    validation_satisfied = has_validation or "static_validation" in skipped
+    backtest_satisfied = has_backtest_preview or "backtest_preview" in skipped
+    evidence_satisfied = has_evidence_review or "evidence_review" in skipped
+    skipped_evidence_gate = (
+        ("backtest_preview" in skipped and not has_backtest_preview)
+        or ("evidence_review" in skipped and not has_evidence_review)
+    )
+    start_allowed = proposal is not None and not setup_missing and not skipped_evidence_gate
 
     completed: list[str] = []
     if not strategy_missing:
         completed.append("collect_strategy_inputs")
+    has_downstream_strategy_work = (
+        has_pine or has_validation or has_backtest_preview or has_evidence_review or proposal is not None
+    )
+    has_existing_spec_skip = not strategy_missing and "generate_pine" in skipped
+    if has_downstream_strategy_work or has_existing_spec_skip:
+        completed.append("draft_strategy_spec")
     if has_pine:
-        completed.extend(["draft_strategy_spec", "generate_pine"])
+        completed.append("generate_pine")
     if has_validation:
         completed.append("static_validation")
     if has_backtest_preview:
@@ -2739,13 +4524,13 @@ def _strategy_bot_workflow_payload(
 
     if strategy_missing:
         current_step = "collect_strategy_inputs"
-    elif not has_pine:
+    elif not pine_satisfied:
         current_step = "draft_strategy_spec"
-    elif not has_validation:
+    elif not validation_satisfied:
         current_step = "static_validation"
-    elif not has_backtest_preview:
+    elif not backtest_satisfied:
         current_step = "backtest_preview"
-    elif not has_evidence_review:
+    elif not evidence_satisfied:
         current_step = "evidence_review"
     elif proposal is None:
         current_step = "draft_bot_proposal"
@@ -2781,10 +4566,62 @@ def _strategy_bot_workflow_payload(
     elif proposal is not None and setup_missing:
         blocked_reason = "missing_bot_setup_fields"
 
+    tasks: list[dict[str, Any]] = []
+    task_values: dict[str, Any] = {}
+    if strategy_missing:
+        collect_inputs = [
+            field
+            for field in [*strategy_missing, "entry_exit_idea"]
+            if field in {"market", "symbol", "timeframe", "style", "entry_exit_idea", "risk_preference"}
+        ]
+        collect_task = build_workflow_task_payload(
+            STRATEGY_BOT_WORKFLOW_ID,
+            "collect_strategy_inputs",
+            input_request_ids=collect_inputs,
+            status="pending_user",
+            reason="Missing strategy design fields.",
+        )
+        if collect_task is not None:
+            tasks.append(collect_task)
+    if current_step == "backtest_preview" and not has_backtest_preview:
+        draft_only = "backtest_preview" in skipped
+        choice_task = build_workflow_task_payload(
+            STRATEGY_BOT_WORKFLOW_ID,
+            "draft_only_backtest_choice",
+            status="completed" if draft_only else "pending_user",
+            values={"draft_only_choice": "draft_only"} if draft_only else {},
+            reason=step_reasons.get("backtest_preview") if draft_only else "Choose whether to run preview or keep draft-only review.",
+        )
+        if choice_task is not None:
+            tasks.append(choice_task)
+            if draft_only:
+                task_values["draft_only_choice"] = "draft_only"
+    if proposal is not None and setup_missing:
+        setup_task = build_workflow_task_payload(
+            STRATEGY_BOT_WORKFLOW_ID,
+            "complete_paper_setup",
+            input_request_ids=setup_missing,
+            status="pending_user",
+            reason="Paper simulation setup fields are incomplete.",
+        )
+        if setup_task is not None:
+            tasks.append(setup_task)
+    if proposal is not None:
+        confirm_task = build_workflow_task_payload(
+            STRATEGY_BOT_WORKFLOW_ID,
+            "confirm_paper_start",
+            status="pending_user" if start_allowed else "blocked",
+            reason=None if start_allowed else "Paper simulation start remains locked until setup and review gates are complete.",
+        )
+        if confirm_task is not None:
+            tasks.append(confirm_task)
+
     return validate_workflow_payload({
         "workflow_id": STRATEGY_BOT_WORKFLOW_ID,
         "current_step": current_step,
         "completed_steps": completed_steps,
+        "skipped_steps": skipped_steps,
+        "step_reasons": step_reasons,
         "blocked_reason": blocked_reason,
         "required_fields": required_fields,
         "missing_fields": missing_fields,
@@ -2792,7 +4629,42 @@ def _strategy_bot_workflow_payload(
         "evidence_status": evidence_status,
         "bot_proposal_id": proposal_id,
         "start_allowed": start_allowed,
+        "tasks": tasks,
+        "task_values": task_values,
     })
+
+
+def _workflow_task_event_payload(task: Any) -> dict[str, Any]:
+    return {
+        "task_id": task.id,
+        "workflow_id": task.workflow_id,
+        "task_template_id": task.task_template_id,
+        "status": task.status,
+    }
+
+
+def _workflow_task_values_from_state(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for task in tasks:
+        values = task.get("values")
+        if isinstance(values, dict):
+            merged.update(values)
+        response = task.get("response")
+        if isinstance(response, dict) and isinstance(response.get("values"), dict):
+            merged.update(response["values"])
+    return merged
+
+
+def _workflow_payload_has_blocking_user_task(workflow_payload: dict[str, Any]) -> bool:
+    tasks = workflow_payload.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    return any(
+        isinstance(task, dict)
+        and task.get("blocking") is True
+        and task.get("status") == "pending_user"
+        for task in tasks
+    )
 
 
 def _conversation_user_artifact_kinds(
@@ -3008,6 +4880,9 @@ def _latest_backtest_live_context(
 def _insert_system_context(messages: list[dict[str, str]], content: str) -> list[dict[str, str]]:
     if not messages:
         return [{"role": "system", "content": content}]
+    first = messages[0]
+    if first.get("role") == "system":
+        return [{**first, "content": f"{first.get('content', '')}\n\n{content}"}, *messages[1:]]
     return [messages[0], {"role": "system", "content": content}, *messages[1:]]
 
 
@@ -3023,19 +4898,7 @@ def _classify_response_intent(message_content: str, *, web_search: str = "auto")
 
 
 def _deterministic_response_intent(message_content: str, *, web_search: str = "auto") -> IntentClassification | None:
-    normalized = message_content.lower()
-    if _is_artifact_generation_request(normalized):
-        return IntentClassification("artifact_generation", 0.96, "deterministic")
-    if _is_market_snapshot_request(normalized):
-        return IntentClassification("market_snapshot", 0.96, "deterministic")
-    if _is_docs_research_request(normalized):
-        return IntentClassification("docs_research", 0.94, "deterministic")
-    if _is_market_research_request(normalized):
-        return IntentClassification("market_research", 0.92, "deterministic")
-    if _is_capability_help_request(normalized):
-        return IntentClassification("capability_help", 0.9, "deterministic")
-    if _is_strategy_building_request(normalized):
-        return IntentClassification("strategy_building", 0.9, "deterministic")
+    _ = (message_content, web_search)
     return None
 
 
@@ -3047,150 +4910,6 @@ class _NoopIntentClient:
 
     def stream(self, *, messages: list[dict[str, str]], tools: list[dict[str, Any]]) -> Iterator[LLMClientEvent]:
         return iter(())
-
-
-def _is_artifact_generation_request(normalized: str) -> bool:
-    artifact_terms = (
-        "artifact",
-        "code",
-        "pine",
-        "mql5",
-        "script",
-        "ea",
-        "expert advisor",
-        "generate",
-        "gen ",
-        "create",
-        "tạo",
-        "viết code",
-        "sinh code",
-    )
-    strategy_terms = ("strategy", "chiến lược", "indicator", "review", "spec")
-    return any(term in normalized for term in artifact_terms) and any(term in normalized for term in strategy_terms)
-
-
-def _is_market_snapshot_request(normalized: str) -> bool:
-    asset_terms = (
-        "btc",
-        "bitcoin",
-        "eth",
-        "ethereum",
-        "sol",
-        "bnb",
-        "xau",
-        "gold",
-        "forex",
-        "usd",
-        "usdt",
-    )
-    price_terms = ("price", "giá", "quote", "current", "today", "now", "hiện tại", "hôm nay", "bây giờ")
-    return any(term in normalized for term in asset_terms) and any(term in normalized for term in price_terms)
-
-
-def _is_docs_research_request(normalized: str) -> bool:
-    doc_terms = (
-        "docs",
-        "documentation",
-        "api",
-        "sdk",
-        "provider",
-        "pricing",
-        "version",
-        "release",
-        "tài liệu",
-        "phiên bản",
-    )
-    return any(term in normalized for term in doc_terms)
-
-
-def _is_market_research_request(normalized: str) -> bool:
-    research_terms = ("research", "news", "latest", "sources", "citation", "tin tức", "nguồn", "nghiên cứu")
-    market_terms = ("market", "crypto", "forex", "btc", "eth", "price", "giá")
-    if any(term in normalized for term in research_terms) and any(term in normalized for term in market_terms):
-        return True
-    market_context_terms = ("market condition", "market conditions", "market setup", "market context", "market hiện tại")
-    market_followup_terms = (
-        "what should",
-        "what do i do",
-        "what to do",
-        "should i",
-        "suitable",
-        "plan",
-        "condition",
-        "nên làm gì",
-        "làm gì",
-        "phù hợp",
-    )
-    return any(term in normalized for term in market_context_terms) or (
-        "market" in normalized and any(term in normalized for term in market_followup_terms)
-    )
-
-
-def _is_capability_help_request(normalized: str) -> bool:
-    return any(
-        term in normalized
-        for term in (
-            "what can you do",
-            "help me",
-            "bạn làm được gì",
-            "bạn hỗ trợ",
-            "khả năng",
-            "help",
-        )
-    )
-
-
-def _is_strategy_building_request(normalized: str) -> bool:
-    strategy_terms = (
-        "strategy",
-        "chiến lược",
-        "entry",
-        "exit",
-        "stop loss",
-        "take profit",
-        "risk",
-        "timeframe",
-        "ema",
-        "sma",
-        "rsi",
-        "breakout",
-        "liquidity",
-    )
-    return any(term in normalized for term in strategy_terms)
-
-
-def _has_intent_classifier_signal(message_content: str) -> bool:
-    normalized = message_content.lower()
-    signal_terms = (
-        "api",
-        "btc",
-        "code",
-        "docs",
-        "eth",
-        "forex",
-        "indicator",
-        "market",
-        "mql5",
-        "pine",
-        "price",
-        "pricing",
-        "provider",
-        "risk",
-        "strategy",
-        "trading",
-        "xau",
-        "chiến lược",
-        "giá",
-        "giao dịch",
-        "luật",
-        "mô hình",
-        "nguồn",
-        "phí",
-        "tài liệu",
-        "thị trường",
-        "ý tưởng",
-    )
-    return any(term in normalized for term in signal_terms)
 
 
 def _intent_classifier_system_prompt() -> str:
@@ -3213,15 +4932,20 @@ def _chat_intent_decision_system_prompt() -> str:
     intents = ", ".join(sorted(RESPONSE_INTENTS))
     actions = ", ".join(sorted(CHAT_INTENT_ACTIONS))
     stages = ", ".join(sorted(CHAT_INTENT_MODEL_STAGES))
+    scopes = ", ".join(sorted(DOMAIN_SCOPES))
+    workflows = ", ".join(sorted(WORKFLOW_INTENTS))
     return (
         "You are Strategy Codebot's semantic chat intent gate. Return JSON only with keys: "
         "response_intent, action, model_stage, confidence, tool_id, auto_chain, "
-        "current_context_required, missing_inputs, reasons, used_signals. "
+        "current_context_required, domain_scope, workflow_intent, missing_inputs, reasons, used_signals. "
         f"response_intent must be one of: {intents}. "
         f"action must be one of: {actions}. "
         f"model_stage must be one of: {stages}. "
+        f"domain_scope must be one of: {scopes}. "
+        f"workflow_intent may be one of: {workflows}, or null. "
         "Regex evidence is only a hint; decide from semantic intent, recent context, artifacts, and available actions. "
         "Use start_auto_chain or auto_chain=true when the user wants local preview/backtest evidence, including paraphrases such as simulate, paper test, preview performance, chạy thử, thử hiệu quả, or chay thu. "
+        "Use ambiguous instead of off_topic when context is unclear. "
         "Use pine_generation or artifact_generation with the Pine code generation stage for Pine/code/script requests. "
         "Use current_context_required only for current external facts such as market data, docs, providers, models, pricing, releases, or versions; current preview evidence is internal context. "
         "Never select broker, live trading, paper trading execution, profitability proof, or approval bypass behavior. "
@@ -3345,9 +5069,14 @@ def _parse_chat_intent_decision_json(
         tool_id = None
     if bounded_confidence < CHAT_INTENT_DECISION_MIN_CONFIDENCE:
         return None
-    used_signals = _safe_string_tuple(payload.get("used_signals"))
+    domain_scope = normalize_domain_scope(
+        payload.get("domain_scope"),
+        fallback=domain_scope_for_response_intent(response_intent),
+    )
+    workflow_intent = normalize_workflow_intent(payload.get("workflow_intent"))
+    used_signals = normalize_evidence_signals(payload.get("used_signals"))
     if not used_signals and regex_evidence:
-        used_signals = tuple(key for key, value in regex_evidence.items() if value)
+        used_signals = evidence_signals_from_regex(regex_evidence)
     return ChatIntentDecision(
         response_intent=response_intent,
         action=action,
@@ -3357,6 +5086,8 @@ def _parse_chat_intent_decision_json(
         tool_id=tool_id,
         auto_chain=bool(payload.get("auto_chain")),
         current_context_required=bool(payload.get("current_context_required")),
+        domain_scope=domain_scope,
+        workflow_intent=workflow_intent,
         missing_inputs=_safe_string_tuple(payload.get("missing_inputs")),
         reasons=_safe_string_tuple(payload.get("reasons") or payload.get("reason")),
         used_signals=used_signals,
@@ -3368,25 +5099,20 @@ def _fallback_chat_intent_decision(
     *,
     web_search: str,
     regex_evidence: dict[str, bool],
+    domain_scope_hint: str | None = None,
 ) -> ChatIntentDecision:
-    deterministic = _deterministic_response_intent(message_content, web_search=web_search)
-    response_intent = deterministic.intent if deterministic is not None else "general_chat"
-    confidence = deterministic.confidence if deterministic is not None else RESPONSE_INTENT_FALLBACK_CONFIDENCE
-    auto_chain = bool(regex_evidence.get("explicit_backtest") or regex_evidence.get("preview_intent"))
-    source = "fallback_regex" if auto_chain else (deterministic.source if deterministic is not None else "fallback")
-    action = "start_auto_chain" if auto_chain else "answer"
-    if regex_evidence.get("pine_or_code") and response_intent == "general_chat":
-        response_intent = "artifact_generation"
-        confidence = max(confidence, 0.75)
+    _ = (message_content, web_search, domain_scope_hint)
+    response_intent = "general_chat"
     return ChatIntentDecision(
         response_intent=response_intent,
-        action=action,
+        action="answer",
         model_stage=_model_stage_for_intent(response_intent),
-        confidence=confidence,
-        source=source,
-        auto_chain=auto_chain,
-        current_context_required=bool(regex_evidence.get("current_info")),
-        used_signals=tuple(key for key, value in regex_evidence.items() if value),
+        confidence=RESPONSE_INTENT_FALLBACK_CONFIDENCE,
+        source="fallback",
+        auto_chain=False,
+        current_context_required=False,
+        domain_scope="ambiguous",
+        used_signals=evidence_signals_from_regex(regex_evidence),
     )
 
 
@@ -3404,71 +5130,11 @@ def _safe_string_tuple(value: Any) -> tuple[str, ...]:
 
 
 def _chat_regex_evidence(message_content: str) -> dict[str, bool]:
-    normalized = " ".join((message_content or "").lower().split())
-    return {
-        "explicit_backtest": _explicit_backtest_signal(normalized),
-        "preview_intent": _preview_intent_signal(normalized),
-        "pine_or_code": _pine_or_code_signal(normalized),
-        "current_info": _should_enable_web_search_auto(normalized),
-        "artifact_or_strategy": _is_artifact_generation_request(normalized) or _is_strategy_building_request(normalized),
-        "risky_url_action": _risky_url_action_signal(normalized),
-    }
-
-
-def _explicit_backtest_signal(normalized: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(backtest|run\s+(?:a\s+)?preview|test(?:\s+(?:the\s+)?strategy)?|compare(?:\s+variants?)?)\b"
-            r"|chạy\s+backtest|kiểm\s*thử|test\s+(?:chiến\s*lược|strategy)|so\s+sánh",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _preview_intent_signal(normalized: str) -> bool:
-    terms = (
-        "simulate",
-        "paper test",
-        "preview performance",
-        "preview evidence",
-        "run thử",
-        "chạy thử",
-        "thử hiệu quả",
-        "xem chiến lược này ổn không",
-        "chay thu",
-        "thu hieu qua",
-    )
-    return any(term in normalized for term in terms)
-
-
-def _pine_or_code_signal(normalized: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(pine|pinescript|strategy\.entry|strategy\.exit|script|code|indicator|mql5|expert advisor)\b"
-            r"|viết\s+code|sinh\s+code|tạo\s+code",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def _risky_url_action_signal(normalized: str) -> bool:
-    return bool(
-        re.search(
-            r"\b(run|execute|call|use|fetch|open|read|send|submit|request|connect|download|upload|curl|wget|shell|filesystem|network\s+request)\b",
-            normalized,
-            flags=re.IGNORECASE,
-        )
-    )
+    return collect_chat_regex_evidence(message_content)
 
 
 def _model_stage_for_intent(response_intent: str | None) -> str:
-    if response_intent in {"artifact_generation", "backtest_preview", "pine_generation", "strategy_building"}:
-        return MODEL_STAGE_PINE_CODE_GENERATION
-    if response_intent in {"market_research", "docs_research"}:
-        return MODEL_STAGE_BALANCED_REVIEW
-    return DEFAULT_MODEL_STAGE
+    return model_stage_for_response_intent(response_intent, fallback=DEFAULT_MODEL_STAGE)
 
 
 def _normalize_semantic_action(value: Any) -> str | None:
@@ -3520,14 +5186,15 @@ def _direct_action_plan_tool_args(
         return None
     if action_plan.tool_id not in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report", "get_bot_status", "list_bots", "list_bot_events"}:
         return None
+    arguments = dict(action_plan.arguments or {})
     available_tools = available_registry_tool_ids(
         artifact_kinds=artifact_kinds,
         context_text=context_text,
         web_search=web_search,
+        context_signals=_action_plan_context_signals(action_plan.tool_id, arguments),
     )
     if action_plan.tool_id not in available_tools:
         return None
-    arguments = dict(action_plan.arguments or {})
     if action_plan.tool_id in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report"}:
         arguments.setdefault("run_id", "latest_completed_backtest")
     if action_plan.tool_id == "query_backtest_trades":
@@ -3536,6 +5203,15 @@ def _direct_action_plan_tool_args(
             arguments.pop("bucket", None)
         arguments["limit"] = _requested_tool_output_limit(arguments.get("limit"), default=20, maximum=50)
     return action_plan.tool_id, arguments
+
+
+def _action_plan_context_signals(tool_id: str, arguments: dict[str, Any]) -> set[str]:
+    signals: set[str] = set()
+    if tool_id in {"get_bot_status", "list_bot_events"} and (
+        _safe_string(arguments.get("runtime_id")) or _safe_string(arguments.get("bot_id"))
+    ):
+        signals.add("bot_context")
+    return signals
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -3641,6 +5317,156 @@ def _safe_blocked_message(language: str = "en") -> str:
             "Mình có thể giúp chuyển nó thành strategy spec, Pine/MQL5 artifact để review, hoặc hướng dẫn validation thủ công."
         )
     return SAFE_BLOCKED_MESSAGE
+
+
+def should_use_bounded_scout(message_content: str, *, response_intent: str) -> bool:
+    text = message_content.lower()
+    if response_intent not in {"general_chat", "capability_help", "strategy_building", "artifact_generation"}:
+        return False
+    if chat_safety_preflight(message_content) is not None:
+        return False
+    has_tool_context = _contains_any(text, "tool", "tools", "registry", "tooling", "công cụ", "cong cu")
+    asks_for_read_only_scout = _contains_any(
+        text,
+        "read-only",
+        "read safe",
+        "read-safe",
+        "risk_tier=read",
+        "risk tier read",
+        "scout",
+        "inspect",
+        "investigate",
+        "kiểm tra",
+        "kiem tra",
+        "đọc",
+        "doc",
+    )
+    generation_request = _contains_any(
+        text,
+        "generate pine",
+        "sinh pine",
+        "tạo pine",
+        "tao pine",
+        "viết pine",
+        "viet pine",
+        "backtest",
+    )
+    return has_tool_context and asks_for_read_only_scout and not generation_request
+
+
+def chat_safety_preflight(message_content: str) -> PolicyFinding | None:
+    text = message_content.lower()
+    if _requests_shell_or_repo_write(text):
+        return PolicyFinding(
+            severity="blocker",
+            code="unsafe_chat_tool_request",
+            message="Chat requested shell, filesystem, edit, or repository-write execution outside approved tool boundaries.",
+            surface="agent.chat.input",
+            evidence_level=EVIDENCE_STRATEGY_IDEA,
+            rule_id="chat_safety_preflight.unsafe_tool_request",
+            category="tool_safety",
+        )
+    if _requests_live_trading_execution(text):
+        return PolicyFinding(
+            severity="blocker",
+            code="trading_execution_boundary",
+            message="Chat requested live or broker trading execution, which remains outside review-only boundaries.",
+            surface="agent.chat.input",
+            evidence_level=EVIDENCE_STRATEGY_IDEA,
+            rule_id="chat_safety_preflight.trading_execution_boundary",
+            category="trading_boundary",
+        )
+    if _requests_paper_bot_bypass(text):
+        return PolicyFinding(
+            severity="blocker",
+            code="paper_bot_confirmation_required",
+            message="Chat requested paper bot startup while bypassing backend eligibility or explicit user confirmation.",
+            surface="agent.chat.input",
+            evidence_level=EVIDENCE_STRATEGY_IDEA,
+            rule_id="chat_safety_preflight.paper_bot_confirmation_required",
+            category="trading_boundary",
+        )
+    return None
+
+
+def _requests_shell_or_repo_write(text: str) -> bool:
+    shell_terms = (
+        "run shell",
+        "execute shell",
+        "chạy shell",
+        "chay shell",
+        "terminal command",
+        "chạy lệnh",
+        "chay lenh",
+        "bash ",
+        "sh ",
+        "rm -rf",
+        "python -c",
+        "node -e",
+    )
+    repo_write_terms = (
+        "repo-write",
+        "write file",
+        "edit file",
+        "modify file",
+        "filesystem write",
+        "sửa file",
+        "sua file",
+        "ghi file",
+        "git commit",
+        "commit changes",
+        "git push",
+        "push branch",
+    )
+    action_terms = ("run", "execute", "chạy", "chay", "use", "dùng", "dung", "edit", "write", "sửa", "sua", "ghi")
+    return _contains_any(text, *shell_terms) or (
+        _contains_any(text, *repo_write_terms) and _contains_any(text, *action_terms)
+    )
+
+
+def _requests_live_trading_execution(text: str) -> bool:
+    explicit_patterns = (
+        r"\b(connect|integrate|deploy)\b.{0,80}\b(broker|exchange)\b",
+        r"\bexecute\s+(?:broker|exchange)\b",
+        r"\b(place|send|submit|execute)\b.{0,80}\blive\s+(?:orders?|trades?)\b",
+        r"\bplace\s+orders?\b.{0,80}\b(?:broker|exchange|live)\b",
+        r"\bđặt\s+lệnh\s+thật\b",
+        r"\bdat\s+lenh\s+that\b",
+        r"\bgiao\s+dịch\s+thật\b",
+        r"\bgiao\s+dich\s+that\b",
+    )
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in explicit_patterns)
+
+
+def _requests_paper_bot_bypass(text: str) -> bool:
+    bot_terms = ("paper bot", "paper-bot", "bot giấy", "bot giay", "simulation bot")
+    start_terms = ("start", "run", "launch", "chạy", "chay", "bật", "bat", "kích hoạt", "kich hoat")
+    bypass_terms = (
+        "bypass",
+        "skip confirmation",
+        "without confirmation",
+        "no confirmation",
+        "skip eligibility",
+        "không cần hỏi",
+        "khong can hoi",
+        "không cần xác nhận",
+        "khong can xac nhan",
+        "không cần kiểm tra",
+        "khong can kiem tra",
+    )
+    return _contains_any(text, *bot_terms) and _contains_any(text, *start_terms) and _contains_any(text, *bypass_terms)
+
+
+def _contains_any(text: str, *needles: str) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def _bounded_scout_fallback_message(status: str, language: str) -> str:
+    if status == "blocked":
+        return _safe_blocked_message(language)
+    if _normalize_language(language) == "vi":
+        return "Mình đã hoàn tất bước scout read-only và ghi lại telemetry an toàn cho workflow."
+    return "Read-only scout completed with safe workflow telemetry recorded."
 
 
 def _failure_assistant_message(payload: dict[str, Any], language: str = "en") -> str:
@@ -4216,7 +6042,7 @@ def _tool_user_summary(tool_name: str, output: dict[str, Any], language: str = "
 def _missing_current_context_message(message_content: str, prior_context_text: str, language: str = "en") -> str | None:
     if not _needs_existing_strategy_context(message_content):
         return None
-    if _looks_like_strategy_context(prior_context_text):
+    if _strategy_context_lexical_hint(prior_context_text):
         return None
     if _normalize_language(language) == "vi":
         return (
@@ -4234,7 +6060,7 @@ def _needs_existing_strategy_context(message_content: str) -> bool:
     return "current strategy context" in normalized or "current strategy spec" in normalized or "existing strategy context" in normalized
 
 
-def _looks_like_strategy_context(text: str) -> bool:
+def _strategy_context_lexical_hint(text: str) -> bool:
     normalized = text.lower()
     required_terms = ["entry", "exit", "risk", "strategy", "indicator", "ema", "rsi", "atr", "stop", "take profit", "timeframe"]
     return sum(1 for term in required_terms if term in normalized) >= 2
@@ -4375,19 +6201,24 @@ def _provider_tools_for_web_search(
     *,
     response_intent: str | None = None,
     current_context_required: bool = False,
+    decision_source: str | None = None,
 ) -> list[dict[str, Any]]:
+    _ = message_content
     mode = _normalize_web_search(web_search)
-    intent_needs_web_search = current_context_required or response_intent in {
-        "docs_research",
-        "market_research",
-        "market_snapshot",
-    }
-    if intent_needs_web_search and mode != "off":
+    if mode == "off":
+        return provider_tools()
+    tools = provider_tools()
+    if mode == "on":
+        tools.append({"type": "web_search"})
+        return tools
+    if _decision_allows_readonly_web_search(
+        response_intent=response_intent,
+        current_context_required=current_context_required,
+        decision_source=decision_source,
+        web_search=mode,
+    ):
         return [{"type": "web_search"}]
 
-    tools = provider_tools()
-    if mode == "on" or (mode == "auto" and _should_enable_web_search_auto(message_content)):
-        tools.append({"type": "web_search"})
     return tools
 
 
@@ -4395,41 +6226,24 @@ def _has_web_search_tool(tools: list[dict[str, Any]]) -> bool:
     return any(tool.get("type") == "web_search" for tool in tools)
 
 
-def _should_enable_web_search_auto(message_content: str) -> bool:
-    normalized = message_content.lower()
-    explicit_terms = (
-        "latest",
-        "recent",
-        "research",
-        "sources",
-        "citation",
-        "citations",
-        "cite",
-        "docs",
-        "documentation",
-        "provider",
-        "pricing",
-        "news",
-        "release",
-        "version",
-        "web",
-        "search",
-        "mới nhất",
-        "gần đây",
-        "nghiên cứu",
-        "tìm kiếm",
-        "tài liệu",
-        "nguồn",
-        "tin tức",
-    )
-    if any(term in normalized for term in explicit_terms):
-        return True
+def _is_classifier_fallback_source(source: str | None) -> bool:
+    return source in {"fallback", "timeout_fallback", WORKFLOW_TIMEOUT_FALLBACK_SOURCE}
 
-    qualified_patterns = (
-        r"\b(current|today(?:'s)?|now|real[- ]?time|up[- ]?to[- ]?date)\s+(price|prices|market data|docs?|documentation|provider|providers|model|models|pricing|release|version)s?\b",
-        r"\b(current|today(?:'s)?|now|real[- ]?time|up[- ]?to[- ]?date)\b.{0,32}\b(price|prices|market data|docs?|documentation|provider|providers|model|models|pricing|release|version)s?\b",
-        r"\b(price|prices|market data|docs?|documentation|provider|providers|model|models|pricing|release|version)s?\s+(today|now|currently|current)\b",
-        r"(giá|market data|provider|model|phiên bản|release).{0,32}(hiện tại|hôm nay|bây giờ)",
-        r"(hiện tại|hôm nay|bây giờ).{0,32}(giá|market data|provider|model|phiên bản|release)",
-    )
-    return any(re.search(pattern, normalized) for pattern in qualified_patterns)
+
+def _decision_allows_readonly_web_search(
+    *,
+    response_intent: str | None,
+    current_context_required: bool,
+    decision_source: str | None,
+    web_search: str,
+) -> bool:
+    return current_context_policy_decision(
+        web_search=web_search,
+        response_intent=response_intent,
+        current_context_required=current_context_required,
+        decision_source=decision_source,
+    ).enabled
+
+
+def _should_enable_web_search_auto(message_content: str) -> bool:
+    return current_context_signal(message_content)
