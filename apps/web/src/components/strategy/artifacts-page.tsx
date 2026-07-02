@@ -169,7 +169,7 @@ export function ArtifactsPage() {
   }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
 
   return (
-    <main className="flex h-[100dvh] overflow-hidden bg-background text-foreground">
+    <main className="apple-page-shell flex h-[100dvh] overflow-hidden text-foreground">
       <ConversationSidebar
         activeView="artifacts"
         collapsed={sidebarCollapsed}
@@ -192,17 +192,17 @@ export function ArtifactsPage() {
         selectedConversationId={null}
         theme={theme}
       />
-      <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background lg:flex-row">
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent lg:flex-row">
         <div className="min-h-0 min-w-0 flex-1 overflow-y-auto" ref={scrollRootRef}>
           <div
             className={cn(
-              "mx-auto w-full px-4 py-8 transition-[max-width,padding] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] md:px-8 md:py-10",
+              "mx-auto w-full px-4 py-8 transition-[max-width,padding] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] md:px-8 md:py-12",
               artifactDrawerOpen ? "max-w-none" : "max-w-7xl"
             )}
           >
           <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0">
-              <h1 className="text-2xl font-semibold tracking-normal md:text-3xl">Artifacts</h1>
+              <h1 className="apple-section-title">Artifacts</h1>
               <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
                 Code, reports, and strategy outputs saved from your chats.
               </p>
@@ -220,7 +220,7 @@ export function ArtifactsPage() {
             </Button>
           </header>
 
-          <label className="mt-6 flex h-11 items-center gap-3 rounded-[6px] border border-border bg-muted/45 px-4 text-sm text-muted-foreground focus-within:border-primary/40 focus-within:bg-background">
+          <label className="apple-search-shell mt-6 flex h-11 items-center gap-3 px-4 text-sm text-muted-foreground focus-within:border-primary/40">
             <Search className="size-4 shrink-0" />
             <span className="sr-only">Search artifacts</span>
             <input
@@ -239,15 +239,15 @@ export function ArtifactsPage() {
                 Loading artifacts
               </div>
             ) : artifactsQuery.isError ? (
-              <div className="rounded-[4px] border border-destructive/25 bg-destructive/5 p-4 text-sm text-destructive">
+              <div className="rounded-[8px] border border-destructive/25 bg-destructive/5 p-4 text-sm text-destructive">
                 Unable to load artifacts.
               </div>
             ) : artifacts.length === 0 ? (
-              <div className="rounded-[4px] border border-dashed border-border bg-background p-5 text-sm text-muted-foreground">
+              <div className="apple-utility-card border-dashed p-5 text-sm text-muted-foreground">
                 No artifacts yet. Generated Pine code, backtest reports, and review outputs will appear here.
               </div>
             ) : filteredArtifacts.length === 0 ? (
-              <div className="rounded-[6px] border border-dashed border-border bg-muted/20 p-8 text-sm text-muted-foreground">
+              <div className="apple-utility-card border-dashed p-8 text-sm text-muted-foreground">
                 No artifacts match your search.
               </div>
             ) : (
@@ -264,14 +264,14 @@ export function ArtifactsPage() {
                   return (
                     <button
                       className={cn(
-                        "group relative grid h-[192px] overflow-hidden rounded-[8px] border bg-card text-left text-card-foreground transition hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-sm active:translate-y-0",
-                        isSelected ? "border-primary/45 shadow-sm" : "border-border"
+                        "apple-utility-card group relative grid h-[192px] overflow-hidden text-left text-card-foreground transition hover:-translate-y-0.5 hover:border-primary/35 active:translate-y-0",
+                        isSelected && "border-primary/45 ring-1 ring-primary/25"
                       )}
                       key={artifact.id}
                       onClick={() => selectArtifact(artifact.id)}
                       type="button"
                     >
-                      <span className="pointer-events-none absolute right-0 top-0 size-5 border-b border-l border-border bg-muted shadow-sm transition group-hover:bg-muted/80" />
+                      <span className="pointer-events-none absolute right-0 top-0 size-5 border-b border-l border-border bg-muted transition group-hover:bg-muted/80" />
                       <span className="min-h-0 border-b border-border/70 px-4 py-3">
                         <span className="mb-2 flex items-center gap-2 text-[11px] font-medium uppercase text-muted-foreground">
                           {artifactIcon(artifact)}
@@ -325,7 +325,7 @@ export function ArtifactsPage() {
         <aside
           aria-hidden={!artifactDrawerOpen}
           className={cn(
-            "shrink-0 overflow-hidden bg-background transition-[width,max-height,opacity,transform,border-color] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]",
+            "apple-product-tile shrink-0 overflow-hidden transition-[width,max-height,opacity,transform,border-color] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]",
             artifactDrawerOpen
               ? "max-h-[82dvh] translate-y-0 border-t border-border opacity-100 lg:h-auto lg:max-h-none lg:w-[min(980px,62vw)] lg:translate-x-0 lg:border-l lg:border-t-0 2xl:w-[980px]"
               : "max-h-0 translate-y-3 border-t border-transparent opacity-0 lg:max-h-none lg:w-0 lg:translate-x-4 lg:border-l lg:border-t-0"
@@ -339,7 +339,7 @@ export function ArtifactsPage() {
           >
             {artifactDrawerOpen ? (
               <>
-                <div className="border-b border-border p-4 md:p-5">
+                <div className="apple-frosted border-b p-4 md:p-5">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <p className="text-xs font-medium uppercase text-muted-foreground">
@@ -373,18 +373,18 @@ export function ArtifactsPage() {
                 </div>
               </div>
                 </div>
-                <div className="min-h-0 overflow-auto p-4 md:p-5">
+                <div className="min-h-0 overflow-auto bg-background/40 p-4 md:p-5">
               {preview.isLoading ? (
                 <div className="flex h-40 items-center justify-center text-sm text-muted-foreground">
                   <Loader2 className="mr-2 size-4 animate-spin" />
                   Loading preview
                 </div>
               ) : preview.isError ? (
-                <div className="rounded-[4px] border border-destructive/25 bg-destructive/5 p-4 text-sm text-destructive">
+                <div className="rounded-[8px] border border-destructive/25 bg-destructive/5 p-4 text-sm text-destructive">
                   Unable to load preview.
                 </div>
               ) : !preview.data ? (
-                <div className="rounded-[4px] border border-border bg-muted/25 p-4 text-sm text-muted-foreground">
+                <div className="apple-utility-card p-4 text-sm text-muted-foreground">
                   Preview unavailable.
                 </div>
               ) : (

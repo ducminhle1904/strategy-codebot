@@ -6,6 +6,7 @@ import {
   ChevronRight,
   CornerDownLeft,
   ListChecks,
+  LoaderCircle,
   Pencil,
   Play,
   SendHorizontal,
@@ -16,6 +17,7 @@ import type { ChatActivity, ChatActivityArtifactLink } from "@/lib/chat-activity
 import {
   compactWorkflowTaskValues,
   getWorkflowDefinition,
+  STRATEGY_BOT_WORKFLOW_ID,
   type WorkflowAction,
   type WorkflowDefinition,
   type WorkflowDefinitions,
@@ -27,7 +29,7 @@ import {
   type WorkflowTask,
 } from "@/lib/workflow-ui";
 
-type WorkflowStepStatus = "completed" | "current" | "skipped" | "pending";
+type WorkflowStepStatus = "completed" | "running" | "current" | "skipped" | "pending";
 
 type WorkflowPanelProps = {
   activities?: ChatActivity[];
@@ -35,37 +37,34 @@ type WorkflowPanelProps = {
   onSelectArtifact?: (artifactId: string) => void;
   onSubmitTask?: (taskId: string, values: Record<string, unknown>) => void;
   onTaskAction?: (taskId: string, action: WorkflowAction, values?: Record<string, unknown>) => void;
+  isWorking?: boolean;
   showTaskControls?: boolean;
   workflow: WorkflowState;
 };
 
 const WORKFLOW_STEP_MARKER_CLASS_NAMES: Record<WorkflowStepStatus, string> = {
   completed: "border-emerald-500 bg-emerald-500 text-white",
+  running: "border-primary bg-primary/10 text-primary",
   current: "border-primary text-primary",
   skipped: "border-dashed border-muted-foreground/50 text-muted-foreground",
   pending: "border-border",
 };
 
 export function WorkflowRail({
-  activities,
-  onSelectArtifact,
-  onSubmitTask,
-  onTaskAction,
+  isWorking,
   workflow,
 }: {
   activities?: ChatActivity[];
   onSelectArtifact?: (artifactId: string) => void;
   onSubmitTask?: (taskId: string, values: Record<string, unknown>) => void;
   onTaskAction?: (taskId: string, action: WorkflowAction, values?: Record<string, unknown>) => void;
+  isWorking?: boolean;
   workflow: WorkflowState;
 }) {
   return (
     <aside className="pointer-events-auto hidden min-[1440px]:absolute min-[1440px]:left-[calc(50%+24rem+1rem)] min-[1440px]:top-8 min-[1440px]:z-10 min-[1440px]:block min-[1440px]:max-h-[calc(100vh-4rem)] min-[1440px]:w-72 min-[1440px]:overflow-y-auto min-[1536px]:left-[calc(50%+24rem+1.5rem)] min-[1536px]:w-80">
       <WorkflowPanel
-        activities={activities}
-        onSelectArtifact={onSelectArtifact}
-        onSubmitTask={onSubmitTask}
-        onTaskAction={onTaskAction}
+        isWorking={isWorking}
         showTaskControls={false}
         workflow={workflow}
       />
@@ -143,7 +142,7 @@ function WorkflowQuestionPromptCard({
   return (
     <section
       aria-label="Workflow task prompt"
-      className="rounded-[8px] border border-border bg-background/95 p-3 text-foreground shadow-sm"
+      className="apple-frosted rounded-[8px] border p-3 text-foreground shadow-sm"
     >
       <div className="mb-3 flex items-start justify-between gap-4">
         <h2 className="min-w-0 text-pretty font-semibold text-sm leading-snug">
@@ -152,7 +151,7 @@ function WorkflowQuestionPromptCard({
         <div className="flex shrink-0 items-center gap-1.5 text-muted-foreground text-xs">
           <button
             aria-label="Previous question"
-            className="rounded-[4px] p-1 hover:bg-muted disabled:opacity-35"
+            className="rounded-full p-1 hover:bg-muted disabled:opacity-35"
             disabled={currentIndex === 0}
             onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}
             type="button"
@@ -162,7 +161,7 @@ function WorkflowQuestionPromptCard({
           <span>{currentIndex + 1} of {promptItems.length}</span>
           <button
             aria-label="Next question"
-            className="rounded-[4px] p-1 hover:bg-muted disabled:opacity-35"
+            className="rounded-full p-1 hover:bg-muted disabled:opacity-35"
             disabled={currentIndex >= promptItems.length - 1}
             onClick={() => setCurrentIndex((index) => Math.min(promptItems.length - 1, index + 1))}
             type="button"
@@ -178,7 +177,7 @@ function WorkflowQuestionPromptCard({
           return (
             <button
               className={cn(
-                "grid grid-cols-[2rem_minmax(0,1fr)] items-center gap-3 rounded-[6px] border px-2.5 py-2 text-left text-sm transition-colors",
+                "grid grid-cols-[2rem_minmax(0,1fr)] items-center gap-3 rounded-[8px] border px-2.5 py-2 text-left text-sm transition-colors",
                 selected
                   ? "border-border/70 bg-muted/70 text-foreground"
                   : "border-transparent text-muted-foreground hover:bg-muted/35 hover:text-foreground"
@@ -197,12 +196,12 @@ function WorkflowQuestionPromptCard({
               >
                 {index + 1}
               </span>
-              <span className="min-w-0">
+              <span className="grid min-w-0 gap-0.5">
                 <span className={cn("font-medium", selected ? "text-foreground" : "text-foreground/90")}>
                   {option.label}
                 </span>
                 {option.description ? (
-                  <span className="ml-2 text-muted-foreground">{option.description}</span>
+                  <span className="text-muted-foreground text-xs leading-snug">{option.description}</span>
                 ) : null}
               </span>
             </button>
@@ -212,7 +211,7 @@ function WorkflowQuestionPromptCard({
         {current.request.allow_custom ? (
           <label
             className={cn(
-              "grid grid-cols-[2rem_minmax(0,1fr)] items-center gap-3 rounded-[6px] border px-2.5 py-2 transition-colors",
+              "grid grid-cols-[2rem_minmax(0,1fr)] items-center gap-3 rounded-[8px] border px-2.5 py-2 transition-colors",
               selection.kind === "custom"
                 ? "border-border/70 bg-muted/70"
                 : "border-transparent text-muted-foreground hover:bg-muted/35"
@@ -240,7 +239,7 @@ function WorkflowQuestionPromptCard({
       <div className="mt-3 flex items-center justify-end gap-2">
         {canSkip ? (
           <button
-            className="rounded-[4px] px-3 py-1.5 text-muted-foreground text-xs hover:bg-muted/50 hover:text-foreground"
+            className="rounded-full px-3 py-1.5 text-muted-foreground text-xs hover:bg-muted/50 hover:text-foreground"
             onClick={() => {
               onSubmitTask?.(current.task.id, {});
               setCurrentIndex((index) => Math.min(promptItems.length - 1, index + 1));
@@ -251,7 +250,7 @@ function WorkflowQuestionPromptCard({
           </button>
         ) : null}
         <button
-          className="inline-flex items-center gap-1.5 rounded-[4px] bg-primary px-3 py-1.5 font-medium text-primary-foreground text-xs disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 font-medium text-primary-foreground text-xs disabled:cursor-not-allowed disabled:opacity-50"
           disabled={!canSubmit}
           onClick={() => {
             if (!canSubmit || submitValue === undefined) {
@@ -373,11 +372,10 @@ function stringifyPromptValue(value: unknown): string {
   }
 }
 export function WorkflowPanel({
-  activities = [],
   definitions,
-  onSelectArtifact,
   onSubmitTask,
   onTaskAction,
+  isWorking = false,
   showTaskControls = false,
   workflow,
 }: WorkflowPanelProps) {
@@ -386,7 +384,7 @@ export function WorkflowPanel({
     return (
       <section
         aria-label="Workflow"
-        className="rounded-[8px] border border-border bg-background/95 p-3 shadow-sm"
+        className="apple-frosted rounded-[8px] border p-3 shadow-sm"
       >
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -404,21 +402,15 @@ export function WorkflowPanel({
   const completedSteps = new Set(workflow.completed_steps);
   const skippedSteps = new Set(workflow.skipped_steps);
   const missingFields = new Set(workflow.missing_fields);
-  const requiredFields = new Set(workflow.required_fields);
-  const fieldSections = workflow.sections.filter(
-    (section) => section.component_kind === "field_status_section"
-  );
-  const actionGateSections = workflow.sections.filter(
-    (section) => section.component_kind === "action_gate_section"
-  );
-  const artifactLinks = workflowArtifactLinks(workflow.artifact_refs);
+  const actionGateSections = workflow.sections
+    .filter((section) => section.component_kind === "action_gate_section")
+    .filter((section) => workflowShouldShowActionGateSection(workflow, section));
   const progressSummary = workflowProgressSummary(definition, workflow);
-  const recentActivities = workflowRecentActivities(activities);
 
   return (
     <section
       aria-label={definition.aria_label}
-      className="rounded-[8px] border border-border bg-background/95 p-3 shadow-sm"
+      className="apple-frosted rounded-[8px] border p-3 shadow-sm"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
@@ -443,9 +435,10 @@ export function WorkflowPanel({
           const stepStatus = workflowStepStatus(step.id, {
             completedSteps,
             currentStep: workflow.current_step,
+            isWorking,
             skippedSteps,
           });
-          const isCurrent = stepStatus === "current";
+          const isCurrent = stepStatus === "current" || stepStatus === "running";
           const isSkipped = stepStatus === "skipped";
           return (
             <li
@@ -478,12 +471,6 @@ export function WorkflowPanel({
         })}
       </ol>
 
-      {workflow.blocked_reason ? (
-        <div className="mt-3 rounded-[6px] border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-amber-700 text-xs dark:text-amber-300">
-          {workflow.blocked_reason}
-        </div>
-      ) : null}
-
       {showTaskControls ? (
         <WorkflowTaskInboxSection
           definition={definition}
@@ -491,28 +478,7 @@ export function WorkflowPanel({
           onTaskAction={onTaskAction}
           workflow={workflow}
         />
-      ) : (
-        <WorkflowTaskSummarySection workflow={workflow} />
-      )}
-
-      <WorkflowArtifactRefsSection
-        links={artifactLinks}
-        onSelectArtifact={onSelectArtifact}
-      />
-
-      <WorkflowRecentActivitySection
-        activities={recentActivities}
-        onSelectArtifact={onSelectArtifact}
-      />
-
-      {fieldSections.map((section) => (
-        <WorkflowFieldStatusSection
-          key={section.id}
-          missingFields={missingFields}
-          requiredFields={requiredFields}
-          section={section}
-        />
-      ))}
+      ) : null}
 
       {actionGateSections.map((section) => (
         <WorkflowActionGateSection
@@ -566,6 +532,7 @@ function workflowStepStatus(
   context: {
     completedSteps: Set<string>;
     currentStep: string;
+    isWorking?: boolean;
     skippedSteps: Set<string>;
   }
 ): WorkflowStepStatus {
@@ -573,7 +540,7 @@ function workflowStepStatus(
     return "completed";
   }
   if (context.currentStep === stepId) {
-    return "current";
+    return context.isWorking ? "running" : "current";
   }
   if (context.skippedSteps.has(stepId)) {
     return "skipped";
@@ -585,10 +552,29 @@ function workflowStepMarker(status: WorkflowStepStatus, index: number) {
   if (status === "completed") {
     return <Check className="size-3" />;
   }
+  if (status === "running") {
+    return <LoaderCircle className="size-3 animate-spin" />;
+  }
   if (status === "skipped") {
     return "-";
   }
   return index + 1;
+}
+
+function workflowShouldShowActionGateSection(
+  workflow: WorkflowState,
+  section: WorkflowSection
+): boolean {
+  if (workflow.workflow_id !== STRATEGY_BOT_WORKFLOW_ID) {
+    return true;
+  }
+  if (section.id !== "paper_setup") {
+    return true;
+  }
+  return (
+    workflow.current_step === "complete_setup_confirm_start" ||
+    Boolean(workflow.bot_proposal_id)
+  );
 }
 
 function workflowStepSkipLabel(step: WorkflowStepDefinition): string {
@@ -1041,7 +1027,7 @@ function WorkflowRecentActivitySection({
               <span className="min-w-0 truncate text-[11px] text-foreground">
                 {activity.title}
               </span>
-              <span className="shrink-0 text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+              <span className="shrink-0 text-[10px] font-medium text-muted-foreground">
                 {workflowActivityStateLabel(activity.state)}
               </span>
             </div>

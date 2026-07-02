@@ -427,6 +427,25 @@ ToolHandler = Callable[[dict[str, Any], ToolExecutionContext], dict[str, Any]]
 def _generate_pine_tool(arguments: dict[str, Any], context: ToolExecutionContext) -> dict[str, Any]:
     strategy_spec = arguments["strategy_spec"]
     pine_code = generate_pine(strategy_spec)
+    return persist_generated_pine_artifact(
+        context,
+        strategy_spec=strategy_spec,
+        pine_code=pine_code,
+        source="llm_orchestrator.generate_pine",
+        validation_source="llm_orchestrator.generate_pine.static_validation",
+        review_source="llm_orchestrator.generate_pine.static_review",
+    )
+
+
+def persist_generated_pine_artifact(
+    context: ToolExecutionContext,
+    *,
+    strategy_spec: dict[str, Any],
+    pine_code: str,
+    source: str,
+    validation_source: str,
+    review_source: str,
+) -> dict[str, Any]:
     context.repository.create_strategy_spec(
         context.auth,
         context.run.id,
@@ -440,12 +459,14 @@ def _generate_pine_tool(arguments: dict[str, Any], context: ToolExecutionContext
         display_name="strategy.pine",
         relative_path=PINE_STRATEGY_PATH,
         content=pine_code,
-        source="llm_orchestrator.generate_pine",
+        source=source,
     )
     validation_summary = run_chat_artifact_validation_summary(
         context,
         strategy_spec=strategy_spec,
         pine_code=pine_code,
+        validation_source=validation_source,
+        review_source=review_source,
     )
     return {
         "pine_code": pine_code,
@@ -497,17 +518,19 @@ def run_chat_artifact_validation_summary(
     *,
     strategy_spec: dict[str, Any],
     pine_code: str,
+    validation_source: str = "llm_orchestrator.generate_pine.static_validation",
+    review_source: str = "llm_orchestrator.generate_pine.static_review",
 ) -> dict[str, Any]:
     validation, validation_artifact_id = _persist_chat_validation_summary(
         context,
         strategy_spec=strategy_spec,
         pine_code=pine_code,
-        source="llm_orchestrator.generate_pine.static_validation",
+        source=validation_source,
     )
     review_report, review_artifact_id = _persist_chat_review_summary(
         context,
         validation=validation,
-        source="llm_orchestrator.generate_pine.static_review",
+        source=review_source,
     )
     evaluator_summary = _persist_chat_evaluator_optimizer_summary(
         context,
@@ -1831,19 +1854,36 @@ def _raise_pine_validation_error(
 def _validation_failure_summary(validation: dict[str, Any]) -> dict[str, Any]:
     errors = validation.get("errors")
     diagnostics = validation.get("diagnostics")
+    checks = validation.get("checks")
     issue_count = 0
     if isinstance(errors, list):
         issue_count += len(errors)
     if isinstance(diagnostics, list):
         issue_count += len(diagnostics)
+    failed_checks = [
+        check
+        for check in checks
+        if isinstance(check, dict) and check.get("status") == "fail"
+    ] if isinstance(checks, list) else []
+    issue_count += len(failed_checks)
     summary: dict[str, Any] = {
         "validation_status": validation.get("status"),
         "validation_issue_count": issue_count,
     }
-    first_issue = _first_validation_issue(errors) or _first_validation_issue(diagnostics)
+    first_issue = _first_validation_issue(errors) or _first_validation_issue(diagnostics) or _first_validation_check_issue(failed_checks)
     if first_issue:
         summary["validation_first_issue"] = first_issue
     return summary
+
+
+def _first_validation_check_issue(value: list[dict[str, Any]]) -> str | None:
+    if not value:
+        return None
+    first = value[0]
+    name = first.get("name")
+    details = first.get("details")
+    parts = [part for part in (name, details) if isinstance(part, str) and part.strip()]
+    return ": ".join(parts)[:240] if parts else None
 
 
 def _first_validation_issue(value: Any) -> str | None:

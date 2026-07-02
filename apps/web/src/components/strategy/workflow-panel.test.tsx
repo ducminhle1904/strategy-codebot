@@ -74,6 +74,7 @@ describe("WorkflowPanel", () => {
       step_reasons: { generate_pine: "User asked to skip Pine." },
       required_fields: ["market", "symbol", "timeframe", "style", "risk_preference"],
       missing_fields: ["account_id"],
+      blocked_reason: "missing_strategy_inputs",
       evidence_status: "insufficient_evidence",
       start_allowed: false,
     });
@@ -86,17 +87,35 @@ describe("WorkflowPanel", () => {
     expect(screen.queryByText("Paper simulation only")).not.toBeInTheDocument();
     expect(screen.queryByText("No broker execution")).not.toBeInTheDocument();
     expect(screen.queryByText("Review-only evidence")).not.toBeInTheDocument();
+    expect(screen.queryByText("missing_strategy_inputs")).not.toBeInTheDocument();
     expect(screen.getByText("Draft strategy spec")).toBeInTheDocument();
     expect(screen.getByText("Skipped")).toBeInTheDocument();
     const skippedRow = container.querySelector('[data-workflow-step-id="generate_pine"]');
     const skippedMarker = skippedRow?.querySelector("span");
     expect(skippedRow?.getAttribute("data-workflow-step-status")).toBe("skipped");
     expect(skippedMarker?.className).not.toContain("bg-emerald-500");
-    expect(screen.getByText("Strategy inputs")).toBeInTheDocument();
-    expect(screen.getByText("Risk Preference")).toBeInTheDocument();
-    expect(screen.getByText("Paper setup")).toBeInTheDocument();
-    expect(screen.getByText("Waiting for fields")).toBeInTheDocument();
-    expect(screen.getByText("Account Id")).toBeInTheDocument();
+    expect(screen.queryByText("Strategy inputs")).not.toBeInTheDocument();
+    expect(screen.queryByText("Risk Preference")).not.toBeInTheDocument();
+    expect(screen.queryByText("Paper setup")).not.toBeInTheDocument();
+    expect(screen.queryByText("Waiting for fields")).not.toBeInTheDocument();
+    expect(screen.queryByText("Account Id")).not.toBeInTheDocument();
+  });
+
+  it("renders the active workflow step as running while the chat run is active", () => {
+    const workflow = normalizeWorkflowState({
+      workflow_id: "strategy_bot_simulation",
+      current_step: "draft_strategy_spec",
+      completed_steps: ["collect_strategy_inputs"],
+      evidence_status: "insufficient_evidence",
+      start_allowed: false,
+    });
+
+    expect(workflow).not.toBeNull();
+    const { container } = render(<WorkflowPanel isWorking workflow={workflow!} />);
+    const currentRow = container.querySelector('[data-workflow-step-id="draft_strategy_spec"]');
+
+    expect(currentRow?.getAttribute("data-workflow-step-status")).toBe("running");
+    expect(currentRow?.querySelector(".animate-spin")).not.toBeNull();
   });
 
   it("keeps the rail anchored outside the chat lane without fixed viewport positioning", () => {
@@ -116,7 +135,7 @@ describe("WorkflowPanel", () => {
     expect(rail?.className).not.toContain("fixed");
   });
 
-  it("renders workflow artifact refs and recent activity links", () => {
+  it("keeps workflow rail free of artifact and recent activity sections", () => {
     const onSelectArtifact = vi.fn();
     const workflow = normalizeWorkflowState({
       workflow_id: "strategy_bot_simulation",
@@ -148,16 +167,14 @@ describe("WorkflowPanel", () => {
       />
     );
 
-    expect(screen.getByText("Artifacts")).toBeInTheDocument();
-    expect(screen.getByText("Recent activity")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Pine Code Artifact Id" }));
-    fireEvent.click(screen.getByRole("button", { name: "validation.json" }));
-
-    expect(onSelectArtifact).toHaveBeenCalledWith("artifact_pine");
-    expect(onSelectArtifact).toHaveBeenCalledWith("artifact_validation");
+    expect(screen.queryByText("Artifacts")).not.toBeInTheDocument();
+    expect(screen.queryByText("Recent activity")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pine Code Artifact Id" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "validation.json" })).not.toBeInTheDocument();
+    expect(onSelectArtifact).not.toHaveBeenCalled();
   });
 
-  it("keeps workflow rail task rendering informational", () => {
+  it("keeps workflow rail free of task controls and task summaries", () => {
     const workflow = normalizeWorkflowState({
       workflow_id: "strategy_bot_simulation",
       current_step: "collect_strategy_inputs",
@@ -176,8 +193,8 @@ describe("WorkflowPanel", () => {
     expect(workflow).not.toBeNull();
     render(<WorkflowRail workflow={workflow!} />);
 
-    expect(screen.getByText("Tasks")).toBeInTheDocument();
-    expect(screen.getAllByText("Strategy inputs").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Tasks")).not.toBeInTheDocument();
+    expect(screen.queryByText("Strategy inputs")).not.toBeInTheDocument();
     expect(screen.queryByLabelText(/Symbol/i)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Submit/i })).not.toBeInTheDocument();
   });
@@ -217,6 +234,65 @@ describe("WorkflowPanel", () => {
     });
   });
 
+  it("renders the post-spec next action prompt from the workflow registry", () => {
+    const onSubmitTask = vi.fn();
+    const workflow = normalizeWorkflowState({
+      workflow_id: "strategy_bot_simulation",
+      current_step: "generate_pine",
+      completed_steps: ["collect_strategy_inputs", "draft_strategy_spec"],
+      tasks: [
+        {
+          id: "wft_next",
+          task_template_id: "review_strategy_spec_next_step",
+          status: "pending_user",
+        },
+      ],
+    });
+
+    expect(workflow).not.toBeNull();
+    render(<WorkflowTaskPrompt onSubmitTask={onSubmitTask} workflow={workflow!} />);
+
+    expect(screen.getByText("Strategy spec is ready. What should we do next?")).toBeInTheDocument();
+    expect(screen.getByText("1 of 1")).toBeInTheDocument();
+    expect(screen.getByText("Generate Pine Script")).toBeInTheDocument();
+    expect(screen.getByText("Revise strategy spec")).toBeInTheDocument();
+    expect(screen.getByText("Skip Pine")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Tell the model what to do differently")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Submit/i }));
+
+    expect(onSubmitTask).toHaveBeenCalledWith("wft_next", {
+      next_after_strategy_spec: "generate_pine",
+    });
+  });
+
+  it("renders the backtest preview choice as a blocking workflow prompt", () => {
+    const onSubmitTask = vi.fn();
+    const workflow = normalizeWorkflowState({
+      workflow_id: "strategy_bot_simulation",
+      current_step: "backtest_preview",
+      completed_steps: ["collect_strategy_inputs", "draft_strategy_spec", "generate_pine", "static_validation"],
+      tasks: [
+        {
+          id: "wft_backtest_choice",
+          task_template_id: "draft_only_backtest_choice",
+          status: "pending_user",
+        },
+      ],
+    });
+
+    expect(workflow).not.toBeNull();
+    render(<WorkflowTaskPrompt onSubmitTask={onSubmitTask} workflow={workflow!} />);
+
+    expect(screen.getByText("How should we handle the backtest preview for this draft?")).toBeInTheDocument();
+    expect(screen.getByText("Run preview")).toBeInTheDocument();
+    expect(screen.getByText("Draft only")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Submit/i }));
+
+    expect(onSubmitTask).toHaveBeenCalledWith("wft_backtest_choice", {
+      draft_only_choice: "run_preview",
+    });
+  });
+
   it("renders a second registered workflow without Strategy Bot-specific sections", () => {
     const workflow = normalizeWorkflowState(
       {
@@ -237,7 +313,7 @@ describe("WorkflowPanel", () => {
     expect(screen.getByText("Strategy Review")).toBeInTheDocument();
     expect(screen.getByText("Reviewable")).toBeInTheDocument();
     expect(screen.getByText("Not needed")).toBeInTheDocument();
-    expect(screen.getByText("Review inputs")).toBeInTheDocument();
+    expect(screen.queryByText("Review inputs")).not.toBeInTheDocument();
     expect(screen.queryByText("Paper setup")).not.toBeInTheDocument();
   });
 

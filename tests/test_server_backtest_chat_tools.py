@@ -14,6 +14,7 @@ from strategy_codebot.server.llm_tools import execute_tool
 from strategy_codebot.server.llm_tools import provider_tools
 from strategy_codebot.server.repository import AssistantRunRecord
 from strategy_codebot.server.repository import InMemoryConversationRepository
+from strategy_codebot.server.tool_errors import ToolExecutionError
 from tests.server_helpers import valid_spec
 
 
@@ -455,6 +456,17 @@ def test_pineforge_guardrail_ignores_blocked_construct_names_in_comments() -> No
     assert not any(check["name"] == "pineforge_blocked_constructs" and check["status"] == "fail" for check in report["checks"])
 
 
+def test_pineforge_guardrail_ignores_boundary_copy_in_string_literals() -> None:
+    report = validate_pineforge_pine(
+        PINEFORGE_STRATEGY
+        + '\nriskNote = "Paper simulation only. No broker execution, no live trading, no webhook deployment."\n',
+        valid_spec(),
+    )
+
+    assert report["status"] in {"pass", "manual_required"}
+    assert not any(check["name"] == "pineforge_blocked_constructs" and check["status"] == "fail" for check in report["checks"])
+
+
 def test_pineforge_guardrail_accepts_live_repair_diagnostic_sample() -> None:
     repaired = """//@version=6
 strategy("HTF RSI pullback", overlay=true)
@@ -520,6 +532,28 @@ strategy.exit("Exit", "Long", stop=close * 0.98, limit=close * 1.04)
     )
 
     assert not any(check["name"] == "pineforge_position_sizing" and check["status"] == "fail" for check in report["checks"])
+
+
+def test_create_backtest_plan_validation_error_counts_failed_checks(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    context, _repository = _tool_context(tmp_path)
+
+    try:
+        execute_tool(
+            "create_backtest_plan",
+            {
+                "prompt": "Backtest BTCUSDT 1h",
+                "strategy_spec": valid_spec(),
+                "pine_code": PINEFORGE_STRATEGY + "\nalert('live signal')\n",
+            },
+            context,
+        )
+    except ToolExecutionError as exc:
+        assert exc.details["validation_status"] == "fail"
+        assert exc.details["validation_issue_count"] >= 1
+        assert "pineforge_blocked_constructs" in exc.details["validation_first_issue"]
+    else:
+        raise AssertionError("Expected Pine validation failure")
 
 
 def test_create_backtest_plan_pineforge_requires_enabled_flag(tmp_path: Path, monkeypatch) -> None:

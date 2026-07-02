@@ -9,6 +9,7 @@ import {
 import {
   CHAT_ACTIVITY_COVERED_EVENT_TYPES,
   KNOWN_CHAT_ACTIVITY_EVENT_TYPES,
+  mapRunEventsToChatActivitiesByAssistantMessage,
   mapRunEventsToChatActivities,
 } from "./chat-activity";
 
@@ -25,6 +26,19 @@ function runEvent(type: string, payload: RunEvent["payload"] = null, runId = "ru
     sequence: 1,
     trace_id: "trace_1",
     type,
+  };
+}
+
+function sequencedRunEvent(
+  sequence: number,
+  type: string,
+  payload: RunEvent["payload"] = null,
+  runId = "run_1"
+): RunEvent {
+  return {
+    ...runEvent(type, payload, runId),
+    event_id: `evt_${sequence}_${type.replaceAll(".", "_")}`,
+    sequence,
   };
 }
 
@@ -71,6 +85,73 @@ describe("chat activity mapper", () => {
       title: "Registry activity label",
       toolName: "registry_tool",
     });
+  });
+
+  it("groups durable activities under their assistant message anchors", () => {
+    const events = [
+      sequencedRunEvent(1, "tool.started", { label: "Read strategy context", tool_id: "strategy_context" }, "run_a"),
+      sequencedRunEvent(2, "tool.completed", { label: "Read strategy context", tool_id: "strategy_context" }, "run_a"),
+      sequencedRunEvent(3, "tool.started", { label: "Indexing report", tool_id: "index_report" }, "run_b"),
+    ];
+    const anchors = new Map([
+      [events[0]!.event_id, "assistant_a"],
+      [events[1]!.event_id, "assistant_a"],
+      [events[2]!.event_id, "assistant_b"],
+    ]);
+
+    const grouped = mapRunEventsToChatActivitiesByAssistantMessage({
+      conversationEvents: events,
+      liveEvents: [],
+      resolveAnchorMessageId: (event) => anchors.get(event.event_id) ?? null,
+    });
+
+    expect(grouped.get("assistant_a")?.map((activity) => activity.title)).toEqual([
+      "Read strategy context",
+    ]);
+    expect(grouped.get("assistant_a")?.[0]?.state).toBe("output-available");
+    expect(grouped.get("assistant_b")?.map((activity) => activity.title)).toEqual([
+      "Indexing report",
+    ]);
+    expect(grouped.get("assistant_b")?.[0]?.state).toBe("input-available");
+  });
+
+  it("attaches unpersisted live activities to the active assistant message", () => {
+    const liveEvent = sequencedRunEvent(
+      1,
+      "tool.started",
+      { label: "Generate Pine strategy", tool_id: "generate_pine" },
+      "run_live"
+    );
+
+    const grouped = mapRunEventsToChatActivitiesByAssistantMessage({
+      activeAssistantMessageId: "pending-assistant-message",
+      conversationEvents: [],
+      liveEvents: [liveEvent],
+      resolveAnchorMessageId: () => null,
+    });
+
+    expect(grouped.get("pending-assistant-message")?.map((activity) => activity.title)).toEqual([
+      "Generate Pine strategy",
+    ]);
+  });
+
+  it("does not duplicate live activities that are already durable", () => {
+    const durableEvent = sequencedRunEvent(
+      1,
+      "tool.started",
+      { label: "Indexing report", tool_id: "index_report" },
+      "run_a"
+    );
+
+    const grouped = mapRunEventsToChatActivitiesByAssistantMessage({
+      activeAssistantMessageId: "pending-assistant-message",
+      conversationEvents: [durableEvent],
+      liveEvents: [durableEvent],
+      resolveAnchorMessageId: () => "assistant_a",
+    });
+
+    expect(grouped.get("assistant_a")).toHaveLength(1);
+    expect(grouped.has("pending-assistant-message")).toBe(false);
   });
 
   it("renders run failures as error activities", () => {
@@ -518,9 +599,9 @@ describe("chat activity mapper", () => {
 
     expect(activities.map((activity) => activity.title)).toEqual([
       "Trying fallback route",
-      "Classifier route selected",
       "Model usage recorded",
     ]);
+    expect(activities.every((activity) => activity.title !== "Classifier route selected")).toBe(true);
     expect(JSON.stringify(activities)).not.toContain("paid_high");
     expect(JSON.stringify(activities)).not.toContain("paid_low");
     expect(JSON.stringify(activities)).not.toContain("paid-high-secret-alias");

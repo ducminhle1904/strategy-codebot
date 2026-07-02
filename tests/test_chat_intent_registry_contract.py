@@ -84,9 +84,9 @@ def test_chat_intent_registry_validator_rejects_unknown_stage_ref() -> None:
 def test_chat_intent_registry_validator_rejects_invalid_fallback_policy() -> None:
     module = sync_chat_intent_registry_module()
     contract = chat_intent_contract()
-    contract["classifier_fallback_policy"]["auto_chain_allowed"] = "yes"
+    contract["classifier_fallback_policy"]["safe_workflow_kickoff_allowed"] = "yes"
 
-    with pytest.raises(SystemExit, match="auto_chain_allowed must be boolean"):
+    with pytest.raises(SystemExit, match="safe_workflow_kickoff_allowed must be boolean"):
         module.validate_contract(contract, source="test-contract")
 
 

@@ -1,6 +1,20 @@
 import { Button } from "@/components/ui/button";
 import type { BacktestArtifactCardModel } from "@/lib/backtest-report";
 
+const SUPPRESSED_BACKTEST_BOUNDARY =
+  [
+    "Local sandbox preview only",
+    "not TradingView proof, broker proof, live trading evidence, or a profitability claim.",
+  ].join("; ");
+
+function visibleBacktestBoundary(value: string | null | undefined) {
+  const text = value?.trim();
+  if (!text || text === SUPPRESSED_BACKTEST_BOUNDARY) {
+    return null;
+  }
+  return text;
+}
+
 export function BacktestReportCard({
   isSubmittingFeedback,
   onFeedback,
@@ -11,6 +25,7 @@ export function BacktestReportCard({
   report: BacktestArtifactCardModel;
 }) {
   if (report.kind === "robustness_report") {
+    const boundary = visibleBacktestBoundary(report.boundary);
     return (
       <div className="space-y-3 rounded-[6px] border border-border bg-muted/20 p-3">
         <div className="flex items-start justify-between gap-3">
@@ -82,9 +97,11 @@ export function BacktestReportCard({
           </div>
         </div>
         <BacktestWarnings warnings={report.warnings} />
-        <p className="border-border border-t pt-2 text-muted-foreground text-xs">
-          {report.boundary ?? "Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, or a profitability claim."}
-        </p>
+        {boundary ? (
+          <p className="border-border border-t pt-2 text-muted-foreground text-xs">
+            {boundary}
+          </p>
+        ) : null}
       </div>
     );
   }
@@ -240,7 +257,7 @@ function readableLabel(value: string) {
 }
 
 function recommendationClassName(recommendation: string | null) {
-  const base = "shrink-0 rounded-[4px] border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.08em]";
+  const base = "shrink-0 rounded-[4px] border px-2 py-1 text-[10px] font-medium";
   if (recommendation === "reject_preview") {
     return `${base} border-red-500/40 bg-red-500/10 text-red-300`;
   }
@@ -251,7 +268,7 @@ function recommendationClassName(recommendation: string | null) {
 }
 
 function checkStatusClassName(status: "fail" | "pass" | "warn") {
-  const base = "w-fit rounded-[3px] px-1.5 py-0.5 font-medium uppercase tracking-[0.08em]";
+  const base = "w-fit rounded-[3px] px-1.5 py-0.5 font-medium";
   if (status === "fail") {
     return `${base} bg-red-500/10 text-red-300`;
   }

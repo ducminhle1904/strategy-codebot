@@ -16,6 +16,7 @@ import {
   isEmptyConversation,
   isRenderableMessage,
   latestAssistantAfterLastUser,
+  runEventAssistantAnchorMessageId,
   runEventMetadataByAnchorMessage,
   shouldShowStrategyProfile,
 } from "./chat-ui";
@@ -185,6 +186,75 @@ describe("chat UI helpers", () => {
 
     expect(metadata.get("msg_assistant")?.marketSnapshot?.symbol).toBe("ETH");
     expect(metadata.has("msg_user")).toBe(false);
+  });
+
+  it("finds the assistant anchor immediately after a run event", () => {
+    const anchorId = runEventAssistantAnchorMessageId({
+      backendMessages: [
+        backendMessage("msg_user", "user", "2026-06-21T11:44:44.000Z"),
+        backendMessage("msg_assistant", "assistant", "2026-06-21T11:44:58.000Z"),
+      ],
+      event: runEvent("tool.completed", "2026-06-21T11:44:55.000Z", {
+        output: { run_id: "run_backtest" },
+        tool_id: "get_backtest_summary",
+      }),
+    });
+
+    expect(anchorId).toBe("msg_assistant");
+  });
+
+  it("anchors post-response workflow updates to the assistant from the same turn", () => {
+    const metadata = runEventMetadataByAnchorMessage({
+      backendMessages: [
+        backendMessage("msg_user", "user", "2026-07-01T03:01:57.000Z"),
+        backendMessage(
+          "msg_assistant",
+          "assistant",
+          "2026-07-01T03:02:31.093Z"
+        ),
+      ],
+      events: [
+        runEvent("chat.workflow.updated", "2026-07-01T03:02:31.116Z", {
+          completed_steps: ["collect_strategy_inputs", "draft_strategy_spec"],
+          current_step: "generate_pine",
+          tasks: [
+            {
+              id: "wft_next",
+              status: "pending_user",
+              task_template_id: "review_strategy_spec_next_step",
+            },
+          ],
+          workflow_id: "strategy_bot_simulation",
+        }),
+      ],
+    });
+
+    const workflow = metadata.get("msg_assistant")?.workflow;
+    expect(workflow?.current_step).toBe("generate_pine");
+    expect(workflow?.completed_steps).toContain("draft_strategy_spec");
+  });
+
+  it("does not anchor post-response metadata across a newer user turn", () => {
+    const metadata = runEventMetadataByAnchorMessage({
+      backendMessages: [
+        backendMessage("msg_user", "user", "2026-07-01T03:01:57.000Z"),
+        backendMessage(
+          "msg_assistant",
+          "assistant",
+          "2026-07-01T03:02:31.093Z"
+        ),
+        backendMessage("msg_next_user", "user", "2026-07-01T03:03:00.000Z"),
+      ],
+      events: [
+        runEvent("chat.workflow.updated", "2026-07-01T03:04:00.000Z", {
+          completed_steps: ["collect_strategy_inputs", "draft_strategy_spec"],
+          current_step: "generate_pine",
+          workflow_id: "strategy_bot_simulation",
+        }),
+      ],
+    });
+
+    expect(metadata.has("msg_assistant")).toBe(false);
   });
 
   it("anchors persisted backtest summary tool output to the assistant message", () => {

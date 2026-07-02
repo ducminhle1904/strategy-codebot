@@ -41,6 +41,22 @@ function responseFromSseFrames(frames: string[]) {
   );
 }
 
+function delayedResponseFromSseFrames(frames: string[], delayMs: number) {
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const encoder = new TextEncoder();
+        for (const frame of frames) {
+          controller.enqueue(encoder.encode(frame));
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+        controller.close();
+      },
+    }),
+    { headers: { "Content-Type": "text/event-stream" } }
+  );
+}
+
 function stalledResponse() {
   cancelCount = 0;
   return new Response(
@@ -575,6 +591,61 @@ describe("/api/copilotkit-chat", () => {
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("custom_event_count=1"));
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("agent_status=completed"));
     expect(infoSpy).toHaveBeenCalledWith(expect.stringContaining("status=success"));
+  });
+
+  it("keeps the stream alive when safe reasoning arrives before text deltas", async () => {
+    vi.stubEnv("STRATEGY_CODEBOT_CHAT_FIRST_EVENT_TIMEOUT_MS", "30");
+    vi.stubEnv("STRATEGY_CODEBOT_CHAT_IDLE_TIMEOUT_MS", "30");
+    vi.stubEnv("STRATEGY_CODEBOT_CHAT_TOTAL_TIMEOUT_MS", "160");
+    const route = await import("./route");
+    streamMessageMock.mockResolvedValue(
+      delayedResponseFromSseFrames(
+        [
+          pythonSse({
+            data: { payload: { phase: "strategy_spec", safe: true, text: "Drafting the strategy spec." } },
+            event: "model.reasoning.delta",
+            id: "evt_reasoning",
+          }),
+          pythonSse({
+            data: { payload: { delta: "Strategy spec draft" } },
+            event: "message.delta",
+            id: "evt_delta",
+          }),
+          pythonSse({
+            data: { payload: { status: "completed" }, run_id: "run_1" },
+            event: "run.completed",
+            id: "evt_done",
+          }),
+        ],
+        10
+      )
+    );
+
+    const response = await route.POST(
+      new Request("http://localhost/api/copilotkit-chat", {
+        body: JSON.stringify({
+          forwardedProps: { conversationId: "conv_1", language: "en" },
+          messages: [{ content: "hello", role: "user" }],
+          runId: "run_client",
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      })
+    );
+    const events = await eventsFromResponse(response);
+
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "REASONING_MESSAGE_CONTENT" }),
+        expect.objectContaining({ delta: "Strategy spec draft", type: "TEXT_MESSAGE_CONTENT" }),
+        expect.objectContaining({ type: "RUN_FINISHED" }),
+      ])
+    );
+    expect(events).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "RUN_ERROR" }),
+      ])
+    );
   });
 
   it("streams workflow task continuation without requiring a user message", async () => {

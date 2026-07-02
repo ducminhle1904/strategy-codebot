@@ -26115,6 +26115,81 @@
       ],
       "created_at": "2026-06-29T15:07:43.414534+00:00",
       "last_used_at": "2026-06-29T15:07:43.414537+00:00"
+    },
+    "07331fef9cbcf0a20b76fb5fc04dade28d3d9826dfd74344b515b44dc2638fb2": {
+      "normalized_query": "pine script v6 rules and risk-policy guidance for btcusdt ema strategy",
+      "stage": null,
+      "embedding_provider": "local",
+      "embedding_model": "local/hash-embedding-64",
+      "knowledge_version": "1",
+      "embedding": [
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.53452248,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.26726124,
+        0.26726124,
+        0.0,
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.26726124,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "created_at": "2026-07-02T00:47:23.094536+00:00",
+      "last_used_at": "2026-07-02T00:47:23.094537+00:00"
     }
   },
   "stats": {
@@ -30045,7 +30120,7 @@
       },
       "cache_saved_ms": 31,
       "created_at": "2026-06-29T15:07:35.954777+00:00",
-      "last_used_at": "2026-06-30T02:32:54.070216+00:00"
+      "last_used_at": "2026-07-02T00:48:27.675008+00:00"
     },
     "fc2c499a0e733b29e18832545b159deb9a9b98aba0984f9609fcf701e8ab40bd": {
       "normalized_query": "create a pine strategy",
@@ -30470,7 +30545,7 @@
       },
       "cache_saved_ms": 10,
       "created_at": "2026-06-29T15:07:38.749513+00:00",
-      "last_used_at": "2026-06-30T04:47:54.644408+00:00"
+      "last_used_at": "2026-07-02T00:48:34.677868+00:00"
     },
     "02ba5b1ee93adc5a1dd20b5828e2580ca5830c4dc184667b0de495d202ea17e1": {
       "normalized_query": "create another pine strategy",
@@ -30885,7 +30960,7 @@
       },
       "cache_saved_ms": 11,
       "created_at": "2026-06-29T15:07:38.978197+00:00",
-      "last_used_at": "2026-06-30T04:47:54.267619+00:00"
+      "last_used_at": "2026-07-02T00:48:34.379850+00:00"
     },
     "46a05e6a030132a0af975b27eb8be1be69ff3e21e78b54c8c9b73a7973661656": {
       "normalized_query": "create a pine v6 strategy",
@@ -31310,7 +31385,448 @@
       },
       "cache_saved_ms": 12,
       "created_at": "2026-06-29T15:07:43.424010+00:00",
-      "last_used_at": "2026-06-30T02:33:01.305498+00:00"
+      "last_used_at": "2026-07-02T00:48:35.066219+00:00"
+    },
+    "e2276a9e16e0cbd98cd4c3dcd033da4f1e22d8f4d3fd219cbee8c54a808904de": {
+      "normalized_query": "pine script v6 rules and risk-policy guidance for btcusdt ema strategy",
+      "stage": null,
+      "knowledge_version": "1",
+      "options": {
+        "limit": 6,
+        "lexical_limit": 20,
+        "vector_limit": 20,
+        "max_chars_per_chunk": 900,
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "prefilter_limit": 200
+      },
+      "result": {
+        "status": "pass",
+        "index_ref": "knowledge/kb/index.json",
+        "index_id": "kb-3339e19d",
+        "knowledge_version": 1,
+        "retrieval_query": "Pine Script v6 rules and risk-policy guidance for BTCUSDT EMA strategy",
+        "intent": {
+          "tags": [
+            "crypto",
+            "indicator",
+            "pine",
+            "risk"
+          ],
+          "no_indicators": false
+        },
+        "expanded_terms": [],
+        "embedding_model": "local/hash-embedding-64",
+        "embedding_provider": "local",
+        "retrieval_latency_ms": 12,
+        "embedding_latency_ms": 8,
+        "db_search_latency_ms": 1,
+        "hybrid_candidate_count": 28,
+        "rerank_latency_ms": 0,
+        "cache_hit": false,
+        "cache_layer": "query_embedding",
+        "cache_key": "07331fef9cbcf0a20b76fb5fc04dade28d3d9826dfd74344b515b44dc2638fb2",
+        "cache_key_hash": "07331fef9cbcf0a20b76fb5fc04dade28d3d9826dfd74344b515b44dc2638fb2",
+        "cache_saved_ms": 0,
+        "cache_ttl_seconds": null,
+        "cache_bypass_reason": null,
+        "retrieval_cache_status": "miss",
+        "embedding_cache_status": "miss",
+        "knowledge_health_status": "not_applicable",
+        "retrieved_chunks": [
+          {
+            "chunk_id": "internal-trading-skill-integration#3-curated-skill-mapping-curated-skill-mapping-3",
+            "item_id": "internal-trading-skill-integration",
+            "source_id": "internal-trading-skill-integration",
+            "type": "strategy_pattern",
+            "title": "Internal Trading Skill Integration",
+            "text": "## Curated Skill Mapping\n\n- backtest-expert: prefer strategies that break less under stress, not strategies with the highest preview profit. Use sample size, slippage and fee stress, out-of-sample windows, and parameter robustness before treating a preview as useful evidence.\n- edge-strategy-reviewer: review edge plausibility, overfit risk, sample adequacy, regime dependency, exit calibration, risk concentration, execution realism, and invalidation quality.\n- technical-analyst: require a readable market thesis with trend or range context, support/resistance or structure, volume/liquidity assumption when relevant, pattern trigger, scenario expectation, target, and invalidation. Do not require chart images in this workflow.\n- position-sizer: survival-first sizing. Prefer fixed fractional risk such as 1% per trade, cap single-trade risk around 2%, consider portfolio heat, and apply the stri",
+            "truncated": true,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "validation",
+              "backtest",
+              "quality",
+              "learning_loop"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/trading-skill-integration.md",
+            "section_title": "Curated Skill Mapping",
+            "parent_title": "Curated Skill Mapping",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.190679,
+            "lexical_score": 12.0,
+            "vector_score": 0.547563,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.04,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.1
+            }
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#8-validation-checklist-validation-checklist-8",
+            "item_id": "internal-strategy-patterns",
+            "source_id": "internal-strategy-patterns",
+            "type": "strategy_pattern",
+            "title": "Internal Strategy Patterns",
+            "text": "## Validation Checklist\n\n- State market, timeframe, session, data source, and execution assumptions.\n- Include fees, spread, slippage, commission, and funding or rollover where relevant.\n- Test out-of-sample or walk-forward windows.\n- Review repaint/lookahead risk for Pine and platform-specific execution limits for MQL5.\n- Reject claims of guaranteed profit, no-loss behavior, or live-ready certification.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "price_action"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "section_title": "Validation Checklist",
+            "parent_title": "Validation Checklist",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.159877,
+            "lexical_score": 7.0,
+            "vector_score": 0.60499,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.04,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.07
+            }
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#2-boundary-boundary-2",
+            "item_id": "internal-strategy-patterns",
+            "source_id": "internal-strategy-patterns",
+            "type": "strategy_pattern",
+            "title": "Internal Strategy Patterns",
+            "text": "## Boundary\n\nPatterns describe design templates, not guarantees. Every generated strategy still needs explicit rules, risk limits, validation, and review before any live use.\nWhen a prompt asks for price action without exact rules, convert the request into observable market structure, invalidation, and execution assumptions before coding.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "price_action"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "section_title": "Boundary",
+            "parent_title": "Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.159199,
+            "lexical_score": 7.0,
+            "vector_score": 0.551318,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.04,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.07
+            }
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#9-experience-block-template-experience-block-template-9",
+            "item_id": "internal-strategy-patterns",
+            "source_id": "internal-strategy-patterns",
+            "type": "strategy_pattern",
+            "title": "Internal Strategy Patterns",
+            "text": "## Experience Block Template\n\n- When it works: name the regime, market, timeframe, and structural condition that makes the pattern plausible.\n- When it fails: name the regime shift, liquidity issue, or execution assumption that invalidates the pattern.\n- Required assumptions: state market, timeframe, data source, fees/spread/slippage, and invalidation.\n- Implementation traps: call out repaint, future pivots, vague candle language, and unstated session logic.\n- Validation checklist: include out-of-sample, walk-forward or regime split, and conservative execution costs.\n- Clarifying questions: ask only for missing assumptions that materially change code or risk.\n- Reject/repair triggers: no max loss, guaranteed profit claim, live-ready claim, or unlimited averaging.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "risk",
+              "anti_overfit",
+              "price_action"
+            ],
+            "market_tags": [
+              "general",
+              "crypto",
+              "forex"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "section_title": "Experience Block Template",
+            "parent_title": "Experience Block Template",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_coding",
+              "strategy_reasoning"
+            ],
+            "score": 0.148595,
+            "lexical_score": 6.0,
+            "vector_score": 0.559342,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.04,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.06
+            }
+          },
+          {
+            "chunk_id": "internal-crypto-playbook#4-crypto-specific-checks-crypto-specific-checks-4",
+            "item_id": "internal-crypto-playbook",
+            "source_id": "internal-crypto-playbook",
+            "type": "semantic",
+            "title": "Internal Crypto Playbook",
+            "text": "## Crypto-Specific Checks\n\n- Liquidity: confirm the symbol has enough volume for the intended timeframe and position size.\n- Perpetuals: account for funding windows, premium/discount behavior, and liquidation-driven wicks before treating a move as clean price action.\n- Exchange fragmentation: avoid assuming one exchange candle represents the full market for thin assets.\n- Weekend behavior: crypto trades continuously, so session filters should be explicit rather than copied from forex or equities.\n- Stablecoin and venue risk: do not treat all quote assets, exchanges, or liquidity pools as interchangeable.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "market_regime",
+              "liquidity",
+              "risk"
+            ],
+            "market_tags": [
+              "crypto"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/crypto-playbook.md",
+            "section_title": "Crypto-Specific Checks",
+            "parent_title": "Crypto-Specific Checks",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.144925,
+            "lexical_score": 7.0,
+            "vector_score": 0.0,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.04,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.07
+            }
+          },
+          {
+            "chunk_id": "internal-crypto-playbook#2-boundary-boundary-2",
+            "item_id": "internal-crypto-playbook",
+            "source_id": "internal-crypto-playbook",
+            "type": "semantic",
+            "title": "Internal Crypto Playbook",
+            "text": "## Boundary\n\nThis playbook is decision support for strategy design and review. It must not be used to claim that a crypto strategy is profitable, safe, or ready for live trading.",
+            "truncated": false,
+            "domain_tags": [
+              "strategy_design",
+              "market_regime",
+              "liquidity",
+              "risk"
+            ],
+            "market_tags": [
+              "crypto"
+            ],
+            "platform_tags": [
+              "general",
+              "pine_v6",
+              "mql5"
+            ],
+            "trust_level": "high",
+            "source_type": "internal",
+            "source_uri": "docs/trading/strategy-playbooks/crypto-playbook.md",
+            "section_title": "Boundary",
+            "parent_title": "Boundary",
+            "chunk_kind": "section",
+            "stages": [
+              "balanced_review",
+              "repair",
+              "strategy_reasoning"
+            ],
+            "score": 0.139462,
+            "lexical_score": 5.0,
+            "vector_score": 0.618284,
+            "rerank_features": {
+              "domain_overlap": 0.02,
+              "market_overlap": 0.04,
+              "expansion_bonus": 0.0,
+              "risk_policy_bonus": 0.0,
+              "metadata_penalty": 0.0,
+              "trust_penalty": 0.0,
+              "lexical_strength": 0.05
+            }
+          }
+        ],
+        "source_ids": [
+          "internal-crypto-playbook",
+          "internal-strategy-patterns",
+          "internal-trading-skill-integration"
+        ],
+        "citations": [
+          {
+            "chunk_id": "internal-trading-skill-integration#3-curated-skill-mapping-curated-skill-mapping-3",
+            "source_id": "internal-trading-skill-integration",
+            "title": "Internal Trading Skill Integration",
+            "source_uri": "docs/trading/strategy-playbooks/trading-skill-integration.md",
+            "trust_level": "high",
+            "section_title": "Curated Skill Mapping"
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#8-validation-checklist-validation-checklist-8",
+            "source_id": "internal-strategy-patterns",
+            "title": "Internal Strategy Patterns",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "trust_level": "high",
+            "section_title": "Validation Checklist"
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#2-boundary-boundary-2",
+            "source_id": "internal-strategy-patterns",
+            "title": "Internal Strategy Patterns",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "trust_level": "high",
+            "section_title": "Boundary"
+          },
+          {
+            "chunk_id": "internal-strategy-patterns#9-experience-block-template-experience-block-template-9",
+            "source_id": "internal-strategy-patterns",
+            "title": "Internal Strategy Patterns",
+            "source_uri": "docs/trading/strategy-playbooks/strategy-patterns.md",
+            "trust_level": "high",
+            "section_title": "Experience Block Template"
+          },
+          {
+            "chunk_id": "internal-crypto-playbook#4-crypto-specific-checks-crypto-specific-checks-4",
+            "source_id": "internal-crypto-playbook",
+            "title": "Internal Crypto Playbook",
+            "source_uri": "docs/trading/strategy-playbooks/crypto-playbook.md",
+            "trust_level": "high",
+            "section_title": "Crypto-Specific Checks"
+          },
+          {
+            "chunk_id": "internal-crypto-playbook#2-boundary-boundary-2",
+            "source_id": "internal-crypto-playbook",
+            "title": "Internal Crypto Playbook",
+            "source_uri": "docs/trading/strategy-playbooks/crypto-playbook.md",
+            "trust_level": "high",
+            "section_title": "Boundary"
+          }
+        ],
+        "filters_applied": {
+          "stage": null,
+          "market_tags": [
+            "crypto"
+          ],
+          "platform_tags": [
+            "pine"
+          ],
+          "status": [
+            "active",
+            "approved",
+            "auto_approved"
+          ],
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 90
+        },
+        "retrieval_confidence": {
+          "score": 0.804571,
+          "signals": {
+            "max_lexical_score": 12.0,
+            "max_vector_score": 0.618284,
+            "source_count": 3,
+            "metadata_match_count": 6,
+            "required_source_hit_count": 0
+          }
+        },
+        "low_confidence": false,
+        "missing_context": [],
+        "required_source_hits": [],
+        "metrics": {
+          "chunk_hit_rate": 1.0,
+          "source_coverage": 3,
+          "p95_target_ms": 300,
+          "embedding_latency_ms": 8,
+          "db_search_latency_ms": 1,
+          "embedding_cache_status": "miss",
+          "retrieval_cache_status": "miss",
+          "cache_layer": "query_embedding",
+          "knowledge_health_status": "not_applicable",
+          "prefilter_input_count": 111,
+          "prefilter_output_count": 90,
+          "retrieval_confidence": 0.804571
+        }
+      },
+      "cache_saved_ms": 12,
+      "created_at": "2026-07-02T00:47:23.103691+00:00",
+      "last_used_at": "2026-07-02T00:48:41.788612+00:00"
     }
   }
 }

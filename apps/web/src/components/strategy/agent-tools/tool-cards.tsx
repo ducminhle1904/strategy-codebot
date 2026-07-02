@@ -73,7 +73,7 @@ export function ToolStatusBadge({ status }: { status: ToolStatus }) {
   return (
     <span
       className={cn(
-        "rounded-[4px] border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.08em]",
+        "rounded-[4px] border px-2 py-1 text-[10px] font-medium",
         status === "complete" && "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
         status === "executing" && "border-blue-500/40 bg-blue-500/10 text-blue-300",
         status === "failed" && "border-red-500/40 bg-red-500/10 text-red-300",

@@ -64,6 +64,8 @@ export type MarketSnapshot = {
 
 export type SafeReasoningSummary = {
   text: string;
+  tool_id?: string;
+  workflow_step?: string;
 };
 
 export type ChatSuggestionKind = "artifact_action" | "chat_action" | "composer_block";
@@ -364,6 +366,8 @@ export function reasoningSummaryFromPythonEvent(
   }
   return {
     text,
+    ...(sourceText(record.tool_id) ? { tool_id: sourceText(record.tool_id) } : {}),
+    ...(sourceText(record.workflow_step) ? { workflow_step: sourceText(record.workflow_step) } : {}),
   };
 }
 

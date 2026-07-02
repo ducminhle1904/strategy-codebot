@@ -137,6 +137,10 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
         == "${BACKTEST_WORKER_DATA_FETCH_THROTTLE_MAX_KEYS:-10000}"
     )
     assert services["api"]["environment"]["STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED"] == "${STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED:-1}"
+    assert (
+        services["api"]["environment"]["STRATEGY_CODEBOT_API_DATABASE_URL"]
+        == "postgresql+psycopg://strategy_codebot:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/strategy_codebot"
+    )
     assert services["chat-worker"]["command"] == ["python", "-m", "strategy_codebot.server.chat_worker"]
     assert services["chat-worker"]["environment"]["STRATEGY_CODEBOT_CHAT_WORKER_LEASE_SECONDS"] == "${STRATEGY_CODEBOT_CHAT_WORKER_LEASE_SECONDS:-60}"
     assert services["chat-worker"]["depends_on"]["migration"]["condition"] == "service_completed_successfully"
@@ -287,6 +291,14 @@ def test_litellm_proxy_config_covers_registry_routes() -> None:
         for route in routes
         if route.startswith("litellm_proxy/")
     }
+    alias_stages: dict[str, set[str]] = {}
+    for tier_name, tier in registry["model_tiers"].items():
+        if tier_name == "free":
+            continue
+        for stage, routes in tier["routes_by_stage"].items():
+            for route in routes:
+                if route.startswith("litellm_proxy/"):
+                    alias_stages.setdefault(route.removeprefix("litellm_proxy/"), set()).add(stage)
     assert set(entries_by_alias) == expected_aliases | diagnostic_aliases
     assert all(len(entries_by_alias[alias]) >= 1 for alias in expected_aliases)
     assert len(entries_by_alias["diagnostics.vercel_gemini_flash_lite"]) == 1
@@ -325,9 +337,18 @@ def test_litellm_proxy_config_covers_registry_routes() -> None:
     assert all(entry["litellm_params"]["weight"] == 1 for _alias, entry in vercel_paid_entries)
     for entry in config["model_list"]:
         alias = entry["model_name"]
-        if alias.startswith(("paid_low.", "paid_medium.")):
-            params = entry["litellm_params"]
-            assert params["timeout"] == (85 if alias.endswith(("pine_code_generation", "pine_code_generation_qwen", "pine_code_generation_vercel", "repair", "repair_qwen", "repair_vercel")) else 55)
+        if alias in diagnostic_aliases:
+            continue
+        params = entry["litellm_params"]
+        if alias_stages.get(alias) == {"workflow_fast"}:
+            assert params["timeout"] == registry["stage_timeouts"]["workflow_fast"]
+        elif alias.startswith(("paid_low.", "paid_medium.")):
+            expected_timeout = (
+                85
+                if alias.endswith(("pine_code_generation", "pine_code_generation_qwen", "pine_code_generation_vercel", "repair", "repair_qwen", "repair_vercel"))
+                else 55
+            )
+            assert params["timeout"] == expected_timeout
     for entry in config["model_list"]:
         model = entry["litellm_params"]["model"]
         if "moonshotai/kimi" in model:
@@ -362,8 +383,20 @@ def test_paid_registry_routes_use_litellm_proxy_aliases_and_free_stays_direct() 
                     "litellm_proxy/paid_low.strategy_reasoning_vercel",
                     "litellm_proxy/paid_medium.strategy_reasoning",
                 ]
+            elif tier == "paid_low" and stage == "workflow_fast":
+                assert routes == [
+                    "litellm_proxy/paid_low.workflow_fast_gemini_flash",
+                    "litellm_proxy/paid_low.strategy_reasoning_gemini_lite",
+                    "litellm_proxy/paid_low.strategy_reasoning",
+                    "litellm_proxy/paid_medium.strategy_reasoning",
+                ]
             elif tier in {"paid_medium", "paid_high"} and stage == "classifier":
                 assert routes == [f"litellm_proxy/{tier}.strategy_reasoning"]
+            elif tier in {"paid_medium", "paid_high"} and stage == "workflow_fast":
+                assert routes == [
+                    f"litellm_proxy/{tier}.workflow_fast_gemini_flash",
+                    f"litellm_proxy/{tier}.strategy_reasoning",
+                ]
             elif tier == "paid_low" and stage == "strategy_coding":
                 assert routes == [
                     "litellm_proxy/paid_low.strategy_coding",

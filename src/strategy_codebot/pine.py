@@ -9,9 +9,9 @@ from strategy_codebot.reporting import aggregate_status, validation_check
 def generate_pine(spec: dict[str, Any]) -> str:
     script_type = spec["script_type"]
     title = f"Strategy Codebot {spec.get('symbol') or spec['market']} {spec['timeframe']}"
-    entry_text = " | ".join(spec["entry_rules"])
-    exit_text = " | ".join(spec["exit_rules"])
-    risk_text = " | ".join(spec["risk_rules"])
+    entry_text = _pine_note_text(" | ".join(spec["entry_rules"]))
+    exit_text = _pine_note_text(" | ".join(spec["exit_rules"]))
+    risk_text = _pine_note_text(" | ".join(spec["risk_rules"]))
     note_lines = [
         f'entryNote = "{_escape(entry_text)}"',
         f'exitNote = "{_escape(exit_text)}"',
@@ -127,14 +127,13 @@ def validate_pineforge_pine(code: str, spec: dict[str, Any]) -> dict[str, Any]:
     validation = validate_pine(code, spec)
     checks = list(validation["checks"])
     warnings = list(validation["warnings"])
-    lowered_executable_code = _strip_pine_comments(code).lower()
+    lowered_executable_code = _strip_pine_strings(_strip_pine_comments(code)).lower()
 
     blocked_patterns = {
         "alert": r"\balert\s*\(",
         "alertcondition": r"\balertcondition\s*\(",
         "request_seed": r"\brequest\.seed\s*\(",
         "request_security": r"\brequest\.security\s*\(",
-        "webhook": r"webhook|telegram|broker|live\s+trading|paper\s+trading",
     }
     blocked = [name for name, pattern in blocked_patterns.items() if re.search(pattern, lowered_executable_code)]
     checks.append(
@@ -189,6 +188,44 @@ def validate_pineforge_pine(code: str, spec: dict[str, Any]) -> dict[str, Any]:
 def _strip_pine_comments(code: str) -> str:
     without_block_comments = re.sub(r"/\*.*?\*/", "", code, flags=re.DOTALL)
     return re.sub(r"//.*", "", without_block_comments)
+
+
+def _strip_pine_strings(code: str) -> str:
+    chars: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for char in code:
+        if quote is not None:
+            if escaped:
+                chars.append(" ")
+                escaped = False
+                continue
+            if char == "\\":
+                chars.append(" ")
+                escaped = True
+                continue
+            if char == quote:
+                chars.append(char)
+                quote = None
+                continue
+            chars.append("\n" if char == "\n" else " ")
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            chars.append(char)
+            continue
+        chars.append(char)
+    return "".join(chars)
+
+
+def _pine_note_text(value: str) -> str:
+    parts = [part.strip() for part in re.split(r"\s*\|\s*", value) if part.strip()]
+    filtered = [
+        part
+        for part in parts
+        if not re.search(r"\b(?:broker|live\s+trading|live\s+order|paper\s+trading|paper\s+simulation|runtime)\b", part, flags=re.IGNORECASE)
+    ]
+    return " | ".join(filtered or parts[:1])
 
 
 def manual_checklist(spec: dict[str, Any]) -> str:

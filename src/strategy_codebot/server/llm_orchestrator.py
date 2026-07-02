@@ -1,6 +1,7 @@
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 import json
 import logging
 import os
@@ -13,6 +14,7 @@ from strategy_codebot.server.action_registry import ActionRegistryEvaluation
 from strategy_codebot.server.action_registry import ActionRegistryRequestCache
 from strategy_codebot.server.action_registry import evaluate_action_registry
 from strategy_codebot.server.action_registry import available_registry_tool_ids
+from strategy_codebot.server.action_registry import registry_entry_for_tool
 from strategy_codebot.server.agent_loop import AgentLoopBudget
 from strategy_codebot.server.agent_loop import BoundedScoutRunner
 from strategy_codebot.server.agent_logging import agent_log
@@ -46,6 +48,7 @@ from strategy_codebot.server.domain_intent_gate import normalize_workflow_intent
 from strategy_codebot.server.domain_intent_gate import precheck_domain_scope
 from strategy_codebot.server.domain_intent_gate import response_intent_allows_workflow
 from strategy_codebot.server.domain_intent_gate import should_block_domain_scope
+from strategy_codebot.server.domain_intent_gate import classifier_fallback_policy
 from strategy_codebot.server.domain_intent_gate import workflow_timeout_fallback_policy
 from strategy_codebot.server.domain_intent_gate import workflow_id_for_intent
 from strategy_codebot.server.domain_intent_gate import workflow_intent_policy
@@ -61,6 +64,7 @@ from strategy_codebot.server.llm_tools import ToolExecutionContext
 from strategy_codebot.server.llm_tools import TOOL_DEFINITIONS
 from strategy_codebot.server.llm_tools import compact_tool_output
 from strategy_codebot.server.llm_tools import execute_tool
+from strategy_codebot.server.llm_tools import persist_generated_pine_artifact
 from strategy_codebot.server.llm_tools import provider_tools
 from strategy_codebot.server.llm_tools import validate_tool_arguments
 from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
@@ -71,9 +75,11 @@ from strategy_codebot.server.market_data import market_data_context
 from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
 from strategy_codebot.server.model_routing import MODEL_STAGE_BALANCED_REVIEW
 from strategy_codebot.server.model_routing import MODEL_STAGE_CLASSIFIER
+from strategy_codebot.server.model_routing import MODEL_STAGE_WORKFLOW_FAST
 from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
 from strategy_codebot.server.model_routing import MODEL_STAGE_REPAIR
 from strategy_codebot.server.model_routing import MODEL_STAGE_STRATEGY_CODING
+from strategy_codebot.server.model_routing import PROVIDER_KEEPALIVE_EVENT
 from strategy_codebot.server.model_routing import PROVIDER_ROUTE_EVENT
 from strategy_codebot.server.model_audit import MODEL_ACTION_EXECUTED
 from strategy_codebot.server.model_audit import MODEL_ACTION_PROPOSED
@@ -103,6 +109,7 @@ from strategy_codebot.server.tool_errors import tool_failure_fields
 from strategy_codebot.server.redaction import redact_text
 from strategy_codebot.server.redaction import redact_value
 from strategy_codebot.server.repository import AssistantRunRecord
+from strategy_codebot.server.repository import ArtifactRecord
 from strategy_codebot.server.repository import ConversationRepository
 from strategy_codebot.server.runner_bridge import RunnerIntegrationResult
 from strategy_codebot.server.runner_bridge import execute_dry_run
@@ -123,8 +130,14 @@ from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_STEP
 from strategy_codebot.server.workflow_registry import validate_workflow_payload
 from strategy_codebot.server.workflow_registry import workflow_catalog_guidance
 from strategy_codebot.server.workflow_task_status import WORKFLOW_TASK_RESOLVED_STATUSES
+from strategy_codebot.server.workflow_prompt_generator import generate_workflow_task_prompt_payload
+from strategy_codebot.server.workflow_prompt_generator import workflow_prompt_generator_events
 from strategy_codebot.server.workflow_tasks import build_workflow_task_payload
 from strategy_codebot.server.workflow_tasks import normalize_workflow_tasks
+from strategy_codebot.server.workflow_tasks import STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE
+from strategy_codebot.server.workflow_tasks import STRATEGY_SPEC_NEXT_ACTION_SKIP_PINE
+from strategy_codebot.server.workflow_tasks import STRATEGY_SPEC_NEXT_STEP_TASK_ID
+from strategy_codebot.server.workflow_tasks import workflow_task_strategy_spec_next_action
 from strategy_codebot.server.workflow_tasks import workflow_task_state
 from strategy_codebot.prompt_contracts import STAGE_PINE_CODE_GENERATION
 from strategy_codebot.prompt_contracts import STAGE_STRATEGY_CODING
@@ -155,6 +168,17 @@ CLASSIFIER_EVENT_COMPLETED = "classifier.completed"
 CLASSIFIER_EVENT_TIMEOUT = "classifier.timeout"
 CLASSIFIER_EVENT_FAILED = "classifier.failed"
 WORKFLOW_TIMEOUT_FALLBACK_SOURCE = "workflow_timeout_fallback"
+WORKFLOW_CLASSIFIER_FALLBACK_SOURCE = "workflow_classifier_fallback"
+WORKFLOW_KICKOFF_FALLBACK_SOURCES = frozenset(
+    {
+        WORKFLOW_TIMEOUT_FALLBACK_SOURCE,
+        WORKFLOW_CLASSIFIER_FALLBACK_SOURCE,
+    }
+)
+CHAT_RESPONSE_MODEL_STAGES = CHAT_INTENT_MODEL_STAGES - {
+    MODEL_STAGE_CLASSIFIER,
+    MODEL_STAGE_WORKFLOW_FAST,
+}
 SAFE_CLASSIFIER_PROMPT_SUMMARY_SCALAR_KEYS = frozenset(
     {
         "action_count",
@@ -180,8 +204,13 @@ PROMPT_CHAIN_WORKFLOW = "strategy_prompt_chain"
 PROMPT_CHAIN_STARTED_EVENT = "prompt_chain.started"
 PROMPT_CHAIN_STAGE_COMPLETED_EVENT = "prompt_chain.stage_completed"
 PROMPT_CHAIN_COMPLETED_EVENT = "prompt_chain.completed"
+PROMPT_CHAIN_ROUTE_TIMEOUT_EVENT = "prompt_chain.route_timeout"
 PROMPT_CHAIN_FALLBACK_EVENT = "prompt_chain.fallback"
 PROMPT_CHAIN_FAILED_EVENT = "prompt_chain.failed"
+PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS_ENV = "STRATEGY_CODEBOT_PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS"
+PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS_ENV = "STRATEGY_CODEBOT_PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS"
+DEFAULT_PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS = 45.0
+DEFAULT_PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS = 15.0
 STRATEGY_PROMPT_CHAIN_SIZING_GUIDANCE = (
     "Use bounded position sizing such as fixed units or 1-2% account equity risk per trade; "
     "never use full-capital, all-in, or unbounded leverage assumptions."
@@ -220,6 +249,10 @@ SAFE_REASONING_LABELS = {
         "en": "Preparing the response.",
         "vi": "Đang chuẩn bị phản hồi.",
     },
+    "strategy_spec": {
+        "en": "Drafting the strategy spec.",
+        "vi": "Đang soạn strategy spec.",
+    },
     "retrieval": {
         "en": "Checking relevant knowledge.",
         "vi": "Đang kiểm tra knowledge context liên quan.",
@@ -227,6 +260,10 @@ SAFE_REASONING_LABELS = {
     "tool": {
         "en": "Running the required support step.",
         "vi": "Đang chạy bước hỗ trợ cần thiết.",
+    },
+    "backtest": {
+        "en": "Preparing Backtest Preview.",
+        "vi": "Đang chuẩn bị Backtest Preview.",
     },
 }
 
@@ -294,11 +331,15 @@ class ClassifierRouteCaptureClient:
         *,
         stage: str,
         route_timeout_seconds: float | None,
+        auth: AuthContext | None = None,
+        user_tier: str | None = None,
     ) -> None:
         self.client = client
         self.model = getattr(client, "model", "classifier-route-capture")
         self.stage = stage
         self.route_timeout_seconds = route_timeout_seconds
+        self.auth = auth
+        self.user_tier = user_tier
         self.route_events: list[dict[str, Any]] = []
 
     def ensure_configured(self) -> None:
@@ -312,10 +353,15 @@ class ClassifierRouteCaptureClient:
         routing_context: dict[str, Any] | None = None,
     ) -> Iterable[LLMClientEvent]:
         context = dict(routing_context or {})
-        context.setdefault("stage", self.stage)
+        context["stage"] = self.stage
+        if self.auth is not None:
+            context["auth"] = self.auth
+            context["user_tier"] = self.auth.user_tier
+        elif self.user_tier:
+            context["user_tier"] = self.user_tier
         if self.route_timeout_seconds is not None:
-            context.setdefault("route_timeout_seconds", self.route_timeout_seconds)
-            context.setdefault("hard_route_timeout", True)
+            context["route_timeout_seconds"] = self.route_timeout_seconds
+            context["hard_route_timeout"] = True
         for event in _stream_client(self.client, messages=messages, tools=tools, routing_context=context):
             if event.type == PROVIDER_ROUTE_EVENT and isinstance(event.arguments, dict):
                 self.route_events.append(dict(event.arguments))
@@ -468,6 +514,28 @@ def _classifier_route_timeout_env_name(classifier_name: str | None) -> str:
     return f"{CLASSIFIER_ROUTE_TIMEOUT_SECONDS_ENV}_{normalized}"
 
 
+def _prompt_chain_route_timeout_seconds() -> float:
+    raw = os.getenv(PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return DEFAULT_PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS
+    return timeout if timeout > 0 else DEFAULT_PROMPT_CHAIN_ROUTE_TIMEOUT_SECONDS
+
+
+def _prompt_chain_route_keepalive_seconds() -> float:
+    raw = os.getenv(PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return DEFAULT_PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS
+    return timeout if timeout > 0 else DEFAULT_PROMPT_CHAIN_ROUTE_KEEPALIVE_SECONDS
+
+
 def _classifier_event_payload(
     run: AssistantRunRecord,
     *,
@@ -579,7 +647,7 @@ class ResponseIntentClassifier:
                     {"role": "user", "content": message_content[:2000]},
                 ],
                 tools=[],
-                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
+                routing_context={"stage": MODEL_STAGE_WORKFLOW_FAST},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -708,6 +776,8 @@ class ChatIntentDecision:
 @dataclass(frozen=True)
 class _StrategyPromptChainResult:
     final_text: str
+    strategy_spec: dict[str, Any]
+    pine_code: str
 
 
 class ChatIntentDecisionPlanner:
@@ -851,7 +921,7 @@ class ChatIntentDecisionPlanner:
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                 ],
                 tools=[],
-                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
+                routing_context={"stage": MODEL_STAGE_WORKFLOW_FAST},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -949,7 +1019,7 @@ class ActionPlanner:
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                 ],
                 tools=[],
-                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
+                routing_context={"stage": MODEL_STAGE_WORKFLOW_FAST},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)
@@ -1002,12 +1072,14 @@ class LLMOrchestrator:
         current_message_id: str | None = None,
         language: str = "en",
         request_id: str | None = None,
+        selected_action: dict[str, Any] | None = None,
         trace_id: str | None = None,
         web_search: str = "auto",
         workflow_task_resume: dict[str, Any] | None = None,
     ) -> Iterator[str]:
         language = _normalize_language(language)
         web_search = _normalize_web_search(web_search)
+        selected_action_payload = selected_action if isinstance(selected_action, dict) else None
         workflow_task_resume_payload = workflow_task_resume if isinstance(workflow_task_resume, dict) else None
         run = self.repository.create_run(
             auth,
@@ -1070,15 +1142,16 @@ class LLMOrchestrator:
             }
             policy_capture_client = ClassifierRouteCaptureClient(
                 self.client,
-                stage=MODEL_STAGE_CLASSIFIER,
+                stage=MODEL_STAGE_WORKFLOW_FAST,
                 route_timeout_seconds=_classifier_route_timeout_seconds(classifier_name),
+                auth=auth,
             )
             pre_response_frames.append(
                 self._classifier_started_frame(
                     auth,
                     run,
                     classifier_name=classifier_name,
-                    stage=MODEL_STAGE_CLASSIFIER,
+                    stage=MODEL_STAGE_WORKFLOW_FAST,
                     timeout_seconds=_classifier_timeout_seconds(classifier_name),
                     prompt_summary=policy_prompt_summary,
                 )
@@ -1104,7 +1177,7 @@ class LLMOrchestrator:
                     auth,
                     run,
                     classifier_name=classifier_name,
-                    stage=MODEL_STAGE_CLASSIFIER,
+                    stage=MODEL_STAGE_WORKFLOW_FAST,
                     capture_client=policy_capture_client,
                     outcome=policy_outcome,
                     prompt_summary=policy_prompt_summary,
@@ -1203,30 +1276,58 @@ class LLMOrchestrator:
                 + _token_estimate(backtest_live_context),
                 prior_context_text=f"{conversation_context.prior_context_text}\n{backtest_live_context}",
             )
+        durable_artifact_context = _latest_strategy_artifact_context_text(
+            self.repository,
+            auth,
+            conversation_id,
+        )
+        if durable_artifact_context:
+            conversation_context = replace(
+                conversation_context,
+                messages=_insert_system_context(
+                    conversation_context.messages,
+                    f"<current_strategy_artifact>\n{durable_artifact_context}\n</current_strategy_artifact>",
+                ),
+                estimated_input_tokens=conversation_context.estimated_input_tokens
+                + _token_estimate(durable_artifact_context),
+                prior_context_text=f"{conversation_context.prior_context_text}\n{durable_artifact_context}",
+            )
         suggestion_context_text = conversation_context.prior_context_text
         context_guard_message = _missing_current_context_message(
             message_content,
             conversation_context.prior_context_text,
             language,
         )
+        workflow_task_values: dict[str, Any] = {}
+        if workflow_task_resume_payload is not None:
+            workflow_task_values = _workflow_task_values_for_conversation(
+                self.repository,
+                auth,
+                conversation_id,
+                STRATEGY_BOT_WORKFLOW_ID,
+            )
+            payload_values = workflow_task_resume_payload.get("values")
+            if isinstance(payload_values, dict):
+                workflow_task_values.update(payload_values)
+            workflow_task_context_text = _workflow_task_values_context_text(workflow_task_values)
+            if workflow_task_context_text:
+                workflow_task_context_block = (
+                    "<workflow_task_values>\n"
+                    f"{workflow_task_context_text}\n"
+                    "</workflow_task_values>"
+                )
+                conversation_context = replace(
+                    conversation_context,
+                    messages=_insert_system_context(conversation_context.messages, workflow_task_context_block),
+                    estimated_input_tokens=conversation_context.estimated_input_tokens
+                    + _token_estimate(workflow_task_context_block),
+                    prior_context_text=f"{conversation_context.prior_context_text}\n{workflow_task_context_text}",
+                )
+                suggestion_context_text = conversation_context.prior_context_text
+        chat_action_evaluation: ActionRegistryEvaluation | None = None
         if workflow_task_resume_payload is not None:
             context_guard_message = None
-            resume_intent = workflow_task_resume_payload.get("resume_intent")
-            if not isinstance(resume_intent, str) or resume_intent not in RESPONSE_INTENTS:
-                resume_intent = "strategy_building"
-            chat_decision = ChatIntentDecision(
-                response_intent=resume_intent,
-                action="answer",
-                model_stage=_model_stage_for_intent(resume_intent),
-                confidence=1.0,
-                source="workflow_task_resume",
-                auto_chain=False,
-                current_context_required=False,
-                domain_scope="trading_workflow",
-                workflow_intent="strategy_to_paper_bot_simulation",
-                reasons=("Resuming from a completed workflow task.",),
-                used_signals=("workflow_task_resume",),
-            )
+            chat_decision = _workflow_task_resume_chat_decision(workflow_task_resume_payload)
         elif context_guard_message is not None:
             chat_decision = ChatIntentDecision(
                 response_intent="artifact_generation",
@@ -1254,15 +1355,16 @@ class LLMOrchestrator:
             }
             chat_capture_client = ClassifierRouteCaptureClient(
                 self.client,
-                stage=MODEL_STAGE_CLASSIFIER,
+                stage=MODEL_STAGE_WORKFLOW_FAST,
                 route_timeout_seconds=_classifier_route_timeout_seconds(classifier_name),
+                auth=auth,
             )
             pre_response_frames.append(
                 self._classifier_started_frame(
                     auth,
                     run,
                     classifier_name=classifier_name,
-                    stage=MODEL_STAGE_CLASSIFIER,
+                    stage=MODEL_STAGE_WORKFLOW_FAST,
                     timeout_seconds=_classifier_timeout_seconds(classifier_name),
                     prompt_summary=chat_prompt_summary,
                 )
@@ -1288,7 +1390,7 @@ class LLMOrchestrator:
                     auth,
                     run,
                     classifier_name=classifier_name,
-                    stage=MODEL_STAGE_CLASSIFIER,
+                    stage=MODEL_STAGE_WORKFLOW_FAST,
                     capture_client=chat_capture_client,
                     outcome=chat_outcome,
                     prompt_summary=chat_prompt_summary,
@@ -1296,9 +1398,21 @@ class LLMOrchestrator:
             )
             chat_decision = chat_outcome.value
             if chat_outcome.status == "timeout":
-                workflow_timeout_decision = _workflow_timeout_fallback_decision(message_content)
-                if workflow_timeout_decision is not None:
-                    chat_decision = workflow_timeout_decision
+                workflow_fallback_decision = _workflow_kickoff_fallback_decision(
+                    message_content,
+                    source=WORKFLOW_TIMEOUT_FALLBACK_SOURCE,
+                )
+                if workflow_fallback_decision is not None:
+                    chat_decision = workflow_fallback_decision
+            elif chat_outcome.status == "failed" or (
+                chat_decision.source == "fallback" and not chat_decision.workflow_intent
+            ):
+                workflow_fallback_decision = _workflow_kickoff_fallback_decision(
+                    message_content,
+                    source=WORKFLOW_CLASSIFIER_FALLBACK_SOURCE,
+                )
+                if workflow_fallback_decision is not None:
+                    chat_decision = workflow_fallback_decision
         if chat_decision.source == "llm":
             yield self._append_audit_frame(
                 auth,
@@ -1321,6 +1435,19 @@ class LLMOrchestrator:
                     },
                 },
             )
+        selected_action_plan = _selected_action_plan(
+            selected_action_payload,
+            repository=self.repository,
+            artifact_store=self.artifact_store,
+            auth=auth,
+            conversation_id=conversation_id,
+            message_content=message_content,
+            artifact_kinds=artifact_kinds,
+            context_text=f"{suggestion_context_text}\n{message_content}",
+            web_search=web_search,
+            action_evaluation=chat_action_evaluation,
+        )
+        chat_decision = _chat_decision_for_selected_action(chat_decision, selected_action_plan)
         if should_block_domain_scope(chat_decision.domain_scope, chat_decision.confidence):
             yield from self._domain_scope_blocked(
                 auth=auth,
@@ -1371,9 +1498,12 @@ class LLMOrchestrator:
             _action_planner_enabled()
             and context_guard_message is None
             and workflow_task_resume_payload is None
+            and selected_action_plan is None
             and not _is_classifier_fallback_source(chat_decision.source)
         )
-        if should_run_action_planner:
+        if selected_action_plan is not None:
+            action_plan = selected_action_plan
+        elif should_run_action_planner:
             classifier_name = "action_planner"
             action_planner_context_text = f"{suggestion_context_text}\n{message_content}"
             action_planner_evaluation = action_registry_cache.get(
@@ -1389,15 +1519,16 @@ class LLMOrchestrator:
             }
             action_capture_client = ClassifierRouteCaptureClient(
                 self.client,
-                stage=MODEL_STAGE_CLASSIFIER,
+                stage=MODEL_STAGE_WORKFLOW_FAST,
                 route_timeout_seconds=_classifier_route_timeout_seconds(classifier_name),
+                auth=auth,
             )
             pre_response_frames.append(
                 self._classifier_started_frame(
                     auth,
                     run,
                     classifier_name=classifier_name,
-                    stage=MODEL_STAGE_CLASSIFIER,
+                    stage=MODEL_STAGE_WORKFLOW_FAST,
                     timeout_seconds=_classifier_timeout_seconds(classifier_name),
                     prompt_summary=action_prompt_summary,
                 )
@@ -1423,7 +1554,7 @@ class LLMOrchestrator:
                     auth,
                     run,
                     classifier_name=classifier_name,
-                    stage=MODEL_STAGE_CLASSIFIER,
+                    stage=MODEL_STAGE_WORKFLOW_FAST,
                     capture_client=action_capture_client,
                     outcome=action_outcome,
                     prompt_summary=action_prompt_summary,
@@ -1431,7 +1562,10 @@ class LLMOrchestrator:
             )
             action_plan = action_outcome.value
         else:
-            action_plan = ActionPlanDecision("answer", "none", 0.0, "none")
+            action_plan = _workflow_task_resume_action_plan(
+                workflow_task_resume_payload,
+                workflow_task_values,
+            ) or ActionPlanDecision("answer", "none", 0.0, "none")
         workflow_payload = _maybe_strategy_bot_workflow_payload(
             repository=self.repository,
             auth=auth,
@@ -1440,6 +1574,11 @@ class LLMOrchestrator:
             message_content=message_content,
             context_text=suggestion_context_text,
             artifact_kinds=artifact_kinds,
+            structured_strategy_values=workflow_task_values,
+            completed_strategy_spec=(
+                workflow_task_resume_payload is not None
+                and workflow_task_resume_payload.get("task_template_id") == STRATEGY_SPEC_NEXT_STEP_TASK_ID
+            ),
         )
         suggestions_action_evaluation = action_registry_cache.get(
             artifact_kinds=artifact_kinds,
@@ -1527,8 +1666,8 @@ class LLMOrchestrator:
                     run,
                     MODEL_ACTION_PROPOSED,
                     {
-                        "actor": "model",
-                        "source": "planner",
+                        "actor": "user" if action_plan.source == "selected_action" else "model",
+                        "source": action_plan.source if action_plan.source == "selected_action" else "planner",
                         "status": "proposed",
                         "intent_id": action_plan.intent_id,
                         "decision": action_plan.decision,
@@ -1540,7 +1679,13 @@ class LLMOrchestrator:
                     },
                 )
             if workflow_payload is not None:
-                workflow_payload = self._sync_workflow_tasks(auth, run, workflow_payload)
+                workflow_payload = self._sync_workflow_tasks(
+                    auth,
+                    run,
+                    workflow_payload,
+                    language=language,
+                    user_prompt=message_content,
+                )
                 yield self._append_frame(auth, run, STRATEGY_WORKFLOW_EVENT, workflow_payload)
                 if _workflow_payload_has_blocking_user_task(workflow_payload):
                     yield self._append_frame(auth, run, SUGGESTIONS_EVENT, suggestions_payload)
@@ -1607,6 +1752,32 @@ class LLMOrchestrator:
                 yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
                 return
 
+            artifact_evidence = _latest_artifact_evidence_followup(
+                self.repository,
+                auth,
+                conversation_id,
+                message_content,
+                language=language,
+            )
+            if artifact_evidence is not None:
+                for event_type, payload in artifact_evidence["events"]:
+                    yield self._append_frame(auth, run, event_type, payload)
+                evidence_text = _sanitize_user_facing_model_text(redact_text(artifact_evidence["text"]))
+                self.repository.create_message(auth, conversation_id, evidence_text, role="assistant")
+                yield self._safe_reasoning_frame(auth, run, "finalizing", language)
+                yield self._append_frame(
+                    auth,
+                    run,
+                    LLM_EVENT_MESSAGE_DELTA,
+                    {"text": evidence_text, "compact": True, "source": "artifact_evidence_followup"},
+                )
+                terminal_status = "completed"
+                completed = self.repository.set_run_status(auth, run.id, terminal_status)
+                append_stage_event(self.repository, auth, completed or run, "response_finalization", 0, status=terminal_status)
+                yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
+                self._maybe_compact_conversation(auth, conversation_id, run.id, language=language)
+                return
+
             if should_use_bounded_scout(message_content, response_intent=response_intent):
                 yield from self._run_bounded_scout(
                     auth=auth,
@@ -1639,6 +1810,7 @@ class LLMOrchestrator:
                     context_text=suggestion_context_text,
                     web_search=web_search,
                     language=language,
+                    workflow_intent=chat_decision.workflow_intent,
                 )
                 if not budget.blocked:
                     tool_only_text = _tool_only_success_message(
@@ -1657,6 +1829,22 @@ class LLMOrchestrator:
                 terminal_status = "blocked" if budget.blocked else "completed"
                 completed = self.repository.set_run_status(auth, run.id, terminal_status)
                 append_stage_event(self.repository, auth, completed or run, "response_finalization", 0, status=terminal_status)
+                if workflow_task_resume_payload is not None:
+                    continuation_event = (
+                        "workflow.continuation.completed"
+                        if terminal_status == "completed"
+                        else "workflow.continuation.failed"
+                    )
+                    yield self._append_frame(
+                        auth,
+                        completed or run,
+                        continuation_event,
+                        {
+                            **workflow_task_resume_payload,
+                            "source": "workflow_task_resume",
+                            "status": terminal_status,
+                        },
+                    )
                 yield self._append_frame(auth, completed or run, "run.completed", {"status": terminal_status})
                 if terminal_status == "completed":
                     self._maybe_compact_conversation(auth, conversation_id, run.id, language=language)
@@ -1724,6 +1912,34 @@ class LLMOrchestrator:
                     budget.blocked = True
                     yield from self._policy_blocked(auth, run, None, finding, language=language)
                 else:
+                    if self.artifact_store is None:
+                        raise RuntimeError("artifact_store_required_for_prompt_chain_artifact")
+                    pre_artifact_events = self.repository.list_run_events(auth, run.id) or []
+                    pre_artifact_sequence = pre_artifact_events[-1].sequence if pre_artifact_events else 0
+                    artifact_result = persist_generated_pine_artifact(
+                        ToolExecutionContext(
+                            repository=self.repository,
+                            artifact_store=self.artifact_store,
+                            auth=auth,
+                            run=run,
+                        ),
+                        strategy_spec=chain_result.strategy_spec,
+                        pine_code=chain_result.pine_code,
+                        source="llm_orchestrator.prompt_chain",
+                        validation_source="llm_orchestrator.prompt_chain.static_validation",
+                        review_source="llm_orchestrator.prompt_chain.static_review",
+                    )
+                    yield from self._stream_existing_run_events_after(auth, run, pre_artifact_sequence)
+                    artifact_id = _safe_string(artifact_result.get("artifact_id"))
+                    if artifact_id:
+                        budget.completed_tool_results.append(
+                            {
+                                "tool_id": "prompt_chain_pine_generation",
+                                "arguments": {"strategy_spec": chain_result.strategy_spec},
+                                "output": compact_tool_output(artifact_result),
+                            }
+                        )
+                    artifact_kinds.update(_current_run_user_artifact_kinds(self.repository, auth, run.id))
                     accumulated_text.append(chain_text)
             if chain_result is None and not budget.blocked:
                 for event in _stream_client(
@@ -1746,10 +1962,12 @@ class LLMOrchestrator:
                         context_text=suggestion_context_text,
                         web_search=web_search,
                         language=language,
+                        workflow_intent=chat_decision.workflow_intent,
                     )
                     if budget.blocked:
                         break
             append_stage_event(self.repository, auth, run, "model", model_timer.elapsed_ms())
+            completed_strategy_spec_response = False
             if accumulated_text and not budget.blocked:
                 final_text = "".join(accumulated_text)
                 final_text = _maybe_backtest_summary_response(
@@ -1805,6 +2023,11 @@ class LLMOrchestrator:
                     LLM_EVENT_MESSAGE_DELTA,
                     {"text": final_text, "compact": True},
                 )
+                completed_strategy_spec_response = (
+                    workflow_task_resume_payload is not None
+                    and workflow_task_resume_payload.get("task_template_id") == "collect_strategy_inputs"
+                    and response_intent == "strategy_building"
+                )
             elif budget.executed_tool_calls > 0 and not budget.blocked:
                 tool_only_text = budget.auto_chain_failure_text or _tool_only_success_message(
                     budget.completed_tool_ids,
@@ -1819,6 +2042,32 @@ class LLMOrchestrator:
                     LLM_EVENT_MESSAGE_DELTA,
                     {"text": tool_only_text, "compact": True, "source": "tool_only_success_fallback"},
                 )
+            if completed_strategy_spec_response:
+                advanced_workflow_payload = _maybe_strategy_bot_workflow_payload(
+                    repository=self.repository,
+                    auth=auth,
+                    conversation_id=conversation_id,
+                    chat_decision=chat_decision,
+                    message_content=message_content,
+                    context_text=suggestion_context_text,
+                    artifact_kinds=artifact_kinds,
+                    structured_strategy_values=workflow_task_values,
+                    completed_strategy_spec=True,
+                )
+                if advanced_workflow_payload is not None:
+                    advanced_workflow_payload = self._sync_workflow_tasks(
+                        auth,
+                        run,
+                        advanced_workflow_payload,
+                        language=language,
+                        user_prompt=message_content,
+                    )
+                    yield self._append_frame(
+                        auth,
+                        run,
+                        STRATEGY_WORKFLOW_EVENT,
+                        advanced_workflow_payload,
+                    )
             terminal_status = "blocked" if budget.blocked else "completed"
             completed = self.repository.set_run_status(auth, run.id, terminal_status)
             append_stage_event(self.repository, auth, completed or run, "response_finalization", 0, status=terminal_status)
@@ -2006,20 +2255,55 @@ class LLMOrchestrator:
                 conservative_sizing_guidance=STRATEGY_PROMPT_CHAIN_SIZING_GUIDANCE,
                 repair_iteration=None,
             )
+            heartbeat_phase = "artifact" if stage == STAGE_PINE_CODE_GENERATION else "strategy_spec"
+            heartbeat_step = "generate_pine" if stage == STAGE_PINE_CODE_GENERATION else "draft_strategy_spec"
             try:
                 self.security_controls.check_model_call(auth, model=self.client.model)
                 for event in _stream_client(
                     self.client,
                     messages=messages,
                     tools=[],
-                    routing_context={"auth": auth, "user_tier": auth.user_tier, "stage": stage},
+                    routing_context={
+                        "auth": auth,
+                        "user_tier": auth.user_tier,
+                        "stage": stage,
+                        "route_timeout_seconds": _prompt_chain_route_timeout_seconds(),
+                        "route_keepalive_seconds": _prompt_chain_route_keepalive_seconds(),
+                        "hard_route_timeout": True,
+                    },
                 ):
                     if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                         chunks.append(event.text)
                         continue
+                    if event.type == PROVIDER_KEEPALIVE_EVENT:
+                        yield self._safe_reasoning_frame(
+                            auth,
+                            run,
+                            heartbeat_phase,
+                            language,
+                            workflow_step=heartbeat_step,
+                        )
+                        continue
                     if event.type == PROVIDER_ROUTE_EVENT:
                         route_payload = event.arguments or {}
                         provider_route = _safe_string(route_payload.get("provider_route"))
+                        for failure in _prompt_chain_timeout_failures(route_payload):
+                            yield stage_prompt_chain_frame(
+                                PROMPT_CHAIN_ROUTE_TIMEOUT_EVENT,
+                                status="fallback",
+                                handoff_status="not_evaluated",
+                                fallback_reason="route_timeout",
+                                failed_provider_route=failure.get("provider_route"),
+                                error_class=failure.get("error"),
+                            )
+                        if route_payload.get("fallback_used") is True:
+                            yield self._safe_reasoning_frame(
+                                auth,
+                                run,
+                                heartbeat_phase,
+                                language,
+                                workflow_step=heartbeat_step,
+                            )
                         yield self._append_frame(auth, run, PROVIDER_ROUTE_EVENT, event.arguments or {})
                         continue
                     if event.type == LLM_EVENT_USAGE:
@@ -2113,6 +2397,159 @@ class LLMOrchestrator:
                 return None
             payload = _parse_strategy_prompt_chain_stage_payload("".join(chunks), stage)
             if payload is None:
+                retry_chunks: list[str] = []
+                retry_messages = prompt_stage_messages(
+                    stage,
+                    stage_context,
+                    conservative_sizing_guidance=STRATEGY_PROMPT_CHAIN_SIZING_GUIDANCE,
+                    repair_iteration=1,
+                )
+                try:
+                    self.security_controls.check_model_call(auth, model=self.client.model)
+                    for event in _stream_client(
+                        self.client,
+                        messages=retry_messages,
+                        tools=[],
+                        routing_context={
+                            "auth": auth,
+                            "user_tier": auth.user_tier,
+                            "stage": stage,
+                            "route_timeout_seconds": _prompt_chain_route_timeout_seconds(),
+                            "route_keepalive_seconds": _prompt_chain_route_keepalive_seconds(),
+                            "hard_route_timeout": True,
+                        },
+                    ):
+                        if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
+                            retry_chunks.append(event.text)
+                            continue
+                        if event.type == PROVIDER_KEEPALIVE_EVENT:
+                            yield self._safe_reasoning_frame(
+                                auth,
+                                run,
+                                heartbeat_phase,
+                                language,
+                                workflow_step=heartbeat_step,
+                            )
+                            continue
+                        if event.type == PROVIDER_ROUTE_EVENT:
+                            route_payload = event.arguments or {}
+                            provider_route = _safe_string(route_payload.get("provider_route"))
+                            for failure in _prompt_chain_timeout_failures(route_payload):
+                                yield stage_prompt_chain_frame(
+                                    PROMPT_CHAIN_ROUTE_TIMEOUT_EVENT,
+                                    status="fallback",
+                                    handoff_status="not_evaluated",
+                                    fallback_reason="route_timeout",
+                                    failed_provider_route=failure.get("provider_route"),
+                                    error_class=failure.get("error"),
+                                )
+                            if route_payload.get("fallback_used") is True:
+                                yield self._safe_reasoning_frame(
+                                    auth,
+                                    run,
+                                    heartbeat_phase,
+                                    language,
+                                    workflow_step=heartbeat_step,
+                                )
+                            yield self._append_frame(auth, run, PROVIDER_ROUTE_EVENT, event.arguments or {})
+                            continue
+                        if event.type == LLM_EVENT_USAGE:
+                            budget.add_usage(event.input_tokens, event.output_tokens)
+                            stage_usage["input_tokens"] += event.input_tokens
+                            stage_usage["output_tokens"] += event.output_tokens
+                            model_metadata = _model_metadata_from_event(event)
+                            self.repository.create_usage_ledger(
+                                auth,
+                                run_id=run.id,
+                                model=event.model or self.client.model,
+                                tool_id=None,
+                                input_tokens=event.input_tokens,
+                                output_tokens=event.output_tokens,
+                            )
+                            yield self._append_frame(
+                                auth,
+                                run,
+                                "model.usage",
+                                _usage_payload(
+                                    event.model or self.client.model,
+                                    event.input_tokens,
+                                    event.output_tokens,
+                                    metadata=model_metadata,
+                                ),
+                            )
+                            try:
+                                budget.check_usage()
+                                self.security_controls.check_usage_budget(
+                                    total_tokens=budget.input_tokens + budget.output_tokens,
+                                    output_tokens=budget.output_tokens,
+                                )
+                            except BudgetExceeded as exc:
+                                budget.blocked = True
+                                yield stage_prompt_chain_frame(
+                                    PROMPT_CHAIN_FAILED_EVENT,
+                                    status="blocked",
+                                    handoff_status="not_evaluated",
+                                    error_class=exc.__class__.__name__,
+                                )
+                                yield from self._policy_blocked(
+                                    auth,
+                                    run,
+                                    None,
+                                    budget_policy_finding(exc),
+                                    language=language,
+                                )
+                                return None
+                            continue
+                        if event.type == LLM_EVENT_SOURCES:
+                            continue
+                        agent_log(
+                            logger,
+                            "warn",
+                            "strategy.prompt_chain.unsupported_event",
+                            component="llm_orchestrator",
+                            event_type=event.type,
+                            request_id=run.request_id,
+                            run_id=run.id,
+                            stage=stage,
+                            trace_id=run.trace_id,
+                        )
+                        yield stage_prompt_chain_frame(
+                            PROMPT_CHAIN_FALLBACK_EVENT,
+                            status="fallback",
+                            handoff_status="not_evaluated",
+                            fallback_reason="unsupported_event",
+                            error_class=event.type,
+                        )
+                        return None
+                except SecurityControlError as exc:
+                    yield stage_prompt_chain_frame(
+                        PROMPT_CHAIN_FAILED_EVENT,
+                        status="failed",
+                        handoff_status="not_evaluated",
+                        error_class=exc.__class__.__name__,
+                    )
+                    raise
+                except Exception as exc:
+                    agent_log(
+                        logger,
+                        "warn",
+                        "strategy.prompt_chain.failed",
+                        component="llm_orchestrator",
+                        error=exc.__class__.__name__,
+                        request_id=run.request_id,
+                        run_id=run.id,
+                        stage=stage,
+                        trace_id=run.trace_id,
+                    )
+                    yield stage_prompt_chain_frame(
+                        PROMPT_CHAIN_FAILED_EVENT,
+                        status="failed",
+                        handoff_status="not_evaluated",
+                        error_class=exc.__class__.__name__,
+                    )
+                    return None
+                payload = _parse_strategy_prompt_chain_stage_payload("".join(retry_chunks), stage)
+            if payload is None:
                 agent_log(
                     logger,
                     "warn",
@@ -2148,6 +2585,19 @@ class LLMOrchestrator:
                 latency_ms=chain_timer.elapsed_ms(),
             )
             return None
+        coding_output = (stage_outputs.get(STAGE_STRATEGY_CODING) or {}).get("output")
+        pine_output = (stage_outputs.get(STAGE_PINE_CODE_GENERATION) or {}).get("output")
+        strategy_spec = coding_output.get("strategy_spec") if isinstance(coding_output, dict) else None
+        pine_code = pine_output.get("pine_code") if isinstance(pine_output, dict) else None
+        if not isinstance(strategy_spec, dict) or not isinstance(pine_code, str) or not pine_code.strip():
+            yield prompt_chain_frame(
+                PROMPT_CHAIN_FALLBACK_EVENT,
+                status="fallback",
+                handoff_status="passed",
+                fallback_reason="missing_artifact_payload",
+                latency_ms=chain_timer.elapsed_ms(),
+            )
+            return None
         yield prompt_chain_frame(
             PROMPT_CHAIN_COMPLETED_EVENT,
             status="completed",
@@ -2155,7 +2605,11 @@ class LLMOrchestrator:
             latency_ms=chain_timer.elapsed_ms(),
             stage_count=len(stage_outputs),
         )
-        return _StrategyPromptChainResult(final_text=final_text)
+        return _StrategyPromptChainResult(
+            final_text=final_text,
+            strategy_spec=strategy_spec,
+            pine_code=pine_code,
+        )
 
     def execute_agent_run(
         self,
@@ -2254,6 +2708,7 @@ class LLMOrchestrator:
         context_text: str = "",
         web_search: str = "auto",
         language: str = "en",
+        workflow_intent: str | None = None,
     ) -> Iterator[str]:
         if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
             redacted_text = _sanitize_user_facing_model_text(redact_text(event.text))
@@ -2342,6 +2797,7 @@ class LLMOrchestrator:
                     )
             return
         if event.type == LLM_EVENT_TOOL_CALL:
+            accumulated_text.clear()
             yield from self._execute_tool_call(
                 auth,
                 run,
@@ -2354,6 +2810,7 @@ class LLMOrchestrator:
                 web_search=web_search,
                 language=language,
                 auto_chain_allowed=budget.auto_chain_allowed,
+                workflow_intent=workflow_intent,
             )
             return
         raise RuntimeError(f"Unsupported LLM event type: {event.type}")
@@ -2372,6 +2829,7 @@ class LLMOrchestrator:
         web_search: str = "auto",
         language: str = "en",
         auto_chain_allowed: bool = False,
+        workflow_intent: str | None = None,
     ) -> Iterator[str]:
         yield self._append_audit_frame(
             auth,
@@ -2445,7 +2903,14 @@ class LLMOrchestrator:
             "tool.started",
             {"tool_id": tool_name, "label": _tool_activity_label(tool_name, language), "input_summary": _summary(arguments)},
         )
-        yield self._safe_reasoning_frame(auth, run, _reasoning_phase_for_tool(tool_name), language)
+        yield self._safe_reasoning_frame(
+            auth,
+            run,
+            _reasoning_phase_for_tool(tool_name),
+            language,
+            tool_id=tool_name,
+            workflow_step=_workflow_step_for_tool(tool_name),
+        )
         tool_timer = StageTimer()
         append_stage_started_event(self.repository, auth, run, "tool")
         try:
@@ -2552,7 +3017,14 @@ class LLMOrchestrator:
                 "draft_bot",
             }
             post_tool_artifact_kinds: set[str] | None = None
+            active_strategy_bot_workflow = False
             if workflow_relevant_tool:
+                active_strategy_bot_workflow = _has_active_workflow(
+                    self.repository,
+                    auth,
+                    run.conversation_id,
+                    STRATEGY_BOT_WORKFLOW_ID,
+                )
                 post_tool_artifact_kinds = _conversation_user_artifact_kinds(
                     self.repository,
                     auth,
@@ -2560,9 +3032,11 @@ class LLMOrchestrator:
                     current_run_id=run.id,
                 )
                 post_tool_artifact_kinds.update(_current_run_user_artifact_kinds(self.repository, auth, run.id))
+            normalized_tool_workflow_intent = normalize_workflow_intent(workflow_intent)
             tool_workflow_intent = (
                 "strategy_to_paper_bot_simulation"
                 if workflow_relevant_tool
+                and normalized_tool_workflow_intent == "strategy_to_paper_bot_simulation"
                 and response_intent_allows_workflow(response_intent, "strategy_to_paper_bot_simulation")
                 else None
             )
@@ -2585,13 +3059,19 @@ class LLMOrchestrator:
                     context_text=context_text,
                     artifact_kinds=post_tool_artifact_kinds or set(),
                     tool_name=tool_name,
-                    tool_result=output,
+                    tool_result=_workflow_tool_result_payload(tool_name, arguments, output),
                 )
-                if workflow_relevant_tool
+                if workflow_relevant_tool and (tool_workflow_intent is not None or active_strategy_bot_workflow)
                 else None
             )
             if workflow_payload is not None:
-                workflow_payload = self._sync_workflow_tasks(auth, run, workflow_payload)
+                workflow_payload = self._sync_workflow_tasks(
+                    auth,
+                    run,
+                    workflow_payload,
+                    language=language,
+                    user_prompt=user_message or "",
+                )
                 yield self._append_frame(auth, run, STRATEGY_WORKFLOW_EVENT, workflow_payload)
             refreshed_suggestions = _post_tool_suggestions_payload(
                 repository=self.repository,
@@ -2618,6 +3098,7 @@ class LLMOrchestrator:
                     context_text=context_text,
                     web_search=web_search,
                     language=language,
+                    workflow_intent=workflow_intent,
                 )
             append_stage_event(self.repository, auth, run, "tool", tool_timer.elapsed_ms())
         except Exception as exc:
@@ -2701,6 +3182,7 @@ class LLMOrchestrator:
         context_text: str,
         web_search: str,
         language: str,
+        workflow_intent: str | None = None,
     ) -> Iterator[str]:
         planner = BacktestAutoChainPlanner(
             enabled=os.getenv("STRATEGY_CODEBOT_BACKTEST_AUTO_CHAIN_ENABLED", "1") == "1",
@@ -2737,6 +3219,7 @@ class LLMOrchestrator:
                     web_search=web_search,
                     language=language,
                     auto_chain_allowed=False,
+                    workflow_intent=workflow_intent,
                 )
             except Exception as exc:
                 message = redact_text(str(exc))
@@ -3142,10 +3625,21 @@ class LLMOrchestrator:
         auth: AuthContext,
         run: AssistantRunRecord,
         workflow_payload: dict[str, Any],
+        *,
+        language: str = "en",
+        user_prompt: str = "",
     ) -> dict[str, Any]:
         workflow_id = workflow_payload.get("workflow_id")
         if not isinstance(workflow_id, str):
             return workflow_payload
+        workflow_payload = self._enrich_workflow_task_prompts(
+            auth,
+            run,
+            workflow_payload,
+            workflow_id=workflow_id,
+            language=language,
+            user_prompt=user_prompt,
+        )
         bot_proposal_id = workflow_payload.get("bot_proposal_id")
         task_payloads = normalize_workflow_tasks(
             workflow_id,
@@ -3256,8 +3750,108 @@ class LLMOrchestrator:
         hydrated["task_values"] = _workflow_task_values_from_state(hydrated_tasks)
         return validate_workflow_payload(hydrated) or hydrated
 
-    def _safe_reasoning_frame(self, auth: AuthContext, run: AssistantRunRecord, phase: str, language: str = "en") -> str:
-        return sse_frame(transient_reasoning_event(run, payload=redact_value(_safe_reasoning_payload(phase, language))))
+    def _enrich_workflow_task_prompts(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        workflow_payload: dict[str, Any],
+        *,
+        workflow_id: str,
+        language: str,
+        user_prompt: str,
+    ) -> dict[str, Any]:
+        raw_tasks = workflow_payload.get("tasks")
+        if workflow_id != STRATEGY_BOT_WORKFLOW_ID or not isinstance(raw_tasks, list):
+            return workflow_payload
+        enriched_tasks: list[Any] = []
+        changed = False
+        for task in raw_tasks:
+            if not isinstance(task, dict) or task.get("task_template_id") != "collect_strategy_inputs":
+                enriched_tasks.append(task)
+                continue
+            if task.get("status") != "pending_user":
+                enriched_tasks.append(task)
+                continue
+            result = generate_workflow_task_prompt_payload(
+                self.client,
+                workflow_id=workflow_id,
+                task_payload=task,
+                language=language,
+                user_prompt=user_prompt,
+                task_values=task.get("values") if isinstance(task.get("values"), dict) else None,
+                auth=auth,
+                context={
+                    "current_step": workflow_payload.get("current_step"),
+                    "status": workflow_payload.get("status"),
+                    "missing_fields": [
+                        field for field in workflow_payload.get("missing_fields", []) if isinstance(field, str)
+                    ],
+                },
+            )
+            if result.payload != task:
+                changed = True
+            enriched_tasks.append(result.payload)
+            self.repository.append_run_events(
+                auth,
+                run.id,
+                workflow_prompt_generator_events(
+                    result,
+                    workflow_id=workflow_id,
+                    task_template_id="collect_strategy_inputs",
+                ),
+            )
+            append_model_audit_event(
+                self.repository,
+                auth,
+                run,
+                MODEL_ACTION_VALIDATED,
+                {
+                    "actor": "backend",
+                    "source": "workflow_prompt_generator",
+                    "status": "allowed" if result.status == "generated" else "failed",
+                    "workflow_id": workflow_id,
+                    "task_template_id": "collect_strategy_inputs",
+                    "reason_code": result.fallback_reason or result.status,
+                    "duration_ms": result.duration_ms,
+                    "workflow_summary": {
+                        "input_id": result.input_id,
+                        "target_input_ids": list(result.target_input_ids),
+                        "generated_input_ids": list(result.generated_input_ids),
+                        "fallback_input_ids": list(result.fallback_input_ids),
+                        "option_count": result.option_count,
+                        "generation_status": result.status,
+                    },
+                },
+            )
+        if not changed:
+            return workflow_payload
+        enriched = dict(workflow_payload)
+        enriched["tasks"] = enriched_tasks
+        return enriched
+
+    def _safe_reasoning_frame(
+        self,
+        auth: AuthContext,
+        run: AssistantRunRecord,
+        phase: str,
+        language: str = "en",
+        *,
+        tool_id: str | None = None,
+        workflow_step: str | None = None,
+    ) -> str:
+        return sse_frame(
+            transient_reasoning_event(
+                run,
+                payload=redact_value(
+                    _safe_reasoning_payload(
+                        phase,
+                        language,
+                        tool_id=tool_id,
+                        workflow_step=workflow_step,
+                    )
+                ),
+            )
+        )
 
     def _new_budget(self) -> RunBudget:
         return RunBudget(
@@ -3370,6 +3964,7 @@ def _prompt_chain_event_payload(
     latency_ms: int | None = None,
     usage: dict[str, int] | None = None,
     error_class: str | None = None,
+    failed_provider_route: str | None = None,
     stages: list[str] | None = None,
     stage_count: int | None = None,
 ) -> dict[str, Any]:
@@ -3389,11 +3984,33 @@ def _prompt_chain_event_payload(
         "latency_ms": latency_ms,
         "usage": usage,
         "error_class": error_class,
+        "failed_provider_route": failed_provider_route,
         "stages": stages,
         "stage_count": stage_count,
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
     return payload
+
+
+def _prompt_chain_timeout_failures(route_payload: dict[str, Any]) -> list[dict[str, str]]:
+    attempts = route_payload.get("fallback_attempts")
+    if not isinstance(attempts, list):
+        return []
+    failures: list[dict[str, str]] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        error = _safe_string(attempt.get("error"))
+        if error != "ProviderTimeoutError":
+            continue
+        provider_route = _safe_string(attempt.get("provider_route"))
+        failures.append(
+            {
+                "error": error,
+                "provider_route": provider_route or "unknown",
+            }
+        )
+    return failures
 
 
 def _prompt_chain_usage(usage: dict[str, int]) -> dict[str, int]:
@@ -3503,12 +4120,33 @@ def _parse_strategy_prompt_chain_stage_payload(text: str, stage: str) -> dict[st
         strategy_spec = output.get("strategy_spec")
         if not isinstance(strategy_spec, dict) or not strategy_spec:
             return None
+        required_spec_keys = (
+            "target_platform",
+            "script_type",
+            "market",
+            "timeframe",
+            "entry_rules",
+            "exit_rules",
+            "risk_rules",
+        )
+        if any(key not in strategy_spec for key in required_spec_keys):
+            return None
+        if any(
+            not isinstance(strategy_spec.get(key), str) or not str(strategy_spec.get(key)).strip()
+            for key in ("target_platform", "script_type", "market", "timeframe")
+        ):
+            return None
+        if any(
+            not isinstance(strategy_spec.get(key), list) or not strategy_spec.get(key)
+            for key in ("entry_rules", "exit_rules", "risk_rules")
+        ):
+            return None
         return payload
     if stage == STAGE_PINE_CODE_GENERATION:
         pine_code = output.get("pine_code")
         if not isinstance(pine_code, str) or not pine_code.strip():
             return None
-        if "//@version=6" not in pine_code[:200]:
+        if not pine_code.lstrip().startswith("//@version=6"):
             return None
         return payload
     return None
@@ -3576,7 +4214,7 @@ def _model_stage_for_chat(
     active_tools: list[dict[str, Any]],
     decision_model_stage: str | None = None,
 ) -> str:
-    if decision_model_stage in CHAT_INTENT_MODEL_STAGES:
+    if decision_model_stage in CHAT_RESPONSE_MODEL_STAGES:
         return decision_model_stage
     lowered = message_content.lower()
     tool_names = {
@@ -3660,13 +4298,24 @@ def _usage_payload(
     return payload
 
 
-def _safe_reasoning_payload(phase: str, language: str = "en") -> dict[str, Any]:
+def _safe_reasoning_payload(
+    phase: str,
+    language: str = "en",
+    *,
+    tool_id: str | None = None,
+    workflow_step: str | None = None,
+) -> dict[str, Any]:
     normalized_phase = phase if phase in SAFE_REASONING_LABELS else "model"
-    return {
+    payload = {
         "phase": normalized_phase,
         "safe": True,
         "text": _safe_reasoning_text(normalized_phase, language),
     }
+    if tool_id in TOOL_DEFINITIONS:
+        payload["tool_id"] = tool_id
+    if workflow_step in STRATEGY_BOT_WORKFLOW_STEPS:
+        payload["workflow_step"] = workflow_step
+    return payload
 
 
 def _safe_reasoning_text(phase: str, language: str = "en") -> str:
@@ -3676,16 +4325,27 @@ def _safe_reasoning_text(phase: str, language: str = "en") -> str:
 def _reasoning_phase_for_tool(tool_name: str) -> str:
     if tool_name == "knowledge_check":
         return "retrieval"
+    if tool_name in {"create_backtest_plan", "run_backtest_preview", "run_backtest_variant_lab"}:
+        return "backtest"
     if tool_name in {
         "generate_pine",
         "static_validate",
         "parallel_review",
-        "create_backtest_plan",
-        "run_backtest_preview",
-        "run_backtest_variant_lab",
     }:
         return "artifact"
     return "tool"
+
+
+def _workflow_step_for_tool(tool_name: str) -> str | None:
+    if tool_name == "generate_pine":
+        return "generate_pine"
+    if tool_name == "static_validate":
+        return "static_validation"
+    if tool_name in {"create_backtest_plan", "run_backtest_preview", "run_backtest_variant_lab"}:
+        return "backtest_preview"
+    if tool_name == "draft_bot":
+        return "draft_bot_proposal"
+    return None
 
 
 def _normalize_language(language: str | None) -> str:
@@ -4120,6 +4780,44 @@ def _strategy_bot_missing_fields(context: str) -> list[str]:
     return missing
 
 
+def _strategy_bot_missing_after_structured_evidence(
+    missing_fields: list[str],
+    *,
+    structured_strategy_values: dict[str, Any] | None,
+    tool_result: dict[str, Any],
+) -> list[str]:
+    if _strategy_spec_satisfies_strategy_inputs(tool_result.get("strategy_spec")):
+        return []
+    present = _strategy_bot_present_fields_from_values(structured_strategy_values or {})
+    if not present:
+        return missing_fields
+    return [field for field in missing_fields if field not in present]
+
+
+def _strategy_bot_present_fields_from_values(values: dict[str, Any]) -> set[str]:
+    present: set[str] = set()
+    for field in STRATEGY_BOT_REQUIRED_INPUT_FIELDS:
+        value = values.get(field)
+        if not _is_empty_workflow_value(value):
+            present.add(field)
+    return present
+
+
+def _strategy_spec_satisfies_strategy_inputs(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = (
+        value.get("market"),
+        value.get("timeframe"),
+        value.get("entry_rules"),
+        value.get("exit_rules"),
+        value.get("risk_rules"),
+    )
+    if any(_is_empty_workflow_value(item) for item in required):
+        return False
+    return True
+
+
 def _strategy_bot_lexical_hint(context: str) -> bool:
     return any(
         term in context
@@ -4332,8 +5030,343 @@ def _has_active_workflow(
     )
 
 
+def _is_empty_workflow_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _workflow_task_values_for_conversation(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    workflow_id: str,
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for task in repository.list_workflow_tasks(auth, conversation_id) or []:
+        if task.workflow_id != workflow_id:
+            continue
+        state = workflow_task_state(task)
+        task_values = state.get("values")
+        if not isinstance(task_values, dict):
+            continue
+        for key, value in task_values.items():
+            if isinstance(key, str) and not _is_empty_workflow_value(value):
+                values[key] = value
+    return values
+
+
+def _workflow_task_values_context_text(values: dict[str, Any]) -> str:
+    lines = []
+    for key in sorted(values):
+        value = values.get(key)
+        if not isinstance(key, str) or _is_empty_workflow_value(value):
+            continue
+        lines.append(f"- {key}: {value}")
+    if not lines:
+        return ""
+    return "Durable workflow task values:\n" + "\n".join(lines)
+
+
+def _workflow_task_resume_action_plan(
+    payload: dict[str, Any] | None,
+    workflow_task_values: dict[str, Any],
+) -> ActionPlanDecision | None:
+    if not isinstance(payload, dict) or payload.get("task_template_id") != STRATEGY_SPEC_NEXT_STEP_TASK_ID:
+        return None
+    if workflow_task_strategy_spec_next_action(payload) != STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE:
+        return None
+    strategy_spec = _strategy_spec_from_workflow_task_values(workflow_task_values)
+    if strategy_spec is None:
+        return None
+    return ActionPlanDecision(
+        decision="call_tool",
+        intent_id="generate_pine",
+        confidence=1.0,
+        source="workflow_task_resume",
+        tool_id="generate_pine",
+        arguments={"strategy_spec": strategy_spec},
+        suggested_actions=("generate_pine",),
+        reason="User approved generating Pine after reviewing the strategy spec.",
+    )
+
+
+def _selected_action_plan(
+    selected_action: dict[str, Any] | None,
+    *,
+    repository: ConversationRepository,
+    artifact_store: LocalArtifactStore | None,
+    auth: AuthContext,
+    conversation_id: str,
+    message_content: str,
+    artifact_kinds: set[str],
+    context_text: str,
+    web_search: str,
+    action_evaluation: ActionRegistryEvaluation | None = None,
+) -> ActionPlanDecision | None:
+    if not isinstance(selected_action, dict):
+        return None
+    action_id = _safe_string(selected_action.get("action_id"))
+    tool_id = _safe_string(selected_action.get("tool_id"))
+    if not action_id or not tool_id:
+        return None
+    entry = registry_entry_for_tool(tool_id)
+    if entry is None or entry.action_id != action_id:
+        return None
+    evaluation = action_evaluation or evaluate_action_registry(
+        artifact_kinds=artifact_kinds,
+        context_text=context_text,
+        web_search=web_search,
+    )
+    if tool_id not in evaluation.available_tool_ids:
+        return None
+    if tool_id not in {"run_backtest_preview", "create_backtest_plan"}:
+        return None
+    arguments = _backtest_plan_arguments_from_conversation(
+        repository,
+        artifact_store,
+        auth,
+        conversation_id,
+        prompt=message_content,
+        source_message_id=_safe_string(selected_action.get("source_message_id")),
+    )
+    if arguments is None:
+        return None
+    return ActionPlanDecision(
+        decision="call_tool",
+        intent_id="backtest_preview",
+        confidence=1.0,
+        source="selected_action",
+        tool_id="create_backtest_plan",
+        arguments=arguments,
+        reason="User selected the Backtest Preview workflow action.",
+    )
+
+
+def _chat_decision_for_selected_action(
+    chat_decision: ChatIntentDecision,
+    action_plan: ActionPlanDecision | None,
+) -> ChatIntentDecision:
+    if action_plan is None or action_plan.source != "selected_action" or action_plan.tool_id != "create_backtest_plan":
+        return chat_decision
+    return ChatIntentDecision(
+        response_intent="backtest_preview",
+        action="call_tool",
+        model_stage=MODEL_STAGE_PINE_CODE_GENERATION,
+        confidence=1.0,
+        source="selected_action",
+        tool_id="create_backtest_plan",
+        auto_chain=False,
+        current_context_required=False,
+        domain_scope="trading_workflow",
+        workflow_intent=None,
+        used_signals=("selected_action", "has_strategy_artifact"),
+    )
+
+
+def _backtest_plan_arguments_from_conversation(
+    repository: ConversationRepository,
+    artifact_store: LocalArtifactStore | None,
+    auth: AuthContext,
+    conversation_id: str,
+    *,
+    prompt: str,
+    source_message_id: str | None = None,
+) -> dict[str, Any] | None:
+    anchor_before = _selected_action_anchor_before(repository, auth, conversation_id, source_message_id)
+    if source_message_id and anchor_before is None:
+        return None
+    strategy_spec_record = repository.get_latest_strategy_spec_for_conversation(
+        auth,
+        conversation_id,
+        before=anchor_before,
+    )
+    strategy_spec = strategy_spec_record.payload_json if strategy_spec_record is not None else None
+    if not isinstance(strategy_spec, dict) and anchor_before is None:
+        strategy_spec = _strategy_spec_from_workflow_task_values(
+            _workflow_task_values_for_conversation(repository, auth, conversation_id, STRATEGY_BOT_WORKFLOW_ID)
+        )
+    pine_code = _latest_pine_artifact_content(
+        repository,
+        artifact_store,
+        auth,
+        conversation_id,
+        before=anchor_before,
+    )
+    if not isinstance(strategy_spec, dict) or not pine_code:
+        return None
+    return {
+        "prompt": prompt,
+        "strategy_spec": strategy_spec,
+        "pine_code": pine_code,
+    }
+
+
+def _selected_action_anchor_before(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    source_message_id: str | None,
+) -> datetime | None:
+    if not source_message_id:
+        return None
+    return next(
+        (
+            message.created_at
+            for message in repository.list_messages(auth, conversation_id)
+            if message.id == source_message_id and message.conversation_id == conversation_id
+        ),
+        None,
+    )
+
+
+def _latest_pine_artifact_content(
+    repository: ConversationRepository,
+    artifact_store: LocalArtifactStore | None,
+    auth: AuthContext,
+    conversation_id: str,
+    *,
+    before: datetime | None = None,
+) -> str | None:
+    if artifact_store is None:
+        return None
+    artifact = _latest_conversation_artifact(
+        repository,
+        auth,
+        conversation_id,
+        kinds={"pine_file", "pine_strategy_source"},
+        before=before,
+    )
+    if artifact is None:
+        return None
+    try:
+        content = artifact_store.read_content(artifact)
+    except Exception:
+        return None
+    return content if isinstance(content, str) and content.strip() else None
+
+
+def _latest_conversation_artifact(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    *,
+    kinds: set[str],
+    before: datetime | None = None,
+) -> ArtifactRecord | None:
+    return repository.get_latest_conversation_artifact(
+        auth,
+        conversation_id,
+        kinds=kinds,
+        before=before,
+    )
+
+
+def _strategy_spec_from_workflow_task_values(values: dict[str, Any]) -> dict[str, Any] | None:
+    market = _safe_string(values.get("market"))
+    symbol = _safe_string(values.get("symbol"))
+    timeframe = _safe_string(values.get("timeframe"))
+    style = _safe_string(values.get("style"))
+    risk_preference = _safe_string(values.get("risk_preference"))
+    if not (market and symbol and timeframe and style and risk_preference):
+        return None
+
+    entry_exit_idea = _safe_string(values.get("entry_exit_idea"))
+    style_text = style.replace("_", " ")
+    entry_rules = _strategy_entry_rules_from_task_values(style_text, entry_exit_idea)
+    exit_rules = _strategy_exit_rules_from_task_values(entry_exit_idea)
+    risk_rules, position_sizing, stop_loss, take_profit = _strategy_risk_rules_from_task_values(risk_preference)
+    assumptions = [
+        "Generated from approved Strategy -> Paper Bot workflow task values.",
+        "Review-only Pine artifact; not TradingView proof, backtest evidence, or live trading approval.",
+        "Paper simulation boundary only; no broker execution.",
+    ]
+    if entry_exit_idea:
+        assumptions.append(f"User entry/exit idea: {entry_exit_idea}")
+    return {
+        "target_platform": "pine_v6",
+        "script_type": "strategy",
+        "market": market,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "runtime_targets": ["pine_v6"],
+        "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
+        "risk_rules": risk_rules,
+        "position_sizing": position_sizing,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "assumptions": assumptions,
+        "constraints": [
+            f"Strategy style: {style_text}.",
+            "Generated Pine should remain review-only until validation/backtest evidence exists.",
+        ],
+    }
+
+
+def _strategy_entry_rules_from_task_values(style: str, entry_exit_idea: str | None) -> list[str]:
+    idea = (entry_exit_idea or "").lower()
+    rules: list[str] = []
+    if "moving average" in idea or "ma " in f"{idea} " or "ema" in idea or "sma" in idea:
+        rules.append("Enter long when the fast moving average crosses above the slow moving average on a confirmed bar.")
+    elif "breakout" in style or "breakout" in idea:
+        rules.append("Enter long when price confirms a bullish breakout on a confirmed bar.")
+    elif "mean" in style or "reversion" in style:
+        rules.append("Enter long when price shows a mean-reversion recovery signal on a confirmed bar.")
+    elif "dca" in style:
+        rules.append("Enter staged long entries only when review rules confirm the setup.")
+    else:
+        rules.append("Enter long when the trend-following signal turns bullish on a confirmed bar.")
+    if "breakout" in style and "breakout" not in rules[0].lower():
+        rules.append("Use the breakout style as confirmation before accepting the entry.")
+    return rules
+
+
+def _strategy_exit_rules_from_task_values(entry_exit_idea: str | None) -> list[str]:
+    idea = (entry_exit_idea or "").lower()
+    if "moving average" in idea or "ma " in f"{idea} " or "ema" in idea or "sma" in idea:
+        return [
+            "Exit when the fast moving average crosses below the slow moving average on a confirmed bar.",
+            "Use protective stop-loss and take-profit levels for review-only risk control.",
+        ]
+    return [
+        "Exit when the opposite signal appears on a confirmed bar.",
+        "Use protective stop-loss and take-profit levels for review-only risk control.",
+    ]
+
+
+def _strategy_risk_rules_from_task_values(risk_preference: str) -> tuple[list[str], str, str, str]:
+    normalized = risk_preference.lower()
+    if "aggressive" in normalized:
+        risk_pct = "2%"
+        stop_loss = "2% below average entry price"
+        take_profit = "4% above average entry price"
+    elif "conservative" in normalized:
+        risk_pct = "0.5%"
+        stop_loss = "1% below average entry price"
+        take_profit = "2% above average entry price"
+    else:
+        risk_pct = "1%"
+        stop_loss = "1.5% below average entry price"
+        take_profit = "3% above average entry price"
+    position_sizing = f"Risk {risk_pct} account equity per trade"
+    return (
+        [
+            f"{position_sizing}; review before any simulation.",
+            "No broker execution or live order placement is allowed from this workflow.",
+        ],
+        position_sizing,
+        stop_loss,
+        take_profit,
+    )
+
+
 def _should_create_workflow_from_decision(chat_decision: ChatIntentDecision, workflow_id: str) -> bool:
-    if _is_classifier_fallback_source(chat_decision.source) and chat_decision.source != WORKFLOW_TIMEOUT_FALLBACK_SOURCE:
+    if _is_classifier_fallback_source(chat_decision.source) and chat_decision.source not in WORKFLOW_KICKOFF_FALLBACK_SOURCES:
         return False
     workflow_intent = normalize_workflow_intent(chat_decision.workflow_intent)
     if workflow_id_for_intent(workflow_intent) != workflow_id:
@@ -4347,7 +5380,16 @@ def _should_create_workflow_from_decision(chat_decision: ChatIntentDecision, wor
     return not bool(policy.get("requires_explicit_intent")) or workflow_intent is not None
 
 
-def _workflow_timeout_fallback_decision(message_content: str) -> ChatIntentDecision | None:
+def _workflow_kickoff_fallback_decision(
+    message_content: str,
+    *,
+    source: str,
+) -> ChatIntentDecision | None:
+    if source not in WORKFLOW_KICKOFF_FALLBACK_SOURCES:
+        return None
+    fallback_policy = classifier_fallback_policy()
+    if not fallback_policy.get("safe_workflow_kickoff_allowed"):
+        return None
     regex_evidence = _chat_regex_evidence(message_content)
     evidence_signals = set(evidence_signals_from_regex(regex_evidence))
     for workflow_intent in WORKFLOW_INTENTS:
@@ -4362,13 +5404,14 @@ def _workflow_timeout_fallback_decision(message_content: str) -> ChatIntentDecis
             continue
         response_intent = policy.get("response_intent")
         domain_scope = policy.get("domain_scope")
-        source = policy.get("source")
         if not isinstance(response_intent, str) or response_intent not in RESPONSE_INTENTS:
             continue
         if not isinstance(domain_scope, str) or domain_scope not in DOMAIN_SCOPES:
             continue
-        if not isinstance(source, str) or not source:
-            source = WORKFLOW_TIMEOUT_FALLBACK_SOURCE
+        if source == WORKFLOW_TIMEOUT_FALLBACK_SOURCE:
+            reason = "Classifier timed out; registry evidence allowed input-only workflow kickoff."
+        else:
+            reason = "Classifier fell back; registry evidence allowed input-only workflow kickoff."
         return ChatIntentDecision(
             response_intent=response_intent,
             action="answer",
@@ -4380,9 +5423,16 @@ def _workflow_timeout_fallback_decision(message_content: str) -> ChatIntentDecis
             domain_scope=domain_scope,
             workflow_intent=workflow_intent,
             used_signals=tuple(sorted(evidence_signals)),
-            reasons=("Classifier timed out; registry evidence allowed input-only workflow kickoff.",),
+            reasons=(reason,),
         )
     return None
+
+
+def _workflow_timeout_fallback_decision(message_content: str) -> ChatIntentDecision | None:
+    return _workflow_kickoff_fallback_decision(
+        message_content,
+        source=WORKFLOW_TIMEOUT_FALLBACK_SOURCE,
+    )
 
 
 def _should_resume_active_workflow(chat_decision: ChatIntentDecision, workflow_id: str, *, active: bool) -> bool:
@@ -4403,6 +5453,40 @@ def _should_resume_active_workflow(chat_decision: ChatIntentDecision, workflow_i
     return chat_decision.response_intent == "general_chat" and chat_decision.domain_scope != "product_help"
 
 
+def _workflow_task_resume_chat_decision(payload: dict[str, Any]) -> ChatIntentDecision:
+    task_template_id = _safe_string(payload.get("task_template_id"))
+    resume_intent = _safe_string(payload.get("resume_intent"))
+    response_intent = resume_intent if resume_intent in RESPONSE_INTENTS else "strategy_building"
+    reasons = ["Resuming from a completed workflow task."]
+    used_signals = ["workflow_task_resume"]
+    if task_template_id == STRATEGY_SPEC_NEXT_STEP_TASK_ID:
+        next_action = workflow_task_strategy_spec_next_action(payload)
+        if next_action:
+            used_signals.append("strategy_spec_next_action")
+        if next_action == STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE:
+            response_intent = "pine_generation"
+            reasons.append("User approved generating Pine after reviewing the strategy spec.")
+        else:
+            response_intent = "strategy_building"
+            if next_action == STRATEGY_SPEC_NEXT_ACTION_SKIP_PINE:
+                reasons.append("User chose to skip Pine generation.")
+            else:
+                reasons.append("User requested a revision or custom follow-up before Pine generation.")
+    return ChatIntentDecision(
+        response_intent=response_intent,
+        action="answer",
+        model_stage=_model_stage_for_intent(response_intent),
+        confidence=1.0,
+        source="workflow_task_resume",
+        auto_chain=False,
+        current_context_required=False,
+        domain_scope="trading_workflow",
+        workflow_intent="strategy_to_paper_bot_simulation",
+        reasons=tuple(reasons),
+        used_signals=tuple(used_signals),
+    )
+
+
 def _maybe_strategy_bot_workflow_payload(
     *,
     repository: ConversationRepository,
@@ -4414,6 +5498,8 @@ def _maybe_strategy_bot_workflow_payload(
     artifact_kinds: set[str],
     tool_name: str | None = None,
     tool_result: dict[str, Any] | None = None,
+    structured_strategy_values: dict[str, Any] | None = None,
+    completed_strategy_spec: bool = False,
 ) -> dict[str, Any] | None:
     active = _has_active_workflow(repository, auth, conversation_id, STRATEGY_BOT_WORKFLOW_ID)
     if not (
@@ -4427,6 +5513,8 @@ def _maybe_strategy_bot_workflow_payload(
         artifact_kinds=artifact_kinds,
         tool_name=tool_name,
         tool_result=tool_result,
+        structured_strategy_values=structured_strategy_values,
+        completed_strategy_spec=completed_strategy_spec,
         force=True,
     )
 
@@ -4438,6 +5526,8 @@ def _strategy_bot_workflow_payload(
     artifact_kinds: set[str],
     tool_name: str | None = None,
     tool_result: dict[str, Any] | None = None,
+    structured_strategy_values: dict[str, Any] | None = None,
+    completed_strategy_spec: bool = False,
     force: bool = False,
 ) -> dict[str, Any] | None:
     if not force and not _strategy_bot_workflow_lexical_hint(
@@ -4450,6 +5540,11 @@ def _strategy_bot_workflow_payload(
     result = tool_result if isinstance(tool_result, dict) else {}
     combined_context = f"{message_content}\n{context_text}"
     strategy_missing = _strategy_bot_missing_fields(combined_context)
+    strategy_missing = _strategy_bot_missing_after_structured_evidence(
+        strategy_missing,
+        structured_strategy_values=structured_strategy_values,
+        tool_result=result,
+    )
 
     proposal = result.get("bot_proposal") if isinstance(result.get("bot_proposal"), dict) else None
     explicit_missing = [
@@ -4501,14 +5596,20 @@ def _strategy_bot_workflow_payload(
     )
     start_allowed = proposal is not None and not setup_missing and not skipped_evidence_gate
 
-    completed: list[str] = []
-    if not strategy_missing:
-        completed.append("collect_strategy_inputs")
     has_downstream_strategy_work = (
         has_pine or has_validation or has_backtest_preview or has_evidence_review or proposal is not None
     )
+    if has_downstream_strategy_work and strategy_missing:
+        strategy_missing = []
+
+    completed: list[str] = []
+    if not strategy_missing:
+        completed.append("collect_strategy_inputs")
     has_existing_spec_skip = not strategy_missing and "generate_pine" in skipped
-    if has_downstream_strategy_work or has_existing_spec_skip:
+    draft_strategy_spec_satisfied = (
+        completed_strategy_spec or has_downstream_strategy_work or has_existing_spec_skip
+    )
+    if draft_strategy_spec_satisfied:
         completed.append("draft_strategy_spec")
     if has_pine:
         completed.append("generate_pine")
@@ -4524,8 +5625,10 @@ def _strategy_bot_workflow_payload(
 
     if strategy_missing:
         current_step = "collect_strategy_inputs"
-    elif not pine_satisfied:
+    elif not draft_strategy_spec_satisfied:
         current_step = "draft_strategy_spec"
+    elif not pine_satisfied:
+        current_step = "generate_pine"
     elif not validation_satisfied:
         current_step = "static_validation"
     elif not backtest_satisfied:
@@ -4583,6 +5686,15 @@ def _strategy_bot_workflow_payload(
         )
         if collect_task is not None:
             tasks.append(collect_task)
+    if current_step == "generate_pine" and not has_pine:
+        next_step_task = build_workflow_task_payload(
+            STRATEGY_BOT_WORKFLOW_ID,
+            STRATEGY_SPEC_NEXT_STEP_TASK_ID,
+            status="pending_user",
+            reason="Review the drafted strategy spec before generating Pine.",
+        )
+        if next_step_task is not None:
+            tasks.append(next_step_task)
     if current_step == "backtest_preview" and not has_backtest_preview:
         draft_only = "backtest_preview" in skipped
         choice_task = build_workflow_task_payload(
@@ -4684,6 +5796,76 @@ def _conversation_user_artifact_kinds(
             if _artifact_is_user_visible(artifact):
                 kinds.add(str(getattr(artifact, "kind", "")).lower())
     return kinds
+
+
+def _latest_strategy_artifact_context_text(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+) -> str:
+    strategy_spec_record = repository.get_latest_strategy_spec_for_conversation(auth, conversation_id)
+    pine_artifact = _latest_user_visible_artifact(
+        repository,
+        auth,
+        conversation_id,
+        kind="pine_file",
+    )
+    if strategy_spec_record is None and pine_artifact is None:
+        return ""
+
+    lines = ["Durable current strategy artifact context:"]
+    if strategy_spec_record is not None:
+        strategy_spec = strategy_spec_record.payload_json
+        lines.append(f"- strategy_spec_id: {strategy_spec_record.id}")
+        lines.append(f"- strategy_spec_run_id: {strategy_spec_record.run_id}")
+        for key in (
+            "name",
+            "target_platform",
+            "script_type",
+            "market",
+            "symbol",
+            "timeframe",
+            "position_sizing",
+            "stop_loss",
+            "take_profit",
+        ):
+            value = _safe_string(strategy_spec.get(key))
+            if value:
+                lines.append(f"- {key}: {value}")
+        for key in ("entry_rules", "exit_rules", "risk_rules"):
+            values = _safe_string_list(strategy_spec.get(key), limit=3)
+            if values:
+                lines.append(f"- {key}: {'; '.join(values)}")
+    if pine_artifact is not None:
+        lines.append(f"- pine_artifact_id: {pine_artifact.id}")
+        lines.append(f"- pine_artifact_run_id: {pine_artifact.run_id}")
+        lines.append(f"- pine_artifact_kind: {pine_artifact.kind}")
+        lines.append(f"- pine_artifact_display_name: {pine_artifact.display_name}")
+    lines.append(
+        "- instruction: Treat this as current durable strategy context for read-only scout and evidence follow-ups."
+    )
+    return "\n".join(lines)
+
+
+def _latest_user_visible_artifact(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    *,
+    kind: str,
+):
+    artifacts: list[Any] = []
+    for run in repository.list_runs(auth, conversation_id) or []:
+        for artifact in repository.list_artifacts(auth, run.id) or []:
+            if _artifact_is_user_visible(artifact) and str(getattr(artifact, "kind", "")).lower() == kind:
+                artifacts.append(artifact)
+    if not artifacts:
+        return None
+    return sorted(
+        artifacts,
+        key=lambda artifact: (getattr(artifact, "created_at", datetime.min), getattr(artifact, "id", "")),
+        reverse=True,
+    )[0]
 
 
 def _current_run_user_artifact_kinds(
@@ -4801,6 +5983,76 @@ def _tool_result_context_text(tool_result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _latest_artifact_evidence_followup(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+    message_content: str,
+    *,
+    language: str,
+) -> dict[str, Any] | None:
+    if not _is_artifact_evidence_followup_request(message_content):
+        return None
+    snapshot = repository.get_conversation_state_snapshot(auth, conversation_id, event_limit=100)
+    if snapshot is None:
+        return None
+    relevant_types = ("validation.completed", "review.completed", "evaluator_optimizer.summary")
+    latest: dict[str, Any] = {}
+    for event in reversed(snapshot.conversation_run_events):
+        if event.type not in relevant_types or event.type in latest:
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        latest[event.type] = {
+            "run_id": event.run_id,
+            "payload": dict(payload),
+        }
+        if len(latest) == len(relevant_types):
+            break
+    if not latest:
+        return None
+    return {
+        "events": [
+            (
+                event_type,
+                {
+                    **record["payload"],
+                    "evidence_source": "persisted_conversation_evidence",
+                    "reused_from_run_id": record["run_id"],
+                },
+            )
+            for event_type, record in latest.items()
+        ],
+        "text": _artifact_evidence_followup_text(latest, language=language),
+    }
+
+
+def _artifact_evidence_followup_text(evidence: dict[str, Any], *, language: str) -> str:
+    validation = (evidence.get("validation.completed") or {}).get("payload") or {}
+    review = (evidence.get("review.completed") or {}).get("payload") or {}
+    evaluator = (evidence.get("evaluator_optimizer.summary") or {}).get("payload") or {}
+    validation_status = _safe_string(validation.get("status")) or _safe_string(evaluator.get("final_validation_status")) or "unknown"
+    review_status = (
+        _safe_string(review.get("decision"))
+        or _safe_string(review.get("status"))
+        or _safe_string(evaluator.get("final_review_status"))
+        or "unknown"
+    )
+    stop_reason = _safe_string(evaluator.get("stop_reason")) or "unknown"
+    if _normalize_language(language) == "vi":
+        return (
+            "Theo evidence đã persist cho artifact hiện tại: "
+            f"static validation = {validation_status}, review = {review_status}, "
+            f"evaluator stop reason = {stop_reason}. "
+            "Mình không start paper bot hay live trading."
+        )
+    return (
+        "Persisted evidence for the current artifact: "
+        f"static validation = {validation_status}, review = {review_status}, "
+        f"evaluator stop reason = {stop_reason}. "
+        "I did not start paper or live trading."
+    )
+
+
 def _latest_backtest_live_context(
     repository: ConversationRepository,
     auth: AuthContext,
@@ -4898,8 +6150,57 @@ def _classify_response_intent(message_content: str, *, web_search: str = "auto")
 
 
 def _deterministic_response_intent(message_content: str, *, web_search: str = "auto") -> IntentClassification | None:
-    _ = (message_content, web_search)
+    _ = web_search
+    normalized = _normalize_chat_request_text(message_content)
+    if not normalized:
+        return None
+    if _is_artifact_evidence_followup_request(normalized):
+        return IntentClassification("general_chat", 0.91, "deterministic_artifact_evidence_followup")
+    if _is_pine_generation_or_revision_request(normalized):
+        return IntentClassification("pine_generation", 0.93, "deterministic_pine_generation")
     return None
+
+
+def _normalize_chat_request_text(message_content: str | None) -> str:
+    return " ".join((message_content or "").lower().split())
+
+
+def _is_pine_generation_or_revision_request(normalized: str) -> bool:
+    if _is_artifact_evidence_followup_request(normalized):
+        return False
+    if re.search(r"\b(?:backtest|preview|simulate|simulation|paper\s+bot|paper\s+trade)\b", normalized):
+        return False
+    has_pine = bool(re.search(r"\b(?:pine|pinescript|pine\s+script|pine\s+v6)\b", normalized))
+    has_generation_action = bool(
+        re.search(
+            r"\b(?:build|create|generate|regenerate|revise|rewrite|update|fix|repair|implement|write|convert)\b",
+            normalized,
+        )
+    )
+    has_strategy_or_code_context = bool(
+        re.search(
+            r"\b(?:strategy|script|code|artifact|ema|rsi|entry|exit|stop\s*loss|take\s*profit|validation|review)\b",
+            normalized,
+        )
+    )
+    return has_pine and has_generation_action and has_strategy_or_code_context
+
+
+def _is_artifact_evidence_followup_request(message_content: str | None) -> bool:
+    normalized = _normalize_chat_request_text(message_content)
+    if not normalized:
+        return False
+    if re.search(r"\b(?:generate|regenerate|build|create|write|implement|rewrite)\b", normalized):
+        return False
+    has_artifact_context = bool(re.search(r"\b(?:pine|strategy|artifact|script|code|generated)\b", normalized))
+    has_evidence_request = bool(
+        re.search(
+            r"\b(?:validation|validate|validated|static|review|reviewed|passed|pass|fail|failed|"
+            r"blocker|warning|warnings|evaluator|production\s+gate|kiểm\s*tra|danh\s*gia|đánh\s*giá)\b",
+            normalized,
+        )
+    )
+    return has_artifact_context and has_evidence_request
 
 
 class _NoopIntentClient:
@@ -4931,7 +6232,7 @@ def _intent_classifier_system_prompt() -> str:
 def _chat_intent_decision_system_prompt() -> str:
     intents = ", ".join(sorted(RESPONSE_INTENTS))
     actions = ", ".join(sorted(CHAT_INTENT_ACTIONS))
-    stages = ", ".join(sorted(CHAT_INTENT_MODEL_STAGES))
+    stages = ", ".join(sorted(CHAT_RESPONSE_MODEL_STAGES))
     scopes = ", ".join(sorted(DOMAIN_SCOPES))
     workflows = ", ".join(sorted(WORKFLOW_INTENTS))
     return (
@@ -5056,7 +6357,7 @@ def _parse_chat_intent_decision_json(
     if action not in CHAT_INTENT_ACTIONS:
         return None
     model_stage = _safe_string(payload.get("model_stage")) or _model_stage_for_intent(response_intent)
-    if model_stage not in CHAT_INTENT_MODEL_STAGES:
+    if model_stage not in CHAT_RESPONSE_MODEL_STAGES:
         model_stage = _model_stage_for_intent(response_intent)
     confidence = payload.get("confidence")
     if not isinstance(confidence, int | float):
@@ -5101,17 +6402,20 @@ def _fallback_chat_intent_decision(
     regex_evidence: dict[str, bool],
     domain_scope_hint: str | None = None,
 ) -> ChatIntentDecision:
-    _ = (message_content, web_search, domain_scope_hint)
-    response_intent = "general_chat"
+    deterministic = _deterministic_response_intent(message_content, web_search=web_search)
+    if deterministic is None and str(web_search or "").strip().lower() == "on":
+        if regex_evidence.get("market_research") or regex_evidence.get("market_snapshot"):
+            deterministic = IntentClassification("market_snapshot", 0.9, "deterministic_market_snapshot")
+    response_intent = deterministic.intent if deterministic is not None else "general_chat"
     return ChatIntentDecision(
         response_intent=response_intent,
         action="answer",
         model_stage=_model_stage_for_intent(response_intent),
-        confidence=RESPONSE_INTENT_FALLBACK_CONFIDENCE,
-        source="fallback",
+        confidence=deterministic.confidence if deterministic is not None else RESPONSE_INTENT_FALLBACK_CONFIDENCE,
+        source=deterministic.source if deterministic is not None else "fallback",
         auto_chain=False,
         current_context_required=False,
-        domain_scope="ambiguous",
+        domain_scope=domain_scope_for_response_intent(response_intent) if deterministic is not None else "ambiguous",
         used_signals=evidence_signals_from_regex(regex_evidence),
     )
 
@@ -5184,9 +6488,23 @@ def _direct_action_plan_tool_args(
 ) -> tuple[str, dict[str, Any]] | None:
     if not action_plan.is_active() or action_plan.decision != "call_tool" or not action_plan.tool_id:
         return None
+    arguments = dict(action_plan.arguments or {})
+    if action_plan.tool_id == "generate_pine":
+        if isinstance(arguments.get("strategy_spec"), dict):
+            return action_plan.tool_id, arguments
+        return None
+    if action_plan.tool_id == "create_backtest_plan":
+        if (
+            isinstance(arguments.get("strategy_spec"), dict)
+            and isinstance(arguments.get("pine_code"), str)
+            and arguments.get("pine_code").strip()
+            and isinstance(arguments.get("prompt"), str)
+            and arguments.get("prompt").strip()
+        ):
+            return action_plan.tool_id, arguments
+        return None
     if action_plan.tool_id not in {"query_backtest_trades", "get_backtest_summary", "build_robustness_report", "get_bot_status", "list_bots", "list_bot_events"}:
         return None
-    arguments = dict(action_plan.arguments or {})
     available_tools = available_registry_tool_ids(
         artifact_kinds=artifact_kinds,
         context_text=context_text,
@@ -5501,6 +6819,13 @@ def _failure_assistant_message(payload: dict[str, Any], language: str = "en") ->
         if is_vi
         else "The AI run failed before it could produce a response. Try deterministic mode or retry after checking provider configuration."
     )
+
+
+def _workflow_tool_result_payload(tool_name: str, arguments: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(output)
+    if tool_name == "generate_pine" and isinstance(arguments.get("strategy_spec"), dict):
+        payload["strategy_spec"] = arguments["strategy_spec"]
+    return payload
 
 
 def _tool_success_result(tool_name: str, arguments: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
@@ -6227,7 +7552,7 @@ def _has_web_search_tool(tools: list[dict[str, Any]]) -> bool:
 
 
 def _is_classifier_fallback_source(source: str | None) -> bool:
-    return source in {"fallback", "timeout_fallback", WORKFLOW_TIMEOUT_FALLBACK_SOURCE}
+    return source in {"fallback", "timeout_fallback"} or source in WORKFLOW_KICKOFF_FALLBACK_SOURCES
 
 
 def _decision_allows_readonly_web_search(

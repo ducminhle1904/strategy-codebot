@@ -931,7 +931,7 @@ def test_cli_litellm_keys_aliases_lists_paid_tier_routes(tmp_path: Path) -> None
     result = runner.invoke(app, ["models", "litellm", "keys", "aliases", "--tier", "paid_medium", "--out", str(out_path)])
 
     assert result.exit_code == 0, result.output
-    assert "status=pass tier=paid_medium aliases=5" in result.output
+    assert "status=pass tier=paid_medium aliases=6" in result.output
     assert "paid_medium.strategy_reasoning" in result.output
     report = load_json(out_path)
     assert report["aliases"] == [
@@ -940,6 +940,7 @@ def test_cli_litellm_keys_aliases_lists_paid_tier_routes(tmp_path: Path) -> None
         "paid_medium.repair",
         "paid_medium.strategy_coding",
         "paid_medium.strategy_reasoning",
+        "paid_medium.workflow_fast_gemini_flash",
     ]
 
 
@@ -1023,6 +1024,7 @@ def test_cli_litellm_keys_provision_posts_admin_payload(monkeypatch, tmp_path: P
         "paid_medium.repair",
         "paid_medium.strategy_coding",
         "paid_medium.strategy_reasoning",
+        "paid_medium.workflow_fast_gemini_flash",
     ]
     assert payload["metadata"] == {
         "tier": "paid_medium",

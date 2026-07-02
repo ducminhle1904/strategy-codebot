@@ -113,7 +113,7 @@ export function PaperBotsPage() {
   };
 
   return (
-    <main className="flex h-[100dvh] overflow-hidden bg-background text-foreground">
+    <main className="apple-page-shell flex h-[100dvh] overflow-hidden text-foreground">
       <ConversationSidebar
         activeView="paper-bots"
         collapsed={sidebarCollapsed}
@@ -136,17 +136,17 @@ export function PaperBotsPage() {
         selectedConversationId={null}
         theme={theme}
       />
-      <section className="flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background lg:flex-row">
+      <section className="flex min-h-0 min-w-0 flex-1 overflow-hidden bg-transparent lg:flex-row">
         <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           <div
             className={cn(
-              "mx-auto w-full px-4 py-8 transition-[max-width,padding] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] md:px-8 md:py-10",
+              "mx-auto w-full px-4 py-8 transition-[max-width,padding] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)] md:px-8 md:py-12",
               selectedRuntime ? "max-w-none" : "max-w-7xl"
             )}
           >
             <header className="flex flex-col gap-5 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
-                <h1 className="text-2xl font-semibold tracking-normal md:text-3xl">Bots</h1>
+                <h1 className="apple-section-title">Bots</h1>
                 <p className="mt-2 max-w-2xl text-sm text-muted-foreground">
                   Monitor simulated runtimes, order intents, risk gates, and worker health. No broker execution.
                 </p>
@@ -165,7 +165,7 @@ export function PaperBotsPage() {
             </header>
 
             <div className="mt-6 flex flex-col gap-3 lg:flex-row lg:items-center">
-              <label className="flex h-11 min-w-0 flex-1 items-center gap-3 rounded-[6px] border border-border bg-muted/45 px-4 text-sm text-muted-foreground focus-within:border-primary/40 focus-within:bg-background">
+              <label className="apple-search-shell flex h-11 min-w-0 flex-1 items-center gap-3 px-4 text-sm text-muted-foreground focus-within:border-primary/40">
                 <Search className="size-4 shrink-0" />
                 <span className="sr-only">Search bots</span>
                 <input
@@ -176,13 +176,13 @@ export function PaperBotsPage() {
                   value={searchQuery}
                 />
               </label>
-              <div className="flex flex-wrap gap-1 rounded-[6px] border border-border bg-muted/35 p-1">
+              <div className="apple-frosted flex flex-wrap gap-1 rounded-full border p-1">
                 {PAPER_BOT_STATUS_FILTERS.map((filter) => (
                   <button
                     className={cn(
-                      "h-8 rounded-[4px] px-3 text-xs font-medium transition",
+                      "h-8 rounded-full px-3 text-xs font-medium transition",
                       statusFilter === filter.value
-                        ? "bg-background text-foreground shadow-sm"
+                        ? "bg-background text-foreground"
                         : "text-muted-foreground hover:text-foreground"
                     )}
                     key={filter.value}
@@ -262,8 +262,8 @@ function PaperBotCard({
   return (
     <button
       className={cn(
-        "group flex min-h-[190px] flex-col rounded-[7px] border bg-card p-4 text-left transition hover:-translate-y-0.5 hover:border-primary/40 hover:shadow-md",
-        selected ? "border-primary/60 ring-1 ring-primary/30" : "border-border",
+        "apple-utility-card group flex min-h-[190px] flex-col p-4 text-left transition hover:-translate-y-0.5 hover:border-primary/40",
+        selected && "border-primary/60 ring-1 ring-primary/30",
         tone === "danger" && "border-red-500/50",
         tone === "warning" && "border-amber-500/40"
       )}
@@ -279,7 +279,7 @@ function PaperBotCard({
       </div>
       <div className="mt-4 grid grid-cols-2 gap-2">
         {(metrics.length > 0 ? metrics : [{ label: "Heartbeat", value: String(runtime.heartbeat_count) }]).map((metric) => (
-          <div className="rounded-[5px] border border-border bg-background/60 px-3 py-2" key={metric.label}>
+          <div className="rounded-[8px] border border-border bg-background/60 px-3 py-2" key={metric.label}>
             <p className="text-[11px] text-muted-foreground">{metric.label}</p>
             <p className="mt-0.5 truncate text-sm font-medium">{metric.value}</p>
           </div>
@@ -326,7 +326,7 @@ function PaperBotDrawer({
     <aside
       aria-hidden={!runtime}
       className={cn(
-        "shrink-0 overflow-hidden bg-background transition-[width,max-height,opacity,transform,border-color] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]",
+        "apple-product-tile shrink-0 overflow-hidden transition-[width,max-height,opacity,transform,border-color] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]",
         runtime
           ? "w-full border-t border-border opacity-100 lg:max-h-none lg:w-[min(1040px,64vw)] lg:border-l lg:border-t-0 xl:w-[1040px]"
           : "w-0 translate-x-4 border-transparent opacity-0"
@@ -346,13 +346,13 @@ function PaperBotDrawer({
                 <X className="size-4" />
               </Button>
             </div>
-            <div className="mt-4 flex flex-wrap gap-1 rounded-[6px] border border-border bg-muted/35 p-1">
+            <div className="apple-frosted mt-4 flex flex-wrap gap-1 rounded-full border p-1">
               {DRAWER_TABS.map((tab) => (
                 <button
                   className={cn(
-                    "h-8 rounded-[4px] px-3 text-xs font-medium transition",
+                    "h-8 rounded-full px-3 text-xs font-medium transition",
                     activeTab === tab.value
-                      ? "bg-background text-foreground shadow-sm"
+                      ? "bg-background text-foreground"
                       : "text-muted-foreground hover:text-foreground"
                   )}
                   key={tab.value}
@@ -436,7 +436,7 @@ function ActivityTab({ events, loading }: { events: NautilusRuntimeEvent[]; load
   return (
     <div className="space-y-3">
       {events.map((event) => (
-        <div className="rounded-[6px] border border-border bg-card p-3" key={event.event_id}>
+        <div className="apple-utility-card p-3" key={event.event_id}>
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
               <p className="text-sm font-medium">{readableEventType(event.type)}</p>
@@ -482,7 +482,7 @@ function RiskTab({
         ) : (
           <div className="space-y-2">
             {riskEvents.map((event) => (
-              <p className="rounded-[5px] border border-border bg-background/60 px-3 py-2 text-sm" key={event.event_id}>
+                <p className="rounded-[8px] border border-border bg-background/60 px-3 py-2 text-sm" key={event.event_id}>
                 {readableEventType(event.type)}: {paperBotEventSummary(event)}
               </p>
             ))}
@@ -495,7 +495,7 @@ function RiskTab({
         </p>
         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
           <input
-            className="h-10 min-w-0 flex-1 rounded-[5px] border border-border bg-background px-3 text-sm outline-none focus:border-primary/50"
+            className="h-10 min-w-0 flex-1 rounded-full border border-border bg-background px-4 text-sm outline-none focus:border-primary/50"
             onChange={(event) => onKillSwitchReasonChange(event.target.value)}
             placeholder="Required reason"
             value={killSwitchReason}
@@ -523,7 +523,7 @@ function ArtifactsTab({ artifactIds }: { artifactIds: string[] }) {
     <div className="grid gap-3 md:grid-cols-2">
       {artifactIds.map((artifactId) => (
         <Link
-          className="rounded-[6px] border border-border bg-card p-3 text-sm transition hover:border-primary/40"
+          className="apple-utility-card p-3 text-sm transition hover:border-primary/40"
           href={`/artifacts?artifact=${encodeURIComponent(artifactId)}`}
           key={artifactId}
         >
@@ -625,7 +625,7 @@ function MetricGrid({ runtime }: { runtime: NautilusRuntime }) {
 
 function InfoTile({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-[6px] border border-border bg-card p-3">
+    <div className="apple-utility-card p-3">
       <p className="text-xs text-muted-foreground">{label}</p>
       <p className="mt-1 break-words text-sm font-medium">{value}</p>
     </div>
@@ -634,7 +634,7 @@ function InfoTile({ label, value }: { label: string; value: string }) {
 
 function Panel({ children, title }: { children: ReactNode; title: string }) {
   return (
-    <section className="rounded-[7px] border border-border bg-card p-4">
+    <section className="apple-utility-card p-4">
       <h3 className="text-sm font-semibold">{title}</h3>
       <div className="mt-3">{children}</div>
     </section>
@@ -664,7 +664,7 @@ function PaperBotsEmpty({
   title: string;
 }) {
   return (
-    <div className="flex min-h-[220px] flex-col items-center justify-center rounded-[8px] border border-dashed border-border bg-card/40 px-4 text-center">
+    <div className="apple-utility-card flex min-h-[220px] flex-col items-center justify-center border-dashed px-4 text-center">
       <div className="mb-3 flex size-10 items-center justify-center rounded-full border border-border bg-background text-muted-foreground">
         {icon}
       </div>
@@ -678,7 +678,7 @@ function PaperBotsLoading() {
   return (
     <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
       {Array.from({ length: 6 }).map((_, index) => (
-        <div className="h-[190px] animate-pulse rounded-[7px] border border-border bg-card" key={index} />
+        <div className="apple-utility-card h-[190px] animate-pulse" key={index} />
       ))}
     </div>
   );

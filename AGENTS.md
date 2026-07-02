@@ -34,3 +34,12 @@ This repo uses a repository harness. Keep this file short: it is a map, not the 
 - Risky transitions require canonical audit events in `run_events`: model proposal, backend validation/rejection, user gate, and execution decision. Next.js logs are bridge/operational evidence, not the durable source of truth.
 - Treat artifacts and knowledge-base freshness as product behavior: preserve artifact ordering, required-source promotion, stale-chunk pruning, and suppression of raw or empty validation/trade/plan reports.
 - When Clerk or browser auth blocks direct UI proof, verify product behavior through backend stream/state checks plus focused frontend tests, and record the auth blocker clearly.
+
+## Chat Session Audit Playbook
+
+- Given a `conv_...` id, audit the live runtime timeline first: Docker/OrbStack service logs plus Postgres records for `conversation_messages`, `assistant_runs`, `run_events`, `tool_calls`, workflow tasks, and artifacts when relevant.
+- Reconstruct the session in order: user messages, assistant runs, run status/errors, provider/model route events, classifier events, `model_action.*`, workflow/task events, tool events, continuation events, and final persisted assistant messages.
+- Treat `run_events` and durable task/artifact records as canonical. Use Next.js/Copilot route logs only to correlate stream bridge behavior, request ids, frontend timeouts, or missing UI rendering.
+- Compare expected events against actual events: identify missing `chat.workflow.updated`, `workflow.task.created`, `tool.started/completed`, `message.delta`, `run.completed`, or failure events before blaming the UI or model prose.
+- Do not dump raw prompts, secrets, broker/account ids, full artifacts, or raw tool output in the audit summary. Report safe ids, timestamps, event names, status, reason codes, and short payload summaries.
+- End audits with one concrete root cause, the evidence trail, and the smallest backend/frontend fix path; note explicitly when evidence is missing or auth/browser access blocked direct UI proof.

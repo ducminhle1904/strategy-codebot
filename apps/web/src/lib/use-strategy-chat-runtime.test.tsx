@@ -721,6 +721,44 @@ describe("useStrategyChatRuntime", () => {
     });
   });
 
+  it("keeps separate live reasoning steps from safe reasoning deltas", () => {
+    setupCopilotRuntime();
+
+    const runtime = renderRuntime();
+
+    act(() => {
+      copilotSubscriber?.onRunInitialized?.({
+        messages: [{ content: "hello", id: "msg_user", role: "user" }],
+      });
+      copilotSubscriber?.onEvent?.({
+        event: {
+          delta: "- Reading conversation context.\n",
+          messageId: "reasoning_1",
+          type: "REASONING_MESSAGE_CONTENT",
+        },
+      });
+      copilotSubscriber?.onEvent?.({
+        event: {
+          delta: "- Drafting response.\n",
+          messageId: "reasoning_1",
+          type: "REASONING_MESSAGE_CONTENT",
+        },
+      });
+      copilotSubscriber?.onEvent?.({
+        event: {
+          messageId: "msg_assistant",
+          role: "assistant",
+          type: "TEXT_MESSAGE_START",
+        },
+      });
+    });
+
+    expect(runtime.current.messages.at(-1)?.reasoningSummaries).toEqual([
+      expect.objectContaining({ text: "Reading conversation context." }),
+      expect.objectContaining({ text: "Drafting response." }),
+    ]);
+  });
+
   it("preserves CopilotKit metadata when backend hydration returns text-only messages", () => {
     setupCopilotRuntime();
 

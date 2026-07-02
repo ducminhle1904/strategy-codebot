@@ -26,7 +26,8 @@ CHAT_INTENT_REGISTRY: dict[str, Any] = {'schema_version': 1,
                   'pine_code_generation',
                   'repair',
                   'strategy_coding',
-                  'strategy_reasoning'],
+                  'strategy_reasoning',
+                  'workflow_fast'],
  'workflow_intents': ['strategy_to_paper_bot_simulation'],
  'evidence_signals': ['artifact_or_strategy',
                       'current_info',
@@ -125,6 +126,7 @@ CHAT_INTENT_REGISTRY: dict[str, Any] = {'schema_version': 1,
                                                                                         'domain_scope': 'trading_workflow',
                                                                                         'source': 'workflow_timeout_fallback'}}},
  'classifier_fallback_policy': {'readonly_web_search_allowed': True,
+                                'safe_workflow_kickoff_allowed': True,
                                 'workflow_creation_allowed': False,
                                 'auto_chain_allowed': False,
                                 'tool_actions_allowed': False},
@@ -139,6 +141,6 @@ CHAT_INTENT_SCHEMA_VERSION = 1
 DOMAIN_SCOPES = ['product_help', 'trading_workflow', 'artifact_followup', 'context_followup', 'off_topic', 'ambiguous']
 RESPONSE_INTENTS = ['artifact_generation', 'backtest_preview', 'capability_help', 'docs_research', 'general_chat', 'market_research', 'market_snapshot', 'pine_generation', 'strategy_building']
 CHAT_INTENT_ACTIONS = ['answer', 'call_tool', 'suggest_actions', 'ask_clarification', 'start_auto_chain']
-CHAT_INTENT_MODEL_STAGES = ['balanced_review', 'classifier', 'pine_code_generation', 'repair', 'strategy_coding', 'strategy_reasoning']
+CHAT_INTENT_MODEL_STAGES = ['balanced_review', 'classifier', 'pine_code_generation', 'repair', 'strategy_coding', 'strategy_reasoning', 'workflow_fast']
 WORKFLOW_INTENTS = ['strategy_to_paper_bot_simulation']
 EVIDENCE_SIGNALS = ['artifact_or_strategy', 'current_info', 'docs_research', 'explicit_backtest', 'market_research', 'market_snapshot', 'paper_bot_simulation_request', 'pine_or_code', 'preview_intent', 'risky_url_action', 'strategy_design_request']

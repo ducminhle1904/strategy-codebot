@@ -1,4 +1,6 @@
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
@@ -350,6 +352,92 @@ def test_sqlite_repository_create_artifacts_bulk() -> None:
     assert created is not None
     assert [artifact.kind for artifact in created] == ["backtest_report", "backtest_trades"]
     assert [artifact.display_name for artifact in repository.list_artifacts(auth, run.id)] == ["Report", "Trades"]
+
+
+def test_repositories_get_latest_conversation_artifact_by_kind_and_before() -> None:
+    auth = AuthContext("user-a", "workspace-a")
+    other_auth = AuthContext("user-b", "workspace-a")
+    for repository in (InMemoryConversationRepository(), create_sqlite_repository()):
+        conversation = repository.create_conversation(auth, "Artifacts")
+        run = repository.create_run(auth, conversation.id)
+        assert run is not None
+        first = repository.create_artifact(
+            auth,
+            run.id,
+            kind="pine_file",
+            mime_type="text/plain",
+            display_name="first.pine",
+            storage_key=f"{run.id}/first.pine",
+        )
+        assert first is not None
+        time.sleep(0.001)
+        anchor = repository.create_message(auth, conversation.id, "first ready", role="assistant")
+        assert anchor is not None
+        time.sleep(0.001)
+        second = repository.create_artifact(
+            auth,
+            run.id,
+            kind="pine_file",
+            mime_type="text/plain",
+            display_name="second.pine",
+            storage_key=f"{run.id}/second.pine",
+        )
+        assert second is not None
+        repository.create_artifact(
+            auth,
+            run.id,
+            kind="validation_report",
+            mime_type="application/json",
+            display_name="validation.json",
+            storage_key=f"{run.id}/validation.json",
+        )
+        other_conversation = repository.create_conversation(auth, "Other artifacts")
+        other_run = repository.create_run(auth, other_conversation.id)
+        assert other_run is not None
+        repository.create_artifact(
+            auth,
+            other_run.id,
+            kind="pine_file",
+            mime_type="text/plain",
+            display_name="other.pine",
+            storage_key=f"{other_run.id}/other.pine",
+        )
+
+        latest = repository.get_latest_conversation_artifact(auth, conversation.id, kinds={"pine_file"})
+        before_anchor = repository.get_latest_conversation_artifact(
+            auth,
+            conversation.id,
+            kinds={"pine_file"},
+            before=anchor.created_at,
+        )
+        hidden = repository.get_latest_conversation_artifact(other_auth, conversation.id, kinds={"pine_file"})
+
+        assert latest is not None
+        assert latest.id == second.id
+        assert before_anchor is not None
+        assert before_anchor.id == first.id
+        assert hidden is None
+
+
+def test_sql_repository_append_run_events_serializes_concurrent_sequences(tmp_path: Path) -> None:
+    repository = create_sqlite_repository(f"sqlite+pysqlite:///{tmp_path / 'events.db'}")
+    auth = AuthContext("user-a", "workspace-a")
+    conversation = repository.create_conversation(auth, "Events")
+    run = repository.create_run(auth, conversation.id)
+    assert run is not None
+
+    def append_event(index: int):
+        return repository.append_run_events(auth, run.id, [(f"progress.{index}", {"index": index})])
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(append_event, range(24)))
+
+    assert all(result for result in results)
+    events = repository.list_run_events(auth, run.id)
+    assert events is not None
+    sequences = [event.sequence for event in events]
+    assert sequences == list(range(1, 25))
+    assert len(set(sequences)) == 24
 
 
 def test_sqlite_repository_create_artifacts_bulk_rolls_back_on_failure() -> None:

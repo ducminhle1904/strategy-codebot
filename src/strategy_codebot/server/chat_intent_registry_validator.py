@@ -9,6 +9,7 @@ class ChatIntentRegistryValidationError(ValueError):
 
 FALLBACK_POLICY_KEYS = (
     "readonly_web_search_allowed",
+    "safe_workflow_kickoff_allowed",
     "workflow_creation_allowed",
     "auto_chain_allowed",
     "tool_actions_allowed",

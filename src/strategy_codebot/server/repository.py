@@ -631,6 +631,15 @@ class ConversationRepository(Protocol):
 
     def get_artifact(self, auth: AuthContext, artifact_id: str) -> ArtifactRecord | None: ...
 
+    def get_latest_conversation_artifact(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        kinds: set[str],
+        before: datetime | None = None,
+    ) -> ArtifactRecord | None: ...
+
     def list_workspace_artifacts_page(
         self,
         auth: AuthContext,
@@ -893,6 +902,14 @@ class ConversationRepository(Protocol):
     ) -> BotProposalRecord | None: ...
 
     def get_strategy_spec_for_run(self, auth: AuthContext, run_id: str) -> StrategySpecRecord | None: ...
+
+    def get_latest_strategy_spec_for_conversation(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> StrategySpecRecord | None: ...
 
     def cleanup_nautilus_heartbeat_events(
         self,
@@ -1829,6 +1846,34 @@ class InMemoryConversationRepository:
             ]
         return sorted(rows, key=lambda spec: (spec.created_at, spec.id), reverse=True)[0] if rows else None
 
+    def get_latest_strategy_spec_for_conversation(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> StrategySpecRecord | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        with self._lock:
+            run_ids = {
+                run.id
+                for run in self._runs.values()
+                if run.conversation_id == conversation_id
+                and run.owner_user_id == auth.user_id
+                and run.workspace_id == auth.workspace_id
+            }
+            rows = [
+                spec
+                for spec in self._strategy_specs.values()
+                if spec.run_id in run_ids
+                and spec.owner_user_id == auth.user_id
+                and spec.workspace_id == auth.workspace_id
+                and (before is None or spec.created_at <= before)
+            ]
+        return sorted(rows, key=lambda spec: (spec.created_at, spec.id), reverse=True)[0] if rows else None
+
     def create_artifact(
         self,
         auth: AuthContext,
@@ -1907,6 +1952,29 @@ class InMemoryConversationRepository:
                 ],
                 key=lambda artifact: (artifact.created_at, artifact.storage_key, artifact.id),
             )
+
+    def get_latest_conversation_artifact(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        kinds: set[str],
+        before: datetime | None = None,
+    ) -> ArtifactRecord | None:
+        conversation = self.get_conversation(auth, conversation_id)
+        if conversation is None:
+            return None
+        with self._lock:
+            rows = [
+                artifact
+                for artifact in self._artifacts.values()
+                if artifact.conversation_id == conversation.id
+                and artifact.owner_user_id == auth.user_id
+                and artifact.workspace_id == auth.workspace_id
+                and artifact.kind in kinds
+                and (before is None or artifact.created_at <= before)
+            ]
+        return sorted(rows, key=lambda artifact: (artifact.created_at, artifact.id), reverse=True)[0] if rows else None
 
     def get_artifact(self, auth: AuthContext, artifact_id: str) -> ArtifactRecord | None:
         with self._lock:

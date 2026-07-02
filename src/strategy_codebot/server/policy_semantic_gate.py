@@ -10,7 +10,7 @@ from strategy_codebot.server.llm_clients import LLMClient
 from strategy_codebot.server.llm_clients import LLM_EVENT_MESSAGE_DELTA
 from strategy_codebot.server.llm_clients import stream_client
 from strategy_codebot.server.llm_json import extract_json_object
-from strategy_codebot.server.model_routing import MODEL_STAGE_CLASSIFIER
+from strategy_codebot.server.model_routing import MODEL_STAGE_WORKFLOW_FAST
 from strategy_codebot.server.policy import PolicyFinding
 
 POLICY_INTENTS = {"request_execution", "boundary_statement", "educational", "ambiguous"}
@@ -175,7 +175,7 @@ class PolicySemanticGateClassifier:
                     {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
                 ],
                 tools=[],
-                routing_context={"stage": MODEL_STAGE_CLASSIFIER},
+                routing_context={"stage": MODEL_STAGE_WORKFLOW_FAST},
             ):
                 if event.type == LLM_EVENT_MESSAGE_DELTA and event.text:
                     chunks.append(event.text)

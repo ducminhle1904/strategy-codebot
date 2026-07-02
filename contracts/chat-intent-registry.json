@@ -32,7 +32,8 @@
     "pine_code_generation",
     "repair",
     "strategy_coding",
-    "strategy_reasoning"
+    "strategy_reasoning",
+    "workflow_fast"
   ],
   "workflow_intents": [
     "strategy_to_paper_bot_simulation"
@@ -193,6 +194,7 @@
   },
   "classifier_fallback_policy": {
     "readonly_web_search_allowed": true,
+    "safe_workflow_kickoff_allowed": true,
     "workflow_creation_allowed": false,
     "auto_chain_allowed": false,
     "tool_actions_allowed": false

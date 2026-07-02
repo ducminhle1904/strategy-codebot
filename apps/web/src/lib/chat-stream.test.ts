@@ -440,6 +440,28 @@ describe("chat stream helpers", () => {
     ).toBeNull();
   });
 
+  it("extracts safe reasoning tool and workflow metadata", () => {
+    expect(
+      reasoningSummaryFromPythonEvent({
+        data: {
+          payload: {
+            phase: "backtest",
+            safe: true,
+            text: "Preparing Backtest Preview.",
+            tool_id: "create_backtest_plan",
+            workflow_step: "backtest_preview",
+          },
+        },
+        event: "model.reasoning.delta",
+        id: "evt_reasoning",
+      })
+    ).toEqual({
+      text: "Preparing Backtest Preview.",
+      tool_id: "create_backtest_plan",
+      workflow_step: "backtest_preview",
+    });
+  });
+
   it("extracts response intent and market snapshot data events", () => {
     const marketPayload = {
       approximate: true,

@@ -10,6 +10,7 @@ import {
   BotProposalSchema,
   ConversationStateResponseSchema,
   KNOWN_RUN_EVENT_TYPES,
+  MessageCreateSchema,
   RunCreateSchema,
   WORKFLOW_CONTINUATION_EVENT_TYPES,
 } from "./backend-schemas";
@@ -34,6 +35,27 @@ describe("BackendClient", () => {
     });
 
     expect(payload.web_search).toBe("auto");
+  });
+
+  it("accepts selected action metadata on message creation", () => {
+    const payload = MessageCreateSchema.parse({
+      content: "Prepare preview",
+      selected_action: {
+        action_id: "run-backtest-preview",
+        artifact_kind: "backtest_report",
+        next_state: "local_preview_evidence",
+        source_message_id: "msg_1",
+        tool_id: "run_backtest_preview",
+      },
+    });
+
+    expect(payload.selected_action).toEqual({
+      action_id: "run-backtest-preview",
+      artifact_kind: "backtest_report",
+      next_state: "local_preview_evidence",
+      source_message_id: "msg_1",
+      tool_id: "run_backtest_preview",
+    });
   });
 
   it("keeps backtest progress events in the known event contract", () => {
@@ -61,6 +83,11 @@ describe("BackendClient", () => {
         "classifier.completed",
         "classifier.timeout",
         "classifier.failed",
+        "workflow_prompt_generator.started",
+        "workflow_prompt_generator.route",
+        "workflow_prompt_generator.completed",
+        "workflow_prompt_generator.timeout",
+        "workflow_prompt_generator.failed",
         "model_action.proposed",
         "model_action.validated",
         "model_action.rejected",

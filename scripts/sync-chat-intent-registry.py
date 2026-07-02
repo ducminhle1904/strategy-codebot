@@ -2,27 +2,32 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import importlib.util
 import json
 from pathlib import Path
 from pprint import pformat
-import sys
 from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
-
-from strategy_codebot.server.chat_intent_registry_validator import ChatIntentRegistryValidationError
-from strategy_codebot.server.chat_intent_registry_validator import validate_chat_intent_registry_contract
-from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
-from strategy_codebot.server.model_routing import MODEL_STAGE_BALANCED_REVIEW
-from strategy_codebot.server.model_routing import MODEL_STAGE_CLASSIFIER
-from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
-from strategy_codebot.server.model_routing import MODEL_STAGE_REPAIR
-from strategy_codebot.server.model_routing import MODEL_STAGE_STRATEGY_CODING
-
 CONTRACT_PATH = ROOT / "contracts" / "chat-intent-registry.json"
 WORKFLOW_CONTRACT_PATH = ROOT / "contracts" / "workflow-registry.json"
+VALIDATOR_PATH = ROOT / "src" / "strategy_codebot" / "server" / "chat_intent_registry_validator.py"
+MODEL_ROUTING_PATH = ROOT / "src" / "strategy_codebot" / "server" / "model_routing.py"
+CHAT_INTENT_MODEL_STAGE_SET_NAME = "CHAT_INTENT_MODEL_STAGE_VALUES"
+
+
+def _load_validator() -> tuple[type[Exception], Any]:
+    spec = importlib.util.spec_from_file_location("chat_intent_registry_validator", VALIDATOR_PATH)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"Unable to load validator from {VALIDATOR_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ChatIntentRegistryValidationError, module.validate_chat_intent_registry_contract
+
+
+ChatIntentRegistryValidationError, validate_chat_intent_registry_contract = _load_validator()
 
 
 def load_contract(path: Path = CONTRACT_PATH) -> dict[str, Any]:
@@ -53,14 +58,49 @@ def _known_workflow_ids() -> set[str]:
 
 
 def _configured_model_stages() -> set[str]:
-    return {
-        DEFAULT_MODEL_STAGE,
-        MODEL_STAGE_BALANCED_REVIEW,
-        MODEL_STAGE_CLASSIFIER,
-        MODEL_STAGE_PINE_CODE_GENERATION,
-        MODEL_STAGE_REPAIR,
-        MODEL_STAGE_STRATEGY_CODING,
-    }
+    module = ast.parse(MODEL_ROUTING_PATH.read_text(encoding="utf-8"))
+    values: dict[str, str] = {}
+    stage_constant_names: set[str] | None = None
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id == CHAT_INTENT_MODEL_STAGE_SET_NAME:
+                stage_constant_names = _stage_constant_names(statement.value)
+                continue
+            if target.id == "DEFAULT_MODEL_STAGE" or target.id.startswith("MODEL_STAGE_"):
+                try:
+                    value = ast.literal_eval(statement.value)
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(value, str) and value:
+                    values[target.id] = value
+
+    if stage_constant_names is None:
+        raise SystemExit(f"{MODEL_ROUTING_PATH} missing {CHAT_INTENT_MODEL_STAGE_SET_NAME}")
+    missing = sorted(stage_constant_names - set(values))
+    if missing:
+        raise SystemExit(f"{MODEL_ROUTING_PATH} missing model stage constants: {', '.join(missing)}")
+    return {values[name] for name in stage_constant_names}
+
+
+def _stage_constant_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "frozenset" and node.args:
+        node = node.args[0]
+    if not isinstance(node, ast.Set):
+        raise SystemExit(f"{MODEL_ROUTING_PATH} {CHAT_INTENT_MODEL_STAGE_SET_NAME} must be a frozenset/set literal")
+    names: set[str] = set()
+    for element in node.elts:
+        if not isinstance(element, ast.Name):
+            raise SystemExit(
+                f"{MODEL_ROUTING_PATH} {CHAT_INTENT_MODEL_STAGE_SET_NAME} must contain model stage constants"
+            )
+        names.add(element.id)
+    if not names:
+        raise SystemExit(f"{MODEL_ROUTING_PATH} {CHAT_INTENT_MODEL_STAGE_SET_NAME} must not be empty")
+    return names
 
 
 def render_python(contract: dict[str, Any]) -> str:

@@ -13,10 +13,10 @@ export type StrategyStartPromptSuggestion = {
 };
 
 const strategyPromptTextareaClassName =
-  "min-h-20 resize-none rounded-md border-0 !bg-muted/35 px-2 py-2 shadow-none focus-visible:ring-0 dark:!bg-muted/35";
+  "min-h-20 resize-none rounded-[8px] border-0 !bg-transparent px-2 py-2 shadow-none focus-visible:ring-0 dark:!bg-transparent";
 
 const strategyPromptInputShellClassName =
-  "relative h-auto rounded-[8px] border-border !bg-card p-2 pb-12 shadow-sm dark:!bg-card";
+  "apple-frosted relative h-auto rounded-[8px] border-border p-2 pb-12 shadow-sm";
 
 const strategyPromptActionRowClassName =
   "absolute inset-x-2 bottom-2 flex items-center justify-between gap-2 p-0";
@@ -116,16 +116,16 @@ export function StrategyStartPrompt({
   return (
     <section
       className={cn(
-        "mx-auto flex w-full max-w-3xl flex-col items-center justify-center px-4 text-center",
+        "mx-auto flex w-full max-w-3xl min-w-0 flex-col items-center justify-center overflow-hidden px-4 text-center",
         className
       )}
     >
-      <p className="font-semibold text-2xl tracking-[-0.03em]">{title}</p>
+      <p className="apple-page-title">{title}</p>
 
-      <div className="mt-5 flex max-w-2xl flex-wrap justify-center gap-2">
+      <div className="mt-5 flex max-w-full flex-wrap justify-center gap-2">
         {suggestions.map((suggestion) => (
           <button
-            className="inline-flex max-w-full items-center gap-2 rounded-full border border-border bg-muted/40 px-3 py-1.5 text-muted-foreground text-xs transition hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-full border border-border bg-background/70 px-3 py-1.5 text-muted-foreground text-xs transition hover:bg-background hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
             disabled={disabled || suggestion.disabled}
             key={suggestion.label}
             onClick={suggestion.onSelect}

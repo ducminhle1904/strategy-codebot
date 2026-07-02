@@ -9,6 +9,10 @@ from strategy_codebot.server.workflow_registry_contract import WORKFLOW_DEFINITI
 from strategy_codebot.server.workflow_registry_contract import WORKFLOW_TASK_KINDS
 
 MAX_WORKFLOW_PROMPT_OPTIONS = 3
+STRATEGY_SPEC_NEXT_STEP_TASK_ID = "review_strategy_spec_next_step"
+STRATEGY_SPEC_NEXT_ACTION_REQUEST_ID = "next_after_strategy_spec"
+STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE = "generate_pine"
+STRATEGY_SPEC_NEXT_ACTION_SKIP_PINE = "skip_pine"
 
 
 class WorkflowTaskValidationError(ValueError):
@@ -151,6 +155,81 @@ def workflow_task_input_requests(
     return selected
 
 
+def workflow_task_effective_values(task: WorkflowTaskRecord) -> dict[str, Any]:
+    return _existing_task_values(task)
+
+
+def workflow_task_next_input_request_id(
+    workflow_id: str,
+    task_payload: dict[str, Any],
+    *,
+    values: dict[str, Any] | None = None,
+) -> str | None:
+    definition = WORKFLOW_DEFINITIONS.get(workflow_id)
+    if definition is None:
+        return None
+    task_values = dict(task_payload.get("values") or {})
+    if isinstance(values, dict):
+        task_values.update(values)
+    for request_id in _string_list(task_payload.get("input_request_ids")):
+        request = _input_request_for_validation(definition, task_payload, request_id)
+        if request is None:
+            continue
+        raw_value = task_values.get(request_id)
+        if _is_empty_value(raw_value):
+            return request_id
+        try:
+            value = _sanitize_input_value(definition, request, raw_value)
+        except WorkflowTaskValidationError:
+            return request_id
+        if _is_empty_value(value):
+            return request_id
+    return None
+
+
+def merge_workflow_task_input_request_overrides(
+    workflow_id: str,
+    task_payload: dict[str, Any],
+    input_requests: list[dict[str, Any]],
+    *,
+    values: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(task_payload, dict):
+        return task_payload
+    task_template_id = _string_value(task_payload.get("task_template_id"))
+    if task_template_id is None:
+        return task_payload
+    selected_inputs = _string_list(task_payload.get("input_request_ids"))
+    if not selected_inputs:
+        return task_payload
+    incoming_ids = {
+        request_id
+        for item in input_requests
+        if isinstance(item, dict)
+        for request_id in [_string_value(item.get("id"))]
+        if request_id is not None
+    }
+    existing_overrides = [
+        dict(item)
+        for item in task_payload.get("input_requests") or []
+        if isinstance(item, dict) and _string_value(item.get("id")) not in incoming_ids
+    ]
+    task_values = dict(task_payload.get("values") or {})
+    if isinstance(values, dict):
+        task_values.update(values)
+    merged = build_workflow_task_payload(
+        workflow_id,
+        task_template_id,
+        status=_string_value(task_payload.get("status")),
+        input_request_ids=selected_inputs,
+        action_ids=_string_list(task_payload.get("action_ids")) or None,
+        values=task_values,
+        reason=_string_value(task_payload.get("reason")),
+        input_requests=[*existing_overrides, *input_requests],
+    )
+    return merged or task_payload
+
+
 def workflow_task_values(
     workflow_id: str,
     value: Any,
@@ -213,6 +292,7 @@ def workflow_task_continuation_state(record: WorkflowTaskRecord) -> dict[str, An
         return None
     if record.status not in {"completed", "approved"}:
         return None
+    values = _existing_task_values(record)
     return {
         "required": True,
         "task_id": record.id,
@@ -220,7 +300,19 @@ def workflow_task_continuation_state(record: WorkflowTaskRecord) -> dict[str, An
         "task_template_id": record.task_template_id,
         "resume_intent": _string_value(template.get("resume_intent")),
         "reason": "workflow_task_completed",
+        "values": values,
     }
+
+
+def workflow_task_strategy_spec_next_action(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    if value.get("task_template_id") != STRATEGY_SPEC_NEXT_STEP_TASK_ID:
+        return None
+    values = value.get("values")
+    if not isinstance(values, dict):
+        return None
+    return _string_value(values.get(STRATEGY_SPEC_NEXT_ACTION_REQUEST_ID))
 
 
 def workflow_task_resume_context(record: WorkflowTaskRecord, *, language: str = "en") -> str:
@@ -236,6 +328,54 @@ def workflow_task_resume_context(record: WorkflowTaskRecord, *, language: str = 
     )
     if not value_lines:
         value_lines = "- No completed task values were available."
+    next_action = workflow_task_strategy_spec_next_action(
+        {"task_template_id": record.task_template_id, "values": values}
+    )
+    if next_action is not None:
+        if next_action == STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE:
+            instruction_vi = (
+                "Người dùng đã duyệt Strategy Spec và chọn Generate Pine Script. "
+                "Hãy tạo Pine strategy artifact từ spec đã draft trong conversation. "
+                "Không tạo hoặc start Bot/runtime."
+            )
+            instruction_en = (
+                "The user reviewed the Strategy Spec and chose Generate Pine Script. "
+                "Generate the Pine strategy artifact from the drafted spec in the conversation. "
+                "Do not create or start any Bot/runtime."
+            )
+        elif next_action == STRATEGY_SPEC_NEXT_ACTION_SKIP_PINE:
+            instruction_vi = (
+                "Người dùng chọn bỏ qua Pine generation. Hãy giữ workflow ở review-only/paper simulation boundary "
+                "và chuyển sang bước review tiếp theo phù hợp; không tạo Pine và không start Bot/runtime."
+            )
+            instruction_en = (
+                "The user chose to skip Pine generation. Keep the workflow inside review-only paper simulation "
+                "boundaries and move to the appropriate next review step; do not generate Pine or start any Bot/runtime."
+            )
+        else:
+            instruction_vi = (
+                "Người dùng muốn chỉnh hoặc làm khác trước khi tạo Pine. Hãy xử lý yêu cầu đó dựa trên Strategy Spec "
+                "đã draft; không tạo hoặc start Bot/runtime."
+            )
+            instruction_en = (
+                "The user wants to revise or do something different before Pine generation. Handle that request "
+                "against the drafted Strategy Spec; do not create or start any Bot/runtime."
+            )
+        if language == "vi":
+            return (
+                "Tiếp tục workflow Strategy -> Paper Bot Simulation từ HITL task đã hoàn tất.\n"
+                "Dùng các giá trị task bền vững dưới đây làm nguồn dữ liệu authoritative.\n"
+                f"{instruction_vi} Giữ boundary: paper simulation only, no broker execution, review-only evidence.\n"
+                f"Workflow task: {record.task_template_id}\n"
+                f"Task values:\n{value_lines}"
+            )
+        return (
+            "Resume the Strategy -> Paper Bot Simulation workflow from the completed HITL task.\n"
+            "Use the durable task values below as authoritative context.\n"
+            f"{instruction_en} Keep boundaries: paper simulation only, no broker execution, review-only evidence.\n"
+            f"Workflow task: {record.task_template_id}\n"
+            f"Task values:\n{value_lines}"
+        )
     if language == "vi":
         return (
             "Tiếp tục workflow Strategy -> Paper Bot Simulation từ HITL task đã hoàn tất.\n"

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from threading import Lock
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -88,6 +89,16 @@ from strategy_codebot.server.workflow_task_status import WORKFLOW_TASK_RESOLVED_
 class SQLAlchemyConversationRepository:
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._session_factory = session_factory
+        self._run_event_locks: dict[str, Lock] = {}
+        self._run_event_locks_guard = Lock()
+
+    def _run_event_lock(self, run_id: str) -> Lock:
+        with self._run_event_locks_guard:
+            lock = self._run_event_locks.get(run_id)
+            if lock is None:
+                lock = Lock()
+                self._run_event_locks[run_id] = lock
+            return lock
 
     def create_conversation(self, auth: AuthContext, title: str | None = None) -> ConversationRecord:
         now = utc_now()
@@ -755,29 +766,48 @@ class SQLAlchemyConversationRepository:
         run_id: str,
         events: list[RunEventInput],
     ) -> list[RunEventRecord] | None:
-        now = utc_now()
-        with self._session_factory() as session:
-            run = _authorized_run(session, auth, run_id)
-            if run is None:
-                return None
-            last_sequence = session.scalar(select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run.id)) or 0
-            created = [
-                RunEvent(
-                    id=opaque_id("evt"),
-                    run_id=run.id,
-                    conversation_id=run.conversation_id,
-                    owner_user_id=run.owner_user_id,
-                    workspace_id=run.workspace_id,
-                    sequence=last_sequence + index,
-                    type=event_type,
-                    payload_json=payload,
-                    created_at=now,
-                )
-                for index, (event_type, payload) in enumerate(events, start=1)
-            ]
-            session.add_all(created)
-            session.commit()
-            return [_run_event_record(event, run) for event in created]
+        if not events:
+            return []
+        with self._run_event_lock(run_id):
+            for attempt in range(3):
+                now = utc_now()
+                with self._session_factory() as session:
+                    run = session.scalar(
+                        select(AssistantRun)
+                        .where(
+                            AssistantRun.id == run_id,
+                            AssistantRun.owner_user_id == auth.user_id,
+                            AssistantRun.workspace_id == auth.workspace_id,
+                        )
+                        .with_for_update()
+                    )
+                    if run is None:
+                        return None
+                    last_sequence = session.scalar(select(func.max(RunEvent.sequence)).where(RunEvent.run_id == run.id)) or 0
+                    created = [
+                        RunEvent(
+                            id=opaque_id("evt"),
+                            run_id=run.id,
+                            conversation_id=run.conversation_id,
+                            owner_user_id=run.owner_user_id,
+                            workspace_id=run.workspace_id,
+                            sequence=last_sequence + index,
+                            type=event_type,
+                            payload_json=payload,
+                            created_at=now,
+                        )
+                        for index, (event_type, payload) in enumerate(events, start=1)
+                    ]
+                    session.add_all(created)
+                    try:
+                        session.commit()
+                    except IntegrityError:
+                        session.rollback()
+                        if attempt >= 2:
+                            raise
+                        continue
+                    return [_run_event_record(event, run) for event in created]
+        return None
 
     def list_run_events(self, auth: AuthContext, run_id: str) -> list[RunEventRecord] | None:
         with self._session_factory() as session:
@@ -1023,7 +1053,7 @@ class SQLAlchemyConversationRepository:
                 session.commit()
             resolved_ids = {task.id for task in resolved}
             unchanged_records = [_workflow_task_record(task) for task in unchanged if task.id not in resolved_ids]
-            records = sorted(rows, key=lambda task: (task.created_at, task.id))
+            records = sorted(rows, key=lambda task: (_utc_aware(task.created_at), task.id))
             return WorkflowTaskSyncResult(
                 records=[_workflow_task_record(task) for task in records],
                 created=[_workflow_task_record(task) for task in created],
@@ -1223,6 +1253,31 @@ class SQLAlchemyConversationRepository:
             ).first()
             return _strategy_spec_record(spec) if spec is not None else None
 
+    def get_latest_strategy_spec_for_conversation(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        before: datetime | None = None,
+    ) -> StrategySpecRecord | None:
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            query = (
+                select(StrategySpec)
+                .join(AssistantRun, AssistantRun.id == StrategySpec.run_id)
+                .where(
+                    AssistantRun.conversation_id == conversation.id,
+                    StrategySpec.owner_user_id == auth.user_id,
+                    StrategySpec.workspace_id == auth.workspace_id,
+                )
+            )
+            if before is not None:
+                query = query.where(StrategySpec.created_at <= before)
+            spec = session.scalars(query.order_by(StrategySpec.created_at.desc(), StrategySpec.id.desc())).first()
+            return _strategy_spec_record(spec) if spec is not None else None
+
     def create_artifact(
         self,
         auth: AuthContext,
@@ -1315,6 +1370,31 @@ class SQLAlchemyConversationRepository:
             if artifact is None:
                 return None
             return _artifact_record(artifact)
+
+    def get_latest_conversation_artifact(
+        self,
+        auth: AuthContext,
+        conversation_id: str,
+        *,
+        kinds: set[str],
+        before: datetime | None = None,
+    ) -> ArtifactRecord | None:
+        if not kinds:
+            return None
+        with self._session_factory() as session:
+            conversation = _authorized_conversation(session, auth, conversation_id)
+            if conversation is None:
+                return None
+            query = select(Artifact).where(
+                Artifact.conversation_id == conversation.id,
+                Artifact.owner_user_id == auth.user_id,
+                Artifact.workspace_id == auth.workspace_id,
+                Artifact.kind.in_(tuple(kinds)),
+            )
+            if before is not None:
+                query = query.where(Artifact.created_at <= before)
+            artifact = session.scalars(query.order_by(Artifact.created_at.desc(), Artifact.id.desc())).first()
+            return _artifact_record(artifact) if artifact is not None else None
 
     def list_workspace_artifacts_page(
         self,

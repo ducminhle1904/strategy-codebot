@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from strategy_codebot.server import create_app
 from strategy_codebot.server import llm_tools
 from strategy_codebot.server.action_registry import evaluate_action_registry
+from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
 from strategy_codebot.server.conversation_context import ConversationContextBuilder
 from strategy_codebot.server.database import create_sqlite_repository
@@ -24,10 +25,12 @@ from strategy_codebot.server.domain_intent_gate import load_chat_intent_registry
 from strategy_codebot.server.domain_intent_gate import normalize_evidence_signals
 from strategy_codebot.server.domain_intent_gate import validate_chat_intent_registry
 from strategy_codebot.server.model_routing import PROVIDER_ROUTE_EVENT
+from strategy_codebot.server.model_routing import PROVIDER_KEEPALIVE_EVENT
 from strategy_codebot.server.llm_orchestrator import LLMOrchestrator
 from strategy_codebot.server.llm_orchestrator import ActionPlanner
 from strategy_codebot.server.llm_orchestrator import ActionPlanDecision
 from strategy_codebot.server.llm_orchestrator import ChatIntentDecisionPlanner
+from strategy_codebot.server.llm_orchestrator import ClassifierRouteCaptureClient
 from strategy_codebot.server.llm_orchestrator import ResponseIntentClassifier
 from strategy_codebot.server.llm_orchestrator import _classify_domain_scope
 from strategy_codebot.server.llm_orchestrator import _classifier_route_timeout_seconds
@@ -45,14 +48,17 @@ from strategy_codebot.server.llm_orchestrator import _direct_action_plan_tool_ar
 from strategy_codebot.server.llm_orchestrator import _suggestions_payload
 from strategy_codebot.server.llm_orchestrator import _strategy_bot_workflow_payload
 from strategy_codebot.server.llm_orchestrator import _system_prompt
+from strategy_codebot.server.llm_orchestrator import _workflow_kickoff_fallback_decision
 from strategy_codebot.server.llm_orchestrator import chat_safety_preflight
 from strategy_codebot.server.policy_semantic_gate import PolicySemanticGateClassifier
 from strategy_codebot.server.policy_semantic_gate import collect_semantic_policy_candidates
 from strategy_codebot.server.policy_semantic_gate import should_block_semantic_policy
 from strategy_codebot.server.llm_orchestrator import _maybe_backtest_summary_response
 from strategy_codebot.server.llm_orchestrator import _maybe_backtest_trades_response
+from strategy_codebot.server.llm_orchestrator import _maybe_strategy_bot_workflow_payload
 from strategy_codebot.server.llm_orchestrator import _tool_only_success_message
 from strategy_codebot.server.llm_orchestrator import _tool_success_result
+from strategy_codebot.server.llm_orchestrator import _workflow_task_resume_chat_decision
 from strategy_codebot.server.market_data import MarketDataGateway
 from strategy_codebot.server.model_audit import MODEL_ACTION_PROPOSED
 from strategy_codebot.server.model_audit import MODEL_ACTION_REJECTED
@@ -86,6 +92,7 @@ def test_chat_intent_registry_contract_is_valid() -> None:
     assert registry["intent_domain_scopes"]["strategy_building"] == "trading_workflow"
     assert registry["intent_model_stages"]["strategy_building"] == "strategy_reasoning"
     assert registry["intent_model_stages"]["backtest_preview"] == "pine_code_generation"
+    assert "workflow_fast" in registry["model_stages"]
     assert "preview_intent" in registry["evidence_signals"]
 
 
@@ -201,6 +208,45 @@ def test_direct_bot_action_args_do_not_inject_backtest_run_id() -> None:
     )
 
     assert result == ("get_bot_status", {"runtime_id": "rt_1"})
+
+
+def test_direct_backtest_plan_action_accepts_complete_args() -> None:
+    strategy_spec = {
+        "target_platform": "pine_v6",
+        "script_type": "strategy",
+        "market": "crypto",
+        "symbol": "ETHUSDT",
+        "timeframe": "15m",
+        "entry_rules": ["Enter long on fast EMA crossing above slow EMA."],
+        "exit_rules": ["Exit when fast EMA crosses below slow EMA."],
+        "risk_rules": ["Risk 1% per trade."],
+    }
+    result = _direct_action_plan_tool_args(
+        ActionPlanDecision(
+            decision="call_tool",
+            intent_id="backtest_preview",
+            confidence=1.0,
+            source="selected_action",
+            tool_id="create_backtest_plan",
+            arguments={
+                "prompt": "Prepare a review-only local preview.",
+                "strategy_spec": strategy_spec,
+                "pine_code": "//@version=6\nstrategy(\"x\")",
+            },
+        ),
+        artifact_kinds={"pine_file", "validation_report"},
+        context_text="Backtest Preview selected.",
+        web_search="auto",
+    )
+
+    assert result == (
+        "create_backtest_plan",
+        {
+            "prompt": "Prepare a review-only local preview.",
+            "strategy_spec": strategy_spec,
+            "pine_code": "//@version=6\nstrategy(\"x\")",
+        },
+    )
 
 
 def _strategy_workflow_llm(final_text: str = "Mình cần vài thông tin tối thiểu.") -> "SequencedRecordingLLMClient":
@@ -413,6 +459,27 @@ def test_workflow_task_response_validates_inputs_and_tenant(tmp_path: Path) -> N
     assert any(frame["event"] == "workflow.continuation.completed" for frame in continuation_frames)
     intent_frame = next(frame for frame in continuation_frames if frame["event"] == "chat.response_intent")
     assert intent_frame["data"]["payload"]["source"] == "workflow_task_resume"
+    workflow_frames = [
+        frame["data"]["payload"]
+        for frame in continuation_frames
+        if frame["event"] == "chat.workflow.updated"
+    ]
+    assert workflow_frames[-1]["current_step"] == "generate_pine"
+    assert workflow_frames[-1]["completed_steps"] == [
+        "collect_strategy_inputs",
+        "draft_strategy_spec",
+    ]
+    next_task = next(
+        task
+        for task in workflow_frames[-1]["tasks"]
+        if task["task_template_id"] == "review_strategy_spec_next_step"
+    )
+    assert next_task["status"] == "pending_user"
+    assert next_task["blocking"] is True
+    next_request = next_task["input_requests"][0]
+    assert next_request["id"] == "next_after_strategy_spec"
+    assert next_request["question"] == "Strategy spec is ready. What should we do next?"
+    assert next_request["recommended_option_id"] == "generate_pine"
 
     after = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A)
     assert after.status_code == 200, after.text
@@ -423,6 +490,75 @@ def test_workflow_task_response_validates_inputs_and_tenant(tmp_path: Path) -> N
     assert len([item for item in after.json()["messages"] if item["role"] == "assistant"]) > len(
         [item for item in messages_before if item["role"] == "assistant"]
     )
+
+    review_task = next(
+        item
+        for item in client.get(
+            f"/v1/conversations/{conversation['id']}/workflow-tasks",
+            headers=AUTH_A,
+        ).json()["items"]
+        if item["task_template_id"] == "review_strategy_spec_next_step"
+    )
+    reviewed = client.post(
+        f"/v1/workflow-tasks/{review_task['id']}/responses",
+        headers=AUTH_A,
+        json={"values": {"next_after_strategy_spec": "generate_pine"}},
+    )
+    assert reviewed.status_code == 200, reviewed.text
+    assert reviewed.json()["status"] == "completed"
+    assert reviewed.json()["continuation"]["required"] is True
+    stale_run = repository.create_run(auth, conversation["id"], status="completed")
+    assert stale_run is not None
+    stale_continuation_payload = {
+        **reviewed.json()["continuation"],
+        "source": "workflow_task_resume",
+        "status": "completed",
+    }
+    repository.append_run_event(
+        auth,
+        stale_run.id,
+        "workflow.continuation.started",
+        {**stale_continuation_payload, "status": "started"},
+    )
+    repository.append_run_event(
+        auth,
+        stale_run.id,
+        "workflow.continuation.completed",
+        stale_continuation_payload,
+    )
+    stale_state = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A)
+    assert stale_state.status_code == 200, stale_state.text
+    assert stale_state.json()["pending_workflow_continuation"]["task_id"] == review_task["id"]
+    assert stale_state.json()["pending_workflow_continuation"]["reason"] == "workflow_continuation_incomplete"
+
+    pine_continuation = client.post(
+        f"/v1/workflow-tasks/{review_task['id']}/continuations?stream=true",
+        headers=AUTH_A,
+        json={"language": "vi"},
+    )
+    assert pine_continuation.status_code == 200, pine_continuation.text
+    pine_frames = parse_sse(pine_continuation.text)
+    assert any(
+        frame["event"] == "tool.started"
+        and frame["data"]["payload"]["tool_id"] == "generate_pine"
+        for frame in pine_frames
+    )
+    assert any(
+        frame["event"] == "tool.completed"
+        and frame["data"]["payload"]["tool_id"] == "generate_pine"
+        for frame in pine_frames
+    )
+    assert not any(frame["event"] == "provider.started" for frame in pine_frames)
+    pine_workflow_frames = [
+        frame["data"]["payload"]
+        for frame in pine_frames
+        if frame["event"] == "chat.workflow.updated"
+    ]
+    assert pine_workflow_frames
+    assert "collect_strategy_inputs" in pine_workflow_frames[-1]["completed_steps"]
+    assert "draft_strategy_spec" in pine_workflow_frames[-1]["completed_steps"]
+    assert "generate_pine" in pine_workflow_frames[-1]["completed_steps"]
+    assert pine_workflow_frames[-1]["current_step"] != "collect_strategy_inputs"
 
     duplicate = client.post(
         f"/v1/workflow-tasks/{task['id']}/continuations?stream=true",
@@ -455,6 +591,201 @@ def test_workflow_task_response_validates_inputs_and_tenant(tmp_path: Path) -> N
         json={"language": "vi"},
     )
     assert late_duplicate.status_code == 409
+
+
+def test_workflow_collect_input_started_continuation_becomes_retryable_when_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _strategy_workflow_llm()
+    repository = create_sqlite_repository()
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": "Mình muốn xây dựng trading strategy mới rồi tạo Bot simulation paper.",
+            "language": "vi",
+        },
+    )
+    assert stream.status_code == 200, stream.text
+    auth = AuthContext(user_id="user-a", workspace_id="workspace-a")
+    task = client.get(
+        f"/v1/conversations/{conversation['id']}/workflow-tasks",
+        headers=AUTH_A,
+    ).json()["items"][0]
+
+    submitted = client.post(
+        f"/v1/workflow-tasks/{task['id']}/responses",
+        headers=AUTH_A,
+        json={
+            "values": {
+                "market": "crypto",
+                "symbol": "BTCUSDT",
+                "timeframe": "1h",
+                "style": "trend",
+                "risk_preference": "balanced",
+            }
+        },
+    )
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["continuation"]["task_id"] == task["id"]
+
+    stale_run = repository.create_run(auth, conversation["id"], status="running")
+    assert stale_run is not None
+    repository.append_run_event(
+        auth,
+        stale_run.id,
+        "workflow.continuation.started",
+        {
+            **submitted.json()["continuation"],
+            "source": "workflow_task_resume",
+            "status": "started",
+        },
+    )
+
+    fresh_state = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A)
+    assert fresh_state.status_code == 200, fresh_state.text
+    assert fresh_state.json()["pending_workflow_continuation"] is None
+
+    monkeypatch.setenv("STRATEGY_CODEBOT_WORKFLOW_CONTINUATION_STALE_SECONDS", "0")
+    stale_state = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A)
+    assert stale_state.status_code == 200, stale_state.text
+    assert stale_state.json()["pending_workflow_continuation"]["task_id"] == task["id"]
+    assert stale_state.json()["pending_workflow_continuation"]["reason"] == "workflow_continuation_stale"
+
+    retry = client.post(
+        f"/v1/workflow-tasks/{task['id']}/continuations?stream=true",
+        headers=AUTH_A,
+        json={"language": "vi"},
+    )
+    assert retry.status_code == 200, retry.text
+    retry_frames = parse_sse(retry.text)
+    assert any(frame["event"] == "workflow.continuation.started" for frame in retry_frames)
+
+
+def test_workflow_collect_input_failed_continuation_remains_retryable(tmp_path: Path) -> None:
+    llm = _strategy_workflow_llm()
+    repository = create_sqlite_repository()
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": "Mình muốn xây dựng trading strategy mới rồi tạo Bot simulation paper.",
+            "language": "vi",
+        },
+    )
+    assert stream.status_code == 200, stream.text
+    auth = AuthContext(user_id="user-a", workspace_id="workspace-a")
+    task = client.get(
+        f"/v1/conversations/{conversation['id']}/workflow-tasks",
+        headers=AUTH_A,
+    ).json()["items"][0]
+    submitted = client.post(
+        f"/v1/workflow-tasks/{task['id']}/responses",
+        headers=AUTH_A,
+        json={
+            "values": {
+                "market": "crypto",
+                "symbol": "BTCUSDT",
+                "timeframe": "1h",
+                "style": "trend",
+                "risk_preference": "balanced",
+            }
+        },
+    )
+    assert submitted.status_code == 200, submitted.text
+
+    failed_run = repository.create_run(auth, conversation["id"], status="failed")
+    assert failed_run is not None
+    continuation_payload = {
+        **submitted.json()["continuation"],
+        "source": "workflow_task_resume",
+    }
+    repository.append_run_event(
+        auth,
+        failed_run.id,
+        "workflow.continuation.started",
+        {**continuation_payload, "status": "started"},
+    )
+    repository.append_run_event(
+        auth,
+        failed_run.id,
+        "workflow.continuation.failed",
+        {**continuation_payload, "status": "failed", "reason": "provider_idle_timeout"},
+    )
+
+    state = client.get(f"/v1/conversations/{conversation['id']}/state", headers=AUTH_A)
+    assert state.status_code == 200, state.text
+    assert state.json()["pending_workflow_continuation"]["task_id"] == task["id"]
+    assert state.json()["pending_workflow_continuation"]["reason"] == "workflow_continuation_failed"
+
+
+def test_workflow_task_partial_response_regenerates_next_prompt(tmp_path: Path) -> None:
+    auth = AuthContext(user_id="user-a", workspace_id="workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth)
+    assert conversation is not None
+    repository.create_message(
+        auth,
+        conversation.id,
+        "Mình muốn strategy paper bot cho crypto, hãy hỏi từng câu.",
+    )
+    run = repository.create_run(auth, conversation.id)
+    assert run is not None
+    payload = build_workflow_task_payload(
+        "strategy_bot_simulation",
+        "collect_strategy_inputs",
+        input_request_ids=["market", "symbol", "style"],
+        status="pending_user",
+    )
+    assert payload is not None
+    task = repository.upsert_workflow_task(
+        auth,
+        conversation_id=conversation.id,
+        workflow_id="strategy_bot_simulation",
+        task_template_id="collect_strategy_inputs",
+        step_id="collect_strategy_inputs",
+        kind="input_request",
+        status="pending_user",
+        payload_json=payload,
+        run_id=run.id,
+    )
+    assert task is not None
+    llm = RecordingLLMClient(
+        [
+            LLMClientEvent(
+                type="message.delta",
+                text=(
+                    '{"id":"symbol","question":"Crypto đã chọn. Symbol nào nên backtest?",'
+                    '"options":['
+                    '{"id":"ethusdt","value":"ETHUSDT","label":"ETHUSDT","description":"Altcoin thanh khoản cao"},'
+                    '{"id":"btcusdt","value":"BTCUSDT","label":"BTCUSDT","description":"Benchmark crypto"},'
+                    '{"id":"solusdt","value":"SOLUSDT","label":"SOLUSDT","description":"Biến động cao"}'
+                    '],"recommended_option_id":"ethusdt"}'
+                ),
+            )
+        ]
+    )
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+
+    response = client.post(
+        f"/v1/workflow-tasks/{task.id}/responses",
+        headers=AUTH_A,
+        json={"values": {"market": "crypto"}},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "pending_user"
+    symbol = next(item for item in body["input_requests"] if item["id"] == "symbol")
+    assert symbol["question"] == "Crypto đã chọn. Symbol nào nên backtest?"
+    assert [option["label"] for option in symbol["options"]] == ["ETHUSDT", "BTCUSDT", "SOLUSDT"]
+    assert symbol["options"][0]["description"] == "Altcoin thanh khoản cao"
+    assert body["values"]["market"] == "crypto"
 
 
 def test_workflow_task_action_rejects_disabled_gate(tmp_path: Path) -> None:
@@ -944,6 +1275,79 @@ def test_strategy_bot_workflow_concrete_values_count_as_inputs() -> None:
     assert payload["tasks"] == []
 
 
+def test_strategy_bot_workflow_prompts_next_action_after_strategy_spec() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content=(
+            "Tạo trading strategy và paper bot simulation cho market crypto, symbol BTCUSDT, timeframe 1h, "
+            "style trend, risk balanced."
+        ),
+        context_text="",
+        artifact_kinds=set(),
+        completed_strategy_spec=True,
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "generate_pine"
+    assert payload["completed_steps"] == ["collect_strategy_inputs", "draft_strategy_spec"]
+    assert [task["task_template_id"] for task in payload["tasks"]] == ["review_strategy_spec_next_step"]
+    task = payload["tasks"][0]
+    assert task["blocking"] is True
+    assert task["input_request_ids"] == ["next_after_strategy_spec"]
+    assert task["input_requests"][0]["question"] == "Strategy spec is ready. What should we do next?"
+    assert [option["id"] for option in task["input_requests"][0]["options"]] == [
+        "generate_pine",
+        "revise_strategy_spec",
+        "skip_pine",
+    ]
+
+
+def test_workflow_task_resume_decision_uses_strategy_spec_next_action() -> None:
+    decision = _workflow_task_resume_chat_decision(
+        {
+            "task_template_id": "review_strategy_spec_next_step",
+            "resume_intent": "strategy_building",
+            "values": {"next_after_strategy_spec": "generate_pine"},
+        }
+    )
+
+    assert decision.source == "workflow_task_resume"
+    assert decision.response_intent == "pine_generation"
+    assert decision.workflow_intent == "strategy_to_paper_bot_simulation"
+    assert decision.auto_chain is False
+
+
+def test_generate_pine_next_action_resume_keeps_strategy_spec_completed() -> None:
+    repository = create_sqlite_repository()
+    auth = AuthContext(user_id="user-a", workspace_id="workspace-a")
+    conversation = repository.create_conversation(auth)
+    assert conversation is not None
+    decision = _workflow_task_resume_chat_decision(
+        {
+            "task_template_id": "review_strategy_spec_next_step",
+            "resume_intent": "strategy_building",
+            "values": {"next_after_strategy_spec": "generate_pine"},
+        }
+    )
+
+    payload = _maybe_strategy_bot_workflow_payload(
+        repository=repository,
+        auth=auth,
+        conversation_id=conversation.id,
+        chat_decision=decision,
+        message_content=(
+            "Resume workflow from reviewed spec for market crypto, symbol BTCUSDT, timeframe 1h, "
+            "style trend, risk balanced."
+        ),
+        context_text="market crypto symbol BTCUSDT timeframe 1h style trend risk balanced",
+        artifact_kinds=set(),
+        completed_strategy_spec=True,
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "generate_pine"
+    assert payload["completed_steps"] == ["collect_strategy_inputs", "draft_strategy_spec"]
+
+
 def test_strategy_bot_workflow_skips_backtest_for_draft_only_review() -> None:
     payload = _strategy_bot_workflow_payload(
         message_content=(
@@ -963,6 +1367,49 @@ def test_strategy_bot_workflow_skips_backtest_for_draft_only_review() -> None:
     }
     assert payload["evidence_status"] == "needs_validation_or_robustness_check"
     assert payload["start_allowed"] is False
+
+
+def test_generic_generate_pine_tool_does_not_create_paper_bot_workflow(tmp_path: Path) -> None:
+    repository = create_sqlite_repository()
+    artifact_store = LocalArtifactStore(tmp_path)
+    auth = AuthContext(user_id="user-a", workspace_id="workspace-a")
+    conversation = repository.create_conversation(auth)
+    assert conversation is not None
+    run = repository.create_run(auth, conversation.id)
+    assert run is not None
+    orchestrator = LLMOrchestrator(
+        repository=repository,
+        artifact_store=artifact_store,
+        client=RecordingLLMClient([]),
+    )
+
+    frames = [
+        frame
+        for raw in orchestrator._execute_tool_call(
+            auth,
+            run,
+            "generate_pine",
+            {"strategy_spec": valid_spec()},
+            orchestrator._new_budget(),
+            response_intent="strategy_building",
+            user_message=(
+                "Build a review-only BTCUSDT 1h EMA 20/50 trend-following strategy "
+                "with bounded risk and generate Pine v6 output."
+            ),
+            context_text="",
+            web_search="off",
+            language="en",
+            workflow_intent=None,
+        )
+        for frame in parse_sse(raw)
+    ]
+
+    event_types = [frame["event"] for frame in frames]
+    assert "tool.completed" in event_types
+    assert "artifact.created" in event_types
+    assert "chat.workflow.updated" not in event_types
+    assert not any(event.type == "workflow.task.created" for event in repository.list_run_events(auth, run.id))
+    assert repository.list_workflow_tasks(auth, conversation.id) == []
 
 
 def test_strategy_bot_workflow_skipped_evidence_keeps_completed_proposal_start_locked() -> None:
@@ -1003,6 +1450,26 @@ def test_strategy_bot_workflow_ignores_generic_simulation_without_bot_signal() -
     )
 
     assert payload is None
+
+
+def test_strategy_bot_workflow_downstream_artifacts_prevent_collect_input_regression() -> None:
+    payload = _strategy_bot_workflow_payload(
+        message_content="Prepare a review-only local preview evidence check for the current strategy.",
+        context_text="crypto ETHUSDT 15m risk aggressive",
+        artifact_kinds={"pine_file", "validation_report", "review_report"},
+        force=True,
+    )
+
+    assert payload is not None
+    assert payload["current_step"] == "backtest_preview"
+    assert payload["completed_steps"] == [
+        "collect_strategy_inputs",
+        "draft_strategy_spec",
+        "generate_pine",
+        "static_validation",
+    ]
+    assert payload["missing_fields"] == []
+    assert payload["blocked_reason"] is None
 
 
 def test_strategy_bot_workflow_accepts_lowercase_stock_symbol() -> None:
@@ -1212,6 +1679,149 @@ def test_strategy_bot_timeout_fallback_opens_collect_input_workflow(
     assert tasks.json()["items"][0]["task_template_id"] == "collect_strategy_inputs"
 
 
+def test_strategy_bot_classifier_fallback_opens_collect_input_workflow(tmp_path: Path) -> None:
+    repository = create_sqlite_repository()
+    llm = SequencedRecordingLLMClient(
+        [
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=json.dumps(
+                        {
+                            "policy_intent": "boundary_statement",
+                            "target": "broker_execution",
+                            "polarity": "deny",
+                            "confidence": 0.92,
+                            "reason_code": "paper_only_boundary",
+                        }
+                    ),
+                )
+            ],
+            [LLMClientEvent(type="message.delta", text="not valid classifier json")],
+            [LLMClientEvent(type="message.delta", text="main provider should not be called")],
+        ]
+    )
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": (
+                "Mình muốn xây dựng một trading strategy mới và sau đó tạo Bot simulation để theo dõi thử. "
+                "Đi theo workflow từng bước, tạo strategy spec trước, chưa tạo Bot. "
+                "Bot chỉ là paper simulation, không broker execution, không tự start runtime nếu chưa có confirmation UI rõ ràng."
+            ),
+            "language": "vi",
+        },
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    event_types = [frame["event"] for frame in frames]
+
+    assert "classifier.completed" in event_types
+    assert "chat.workflow.updated" in event_types
+    assert "provider.started" not in event_types
+    assert "tool.started" not in event_types
+    assert "chat.action_plan" not in event_types
+    assert frames[-1]["event"] == "run.completed"
+    assert frames[-1]["data"]["payload"]["source"] == "workflow_task_prompt"
+    intent_payload = next(frame["data"]["payload"] for frame in frames if frame["event"] == "chat.response_intent")
+    assert intent_payload["source"] == "workflow_classifier_fallback"
+    assert intent_payload["workflow_intent"] == "strategy_to_paper_bot_simulation"
+    assert set(intent_payload["used_signals"]) >= {"paper_bot_simulation_request", "strategy_design_request"}
+
+    workflow_payload = next(frame["data"]["payload"] for frame in frames if frame["event"] == "chat.workflow.updated")
+    assert workflow_payload["workflow_id"] == "strategy_bot_simulation"
+    assert workflow_payload["current_step"] == "collect_strategy_inputs"
+    assert workflow_payload["start_allowed"] is False
+
+    run_id = frames[0]["data"]["run_id"]
+    auth = AuthContext(user_id="user-a", workspace_id="workspace-a")
+    persisted_events = repository.list_run_events(auth, run_id)
+    assert any(event.type == "workflow.task.created" for event in persisted_events)
+    assert any(
+        event.type == "model_action.validated"
+        and event.payload.get("reason_code") == "workflow_classifier_fallback"
+        for event in persisted_events
+    )
+
+    tasks = client.get(
+        f"/v1/conversations/{conversation['id']}/workflow-tasks",
+        headers=AUTH_A,
+    )
+    assert tasks.status_code == 200
+    assert tasks.json()["items"][0]["task_template_id"] == "collect_strategy_inputs"
+
+
+def test_workflow_kickoff_fallback_requires_safe_input_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "strategy_codebot.server.llm_orchestrator.classifier_fallback_policy",
+        lambda: {
+            "readonly_web_search_allowed": True,
+            "safe_workflow_kickoff_allowed": False,
+            "workflow_creation_allowed": False,
+            "auto_chain_allowed": False,
+            "tool_actions_allowed": False,
+        },
+    )
+
+    decision = _workflow_kickoff_fallback_decision(
+        (
+            "Mình muốn xây dựng một trading strategy mới và sau đó tạo Bot simulation để theo dõi thử. "
+            "Bot chỉ là paper simulation, không broker execution, không tự start runtime."
+        ),
+        source="workflow_classifier_fallback",
+    )
+
+    assert decision is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Check latest Pine Script v6 strategy.entry docs and summarize current changes.",
+        "ETH đang bao nhiêu rồi?",
+        "What can Strategy Codebot do?",
+    ],
+)
+def test_classifier_fallback_does_not_open_strategy_workflow_for_non_workflow_prompts(
+    content: str,
+    tmp_path: Path,
+) -> None:
+    repository = create_sqlite_repository()
+    llm = SequencedRecordingLLMClient(
+        [
+            [LLMClientEvent(type="message.delta", text="not valid classifier json")],
+            [LLMClientEvent(type="message.delta", text="neutral provider response")],
+        ]
+    )
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={"content": content, "language": "vi"},
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    event_types = [frame["event"] for frame in frames]
+
+    assert "chat.workflow.updated" not in event_types
+    assert "workflow.task.created" not in event_types
+    assert "tool.started" not in event_types
+    tasks = client.get(
+        f"/v1/conversations/{conversation['id']}/workflow-tasks",
+        headers=AUTH_A,
+    )
+    assert tasks.status_code == 200
+    assert tasks.json()["items"] == []
+
+
 def test_docs_timeout_fallback_does_not_open_strategy_workflow(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1244,8 +1854,8 @@ def test_classifier_route_event_persists_safe_route_summary(tmp_path: Path) -> N
         type=PROVIDER_ROUTE_EVENT,
         arguments={
             "model_tier": "paid_low",
-            "model_stage": "classifier",
-            "provider_route": "litellm_proxy/paid_low.strategy_reasoning_gemini_lite",
+            "model_stage": "workflow_fast",
+            "provider_route": "litellm_proxy/paid_low.workflow_fast_gemini_flash",
             "provider": "litellm_proxy",
             "model": "paid-low-secret-alias",
             "fallback_used": False,
@@ -1292,7 +1902,8 @@ def test_classifier_route_event_persists_safe_route_summary(tmp_path: Path) -> N
     frames = parse_sse(stream.text)
     route_payload = next(frame["data"]["payload"] for frame in frames if frame["event"] == "classifier.route")
     assert route_payload["classifier_name"] == "chat_intent_decision"
-    assert route_payload["provider_route"] == "litellm_proxy/paid_low.strategy_reasoning_gemini_lite"
+    assert route_payload["stage"] == "workflow_fast"
+    assert route_payload["provider_route"] == "litellm_proxy/paid_low.workflow_fast_gemini_flash"
     assert route_payload["model"] == "paid-low-secret-alias"
     assert "safe_prompt_summary" in route_payload
     assert message not in json.dumps(route_payload, ensure_ascii=False)
@@ -1376,6 +1987,32 @@ class RoutingAwareSequencedLLMClient:
         self.routing_contexts.append(routing_context)
         index = min(len(self.calls_messages) - 1, len(self.event_batches) - 1)
         return list(self.event_batches[index])
+
+
+def test_classifier_route_capture_client_injects_auth_tier_and_overrides_context() -> None:
+    inner = RoutingAwareSequencedLLMClient([[LLMClientEvent(type="message.delta", text="{}")]])
+    auth = AuthContext("user-a", "workspace-a", user_tier="paid_low")
+    capture_client = ClassifierRouteCaptureClient(
+        inner,
+        stage="workflow_fast",
+        route_timeout_seconds=2.5,
+        auth=auth,
+    )
+
+    list(
+        capture_client.stream(
+            messages=[{"role": "user", "content": "classify"}],
+            tools=[],
+            routing_context={"stage": "strategy_reasoning", "user_tier": "free"},
+        )
+    )
+
+    context = inner.routing_contexts[0]
+    assert context["stage"] == "workflow_fast"
+    assert context["auth"] is auth
+    assert context["user_tier"] == "paid_low"
+    assert context["route_timeout_seconds"] == 2.5
+    assert context["hard_route_timeout"] is True
 
 
 class BlockingSecondModelCallControls(SecurityControls):
@@ -1470,7 +2107,19 @@ def test_model_stage_keeps_normal_strategy_chat_on_reasoning() -> None:
     )
 
 
-def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(monkeypatch) -> None:
+def test_model_stage_ignores_control_stage_from_chat_decision() -> None:
+    assert (
+        _model_stage_for_chat(
+            "Check current docs before answering.",
+            response_intent="docs_research",
+            active_tools=[],
+            decision_model_stage="workflow_fast",
+        )
+        == "balanced_review"
+    )
+
+
+def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED", "0")
     auth = AuthContext("user-a", "workspace-a")
     repository = create_sqlite_repository()
@@ -1510,25 +2159,11 @@ def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(mo
         [
             [
                 LLMClientEvent(
-                    type="message.delta",
-                    text=json.dumps(
-                        {
-                            "response_intent": "strategy_building",
-                            "action": "answer",
-                            "model_stage": "strategy_reasoning",
-                            "confidence": 0.92,
-                            "auto_chain": False,
-                            "current_context_required": False,
-                            "missing_inputs": [],
-                            "reasons": ["The user asks to build a strategy."],
-                            "used_signals": ["artifact_or_strategy"],
-                        }
-                    ),
-                )
-            ],
-            [
-                LLMClientEvent(
                     type=PROVIDER_ROUTE_EVENT,
+                    arguments={"model_stage": "strategy_reasoning", "provider_route": "openrouter/reasoning"},
+                ),
+                LLMClientEvent(
+                    type=PROVIDER_KEEPALIVE_EVENT,
                     arguments={"model_stage": "strategy_reasoning", "provider_route": "openrouter/reasoning"},
                 ),
                 LLMClientEvent(
@@ -1556,7 +2191,8 @@ def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(mo
             ],
         ]
     )
-    orchestrator = LLMOrchestrator(repository=repository, artifact_store=None, client=llm)
+    artifact_store = LocalArtifactStore(tmp_path)
+    orchestrator = LLMOrchestrator(repository=repository, artifact_store=artifact_store, client=llm)
 
     frames = [
         frame
@@ -1572,12 +2208,12 @@ def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(mo
 
     routed_stages = [context.get("stage") for context in llm.routing_contexts]
     assert routed_stages == [
-        "classifier",
         "strategy_reasoning",
         "strategy_coding",
         "pine_code_generation",
     ]
-    stage_payloads = [json.loads(messages[-1]["content"]) for messages in llm.calls_messages[1:]]
+    assert llm.routing_contexts[0]["user_tier"] == "paid_low"
+    stage_payloads = [json.loads(messages[-1]["content"]) for messages in llm.calls_messages]
     assert [payload["response_contract"]["top_level_schema"]["stage"]["const"] for payload in stage_payloads] == [
         "strategy_reasoning",
         "strategy_coding",
@@ -1592,12 +2228,31 @@ def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(mo
             "handoff_notes",
             "policy_observations",
         ]
+    coding_contract = stage_payloads[1]["response_contract"]
+    assert coding_contract["output_schema"]["strategy_spec"]["required_keys"] == [
+        "target_platform",
+        "script_type",
+        "market",
+        "timeframe",
+        "entry_rules",
+        "exit_rules",
+        "risk_rules",
+    ]
+    pine_contract = stage_payloads[2]["response_contract"]
+    assert "first non-whitespace characters must be //@version=6" in pine_contract["output_schema"]["pine_code"]
     route_event_stages = [
         frame["data"]["payload"]["model_stage"]
         for frame in frames
         if frame["event"] == PROVIDER_ROUTE_EVENT
     ]
     assert route_event_stages == ["strategy_reasoning", "strategy_coding", "pine_code_generation"]
+    reasoning_frames = [frame["data"]["payload"] for frame in frames if frame["event"] == "model.reasoning.delta"]
+    assert any(
+        frame.get("phase") == "strategy_spec"
+        and frame.get("workflow_step") == "draft_strategy_spec"
+        and frame.get("safe") is True
+        for frame in reasoning_frames
+    )
     prompt_chain_events = [frame for frame in frames if frame["event"].startswith("prompt_chain.")]
     assert [frame["event"] for frame in prompt_chain_events] == [
         "prompt_chain.started",
@@ -1613,6 +2268,26 @@ def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(mo
     ] == ["strategy_reasoning", "strategy_coding", "pine_code_generation"]
     assert all("output" not in frame["data"]["payload"] for frame in prompt_chain_events)
     assert prompt_chain_events[-1]["data"]["payload"]["stage_count"] == 3
+    event_types = [frame["event"] for frame in frames]
+    assert "artifact.created" in event_types
+    assert "validation.completed" in event_types
+    assert "review.completed" in event_types
+    assert "evaluator_optimizer.summary" in event_types
+    first_artifact_index = event_types.index("artifact.created")
+    final_delta_index = next(index for index, event in enumerate(event_types) if event == "message.delta")
+    assert first_artifact_index < final_delta_index
+    artifacts = [
+        artifact
+        for run in repository.list_runs(auth, conversation.id)
+        for artifact in (repository.list_artifacts(auth, run.id) or [])
+    ]
+    pine_artifacts = [artifact for artifact in artifacts if artifact.kind == "pine_file"]
+    assert len(pine_artifacts) == 1
+    assert pine_artifacts[0].display_name == "strategy.pine"
+    persisted_spec = repository.get_strategy_spec_for_run(auth, pine_artifacts[0].run_id or "")
+    assert persisted_spec is not None
+    assert persisted_spec.payload_json["name"] == "EMA Risk Strategy"
+    assert artifact_store.read_content(pine_artifacts[0]).startswith("//@version=6")
     final_text = "\n".join(
         frame["data"]["payload"].get("text") or frame["data"]["payload"].get("delta") or ""
         for frame in frames
@@ -1623,6 +2298,297 @@ def test_strategy_prompt_chain_routes_internal_stages_and_keeps_json_internal(mo
     assert "strategy_spec" not in final_text
     assert "handoff_notes" not in final_text
     assert '"stage"' not in final_text
+
+
+def test_strategy_prompt_chain_invalid_handoff_retries_once(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED", "0")
+    auth = AuthContext("user-a", "workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth)
+    strategy_spec = valid_spec()
+    reasoning_payload = {
+        "stage": "strategy_reasoning",
+        "output": {
+            "summary": "EMA trend-following setup with bounded risk.",
+            "constraints": ["Use confirmed candle closes."],
+            "indicators": ["EMA fast", "EMA slow"],
+            "entries": ["Enter long when fast EMA crosses above slow EMA."],
+            "exits": ["Exit on reversal or stop/target."],
+            "risk_rules": ["Risk 1% account equity per trade."],
+            "non_goals": ["No live execution."],
+        },
+        "assumptions": ["BTCUSDT 1h."],
+        "handoff_notes": "Pass brief to strategy_coding.",
+        "policy_observations": [],
+    }
+    invalid_coding_payload = {
+        "stage": "strategy_coding",
+        "output": {"strategy_spec": {"name": "Missing schema skeleton"}},
+        "assumptions": [],
+        "handoff_notes": "Invalid.",
+        "policy_observations": [],
+    }
+    coding_payload = {
+        "stage": "strategy_coding",
+        "output": {"strategy_spec": strategy_spec},
+        "assumptions": ["Use bounded sizing."],
+        "handoff_notes": "Pass schema-valid spec to pine_code_generation.",
+        "policy_observations": [],
+    }
+    pine_payload = {
+        "stage": "pine_code_generation",
+        "output": {"pine_code": '//@version=6\nstrategy("EMA Risk Strategy")\nplot(close)'},
+        "assumptions": ["Review-only Pine artifact."],
+        "handoff_notes": "Pine code ready for user-facing response.",
+        "policy_observations": [],
+    }
+    llm = RoutingAwareSequencedLLMClient(
+        [
+            [LLMClientEvent(type="message.delta", text=json.dumps(reasoning_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(invalid_coding_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(coding_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(pine_payload))],
+        ]
+    )
+    orchestrator = LLMOrchestrator(repository=repository, artifact_store=LocalArtifactStore(tmp_path), client=llm)
+
+    frames = [
+        frame
+        for raw in orchestrator.stream_chat(
+            auth=auth,
+            conversation_id=conversation.id,
+            message_content="Build a review-only BTCUSDT strategy and generate Pine v6 output.",
+            language="en",
+            web_search="off",
+        )
+        for frame in parse_sse(raw)
+    ]
+
+    assert [context.get("stage") for context in llm.routing_contexts] == [
+        "strategy_reasoning",
+        "strategy_coding",
+        "strategy_coding",
+        "pine_code_generation",
+    ]
+    prompt_chain_events = [frame["event"] for frame in frames if frame["event"].startswith("prompt_chain.")]
+    assert prompt_chain_events == [
+        "prompt_chain.started",
+        "prompt_chain.stage_completed",
+        "prompt_chain.stage_completed",
+        "prompt_chain.stage_completed",
+        "prompt_chain.completed",
+    ]
+    assert "prompt_chain.fallback" not in prompt_chain_events
+    event_types = [frame["event"] for frame in frames]
+    assert "artifact.created" in event_types
+    assert "validation.completed" in event_types
+    assert "review.completed" in event_types
+    assert "evaluator_optimizer.summary" in event_types
+
+
+def test_strategy_prompt_chain_persistence_failure_fails_run(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED", "0")
+    auth = AuthContext("user-a", "workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth)
+    strategy_spec = valid_spec()
+    reasoning_payload = {
+        "stage": "strategy_reasoning",
+        "output": {
+            "summary": "EMA trend-following setup with bounded risk.",
+            "constraints": ["Use confirmed candle closes."],
+            "indicators": ["EMA fast", "EMA slow"],
+            "entries": ["Enter long when fast EMA crosses above slow EMA."],
+            "exits": ["Exit on reversal or stop/target."],
+            "risk_rules": ["Risk 1% account equity per trade."],
+            "non_goals": ["No live execution."],
+        },
+        "assumptions": ["BTCUSDT 1h."],
+        "handoff_notes": "Pass brief to strategy_coding.",
+        "policy_observations": [],
+    }
+    coding_payload = {
+        "stage": "strategy_coding",
+        "output": {"strategy_spec": strategy_spec},
+        "assumptions": ["Use bounded sizing."],
+        "handoff_notes": "Pass schema-valid spec to pine_code_generation.",
+        "policy_observations": [],
+    }
+    pine_payload = {
+        "stage": "pine_code_generation",
+        "output": {"pine_code": '//@version=6\nstrategy("EMA Risk Strategy")\nplot(close)'},
+        "assumptions": ["Review-only Pine artifact."],
+        "handoff_notes": "Pine code ready for user-facing response.",
+        "policy_observations": [],
+    }
+    llm = RoutingAwareSequencedLLMClient(
+        [
+            [LLMClientEvent(type="message.delta", text=json.dumps(reasoning_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(coding_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(pine_payload))],
+        ]
+    )
+
+    def fail_persistence(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("artifact persistence failed")
+
+    monkeypatch.setattr("strategy_codebot.server.llm_orchestrator.persist_generated_pine_artifact", fail_persistence)
+    orchestrator = LLMOrchestrator(repository=repository, artifact_store=LocalArtifactStore(tmp_path), client=llm)
+
+    frames = [
+        frame
+        for raw in orchestrator.stream_chat(
+            auth=auth,
+            conversation_id=conversation.id,
+            message_content="Build a review-only BTCUSDT strategy and generate Pine v6 output.",
+            language="en",
+            web_search="off",
+        )
+        for frame in parse_sse(raw)
+    ]
+
+    event_types = [frame["event"] for frame in frames]
+    assert "prompt_chain.completed" in event_types
+    assert "artifact.created" not in event_types
+    assert "run.failed" in event_types
+    assert "run.completed" not in event_types
+    final_text = "\n".join(
+        frame["data"]["payload"].get("text") or frame["data"]["payload"].get("delta") or ""
+        for frame in frames
+        if frame["event"] == "message.delta"
+    )
+    assert "Generated a reviewable Pine Script v6 artifact" not in final_text
+    assert not any(
+        repository.list_artifacts(auth, run.id)
+        for run in repository.list_runs(auth, conversation.id)
+    )
+
+
+def test_prompt_chain_artifact_context_is_available_to_read_only_scout(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("STRATEGY_CODEBOT_ACTION_PLANNER_ENABLED", "0")
+    auth = AuthContext("user-a", "workspace-a")
+    repository = create_sqlite_repository()
+    conversation = repository.create_conversation(auth)
+    strategy_spec = valid_spec()
+    strategy_spec["name"] = "EMA Risk Strategy"
+    reasoning_payload = {
+        "stage": "strategy_reasoning",
+        "output": {
+            "summary": "EMA trend-following setup with bounded risk.",
+            "constraints": ["Use confirmed candle closes."],
+            "indicators": ["EMA 20", "EMA 50"],
+            "entries": ["Enter long when EMA 20 is above EMA 50 on confirmed close."],
+            "exits": ["Exit with 2% stop and 4% take profit."],
+            "risk_rules": ["Risk 1% account equity per trade."],
+            "non_goals": ["No live execution."],
+        },
+        "assumptions": ["BTCUSDT 1h."],
+        "handoff_notes": "Pass brief to strategy_coding.",
+        "policy_observations": [],
+    }
+    coding_payload = {
+        "stage": "strategy_coding",
+        "output": {"strategy_spec": strategy_spec},
+        "assumptions": ["Use bounded sizing."],
+        "handoff_notes": "Pass schema-valid spec to pine_code_generation.",
+        "policy_observations": [],
+    }
+    pine_payload = {
+        "stage": "pine_code_generation",
+        "output": {"pine_code": '//@version=6\nstrategy("EMA Risk Strategy")\nplot(close)'},
+        "assumptions": ["Review-only Pine artifact."],
+        "handoff_notes": "Pine code ready for user-facing response.",
+        "policy_observations": [],
+    }
+    llm = RoutingAwareSequencedLLMClient(
+        [
+            [LLMClientEvent(type="message.delta", text="EMA Pine strategy")],
+            [LLMClientEvent(type="message.delta", text=json.dumps(reasoning_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(coding_payload))],
+            [LLMClientEvent(type="message.delta", text=json.dumps(pine_payload))],
+            [
+                LLMClientEvent(
+                    type="tool.call",
+                    tool_name="knowledge_check",
+                    arguments={
+                        "prompt": "Pine Script v6 rules and risk-policy guidance for BTCUSDT EMA strategy",
+                    },
+                )
+            ],
+            [
+                LLMClientEvent(
+                    type="message.delta",
+                    text=(
+                        "I found the durable strategy.pine artifact and checked Pine v6 "
+                        "risk-policy guidance with read-only tools."
+                    ),
+                )
+            ],
+        ]
+    )
+    client = TestClient(
+        create_app(
+            repository=repository,
+            artifact_root=tmp_path,
+            llm_client=llm,
+        )
+    )
+    conversation_payload = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+    conversation_id = conversation_payload["id"]
+
+    generated = client.post(
+        f"/v1/conversations/{conversation_id}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": (
+                "Generate Pine v6 code for this strategy."
+            ),
+            "web_search": "off",
+        },
+    )
+    assert generated.status_code == 200, generated.text
+    generated_events = [frame["event"] for frame in parse_sse(generated.text)]
+    assert "artifact.created" in generated_events
+
+    followup = client.post(
+        f"/v1/conversations/{conversation_id}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": (
+                "Before changing anything, scout the available internal knowledge/context "
+                "for Pine v6 rules and risk-policy guidance related to this strategy. "
+                "Use read-only tools only."
+            ),
+            "web_search": "off",
+        },
+    )
+
+    assert followup.status_code == 200, followup.text
+    frames = parse_sse(followup.text)
+    event_types = [frame["event"] for frame in frames]
+    assert "agent_loop.started" in event_types
+    assert "agent_loop.tool_checked" in event_types
+    assert "agent_loop.completed" in event_types
+    scout_tool_payload = next(frame["data"]["payload"] for frame in frames if frame["event"] == "agent_loop.tool_checked")
+    assert scout_tool_payload["tool_id"] == "knowledge_check"
+    assert scout_tool_payload["decision"] == "allowed"
+    scout_messages = next(
+        messages
+        for messages, tools in zip(llm.calls_messages, llm.calls_tools, strict=False)
+        if any(tool.get("name") == "knowledge_check" for tool in tools)
+    )
+    scout_context = json.dumps(scout_messages, ensure_ascii=False)
+    assert "current_strategy_artifact" in scout_context
+    assert "pine_artifact_id" in scout_context
+    assert "strategy.pine" in scout_context
+    assert "EMA Risk Strategy" in scout_context
+    final_text = "\n".join(
+        frame["data"]["payload"].get("text") or frame["data"]["payload"].get("delta") or ""
+        for frame in frames
+        if frame["event"] == "message.delta"
+    )
+    assert "I do not have a strategy spec or Pine artifact" not in final_text
+    assert "durable strategy.pine artifact" in final_text
 
 
 def test_strategy_prompt_chain_bad_handoff_falls_back_to_existing_chat(monkeypatch) -> None:
@@ -1682,10 +2648,12 @@ def test_strategy_prompt_chain_bad_handoff_falls_back_to_existing_chat(monkeypat
     ]
 
     assert [context.get("stage") for context in llm.routing_contexts] == [
-        "classifier",
+        "workflow_fast",
+        "strategy_reasoning",
         "strategy_reasoning",
         "strategy_reasoning",
     ]
+    assert llm.routing_contexts[0]["user_tier"] == "paid_low"
     assert not any(context.get("stage") == "strategy_coding" for context in llm.routing_contexts)
     fallback_event = next(frame for frame in frames if frame["event"] == "prompt_chain.fallback")
     assert fallback_event["data"]["payload"]["fallback_reason"] == "invalid_handoff"
@@ -1968,7 +2936,7 @@ def test_response_intent_classifier_keyword_only_helper_is_not_intent_authority(
     assert _classify_response_intent("analyze current ETH market", web_search="auto") == "general_chat"
     assert _classify_response_intent("check latest OpenRouter pricing docs", web_search="auto") == "general_chat"
     assert _classify_response_intent("build an EMA strategy with risk rules", web_search="auto") == "general_chat"
-    assert _classify_response_intent("generate Pine v6 code for this strategy", web_search="auto") == "general_chat"
+    assert _classify_response_intent("generate Pine v6 code for this strategy", web_search="auto") == "pine_generation"
 
 
 def test_response_intent_classifier_uses_llm_for_current_market_semantics() -> None:
@@ -2070,6 +3038,24 @@ def test_chat_intent_decision_parser_accepts_llm_auto_chain() -> None:
     assert decision.workflow_intent == "strategy_to_paper_bot_simulation"
     assert decision.used_signals == ("preview_intent",)
     assert decision.should_start_auto_chain() is True
+
+
+def test_chat_intent_decision_parser_rejects_control_model_stage_for_final_response() -> None:
+    decision = _parse_chat_intent_decision_json(
+        json.dumps(
+            {
+                "response_intent": "docs_research",
+                "action": "answer",
+                "model_stage": "workflow_fast",
+                "confidence": 0.91,
+                "domain_scope": "product_help",
+            }
+        ),
+        available_tools=set(),
+    )
+
+    assert decision is not None
+    assert decision.model_stage == "balanced_review"
 
 
 def test_chat_intent_fallback_does_not_promote_regex_backtest_or_pine_evidence() -> None:
@@ -2177,6 +3163,8 @@ def test_chat_intent_decision_prompt_marks_regex_as_hint() -> None:
     assert "chay thu" in prompt
     assert "domain_scope" in prompt
     assert "ambiguous instead of off_topic" in prompt
+    assert "workflow_fast" not in prompt
+    assert "classifier" not in prompt
 
 
 def test_chat_intent_decision_accepts_precomputed_action_evaluation() -> None:
@@ -3249,6 +4237,107 @@ class TimeoutLLMClient(FailingLLMClient):
         raise ProviderTimeoutError("provider took too long")
 
 
+def test_selected_backtest_preview_action_creates_plan_without_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("BACKTEST_PINEFORGE_ENABLED", "1")
+    auth = AuthContext("user-a", "workspace-a")
+    repository = InMemoryConversationRepository()
+    conversation = repository.create_conversation(auth, title="Backtest action")
+    assert conversation is not None
+    previous_run = repository.create_run(auth, conversation.id, status="completed")
+    assert previous_run is not None
+    strategy_spec = {
+        "target_platform": "pine_v6",
+        "script_type": "strategy",
+        "market": "crypto",
+        "symbol": "ETHUSDT",
+        "timeframe": "15m",
+        "runtime_targets": ["pine_v6"],
+        "entry_rules": ["Enter long when fast EMA crosses above slow EMA on a confirmed bar."],
+        "exit_rules": ["Exit when fast EMA crosses below slow EMA on a confirmed bar."],
+        "risk_rules": ["Risk 1% account equity per trade."],
+        "position_sizing": "Risk 1% account equity per trade",
+        "stop_loss": "2% below entry",
+        "take_profit": "4% above entry",
+    }
+    repository.create_strategy_spec(auth, previous_run.id, strategy_spec, "strategy-spec.v1")
+    artifact_store = LocalArtifactStore(tmp_path)
+    pine_code = "\n".join(
+        [
+            "//@version=6",
+            "strategy(\"EMA Cross\", overlay=true)",
+            "fast = ta.ema(close, 9)",
+            "slow = ta.ema(close, 21)",
+            "if ta.crossover(fast, slow)",
+            "    strategy.entry(\"Long\", strategy.long)",
+            "if ta.crossunder(fast, slow)",
+            "    strategy.close(\"Long\")",
+        ]
+    )
+    pine_key = artifact_store.storage_key(previous_run.id, "pine/strategy.pine")
+    pine_path = tmp_path / pine_key
+    pine_path.parent.mkdir(parents=True, exist_ok=True)
+    pine_path.write_text(pine_code, encoding="utf-8")
+    validation_key = artifact_store.storage_key(previous_run.id, "validation-report.json")
+    validation_path = tmp_path / validation_key
+    validation_path.parent.mkdir(parents=True, exist_ok=True)
+    validation_path.write_text(json.dumps({"status": "pass"}), encoding="utf-8")
+    repository.create_artifact(
+        auth,
+        previous_run.id,
+        kind="pine_file",
+        mime_type="text/plain",
+        display_name="strategy.pine",
+        storage_key=pine_key,
+    )
+    repository.create_artifact(
+        auth,
+        previous_run.id,
+        kind="validation_report",
+        mime_type="application/json",
+        display_name="validation-report.json",
+        storage_key=validation_key,
+    )
+    source_message = repository.create_message(
+        auth,
+        conversation.id,
+        "Pine strategy is ready for Backtest Preview.",
+        role="assistant",
+    )
+    assert source_message is not None
+    llm = RecordingLLMClient([])
+    orchestrator = LLMOrchestrator(repository=repository, artifact_store=artifact_store, client=llm)
+
+    frames = [
+        frame
+        for raw in orchestrator.stream_chat(
+            auth=auth,
+            conversation_id=conversation.id,
+            message_content="Prepare a review-only local preview evidence check for the current strategy.",
+            language="en",
+            selected_action={
+                "action_id": "run-backtest-preview",
+                "tool_id": "run_backtest_preview",
+                "next_state": "local_preview_evidence",
+                "artifact_kind": "backtest_report",
+                "source_message_id": source_message.id,
+            },
+            web_search="off",
+        )
+        for frame in parse_sse(raw)
+    ]
+
+    assert not any(frame["event"] == "provider.started" for frame in frames)
+    tool_started = [frame["data"]["payload"] for frame in frames if frame["event"] == "tool.started"]
+    assert any(payload["tool_id"] == "create_backtest_plan" for payload in tool_started)
+    assert any(frame["event"] == "backtest.preview.approval_required" for frame in frames)
+    assert not any(frame["event"] == "chat.workflow.updated" for frame in frames)
+    reasoning_frames = [frame["data"]["payload"] for frame in frames if frame["event"] == "model.reasoning.delta"]
+    assert any(payload.get("workflow_step") == "backtest_preview" for payload in reasoning_frames)
+
+
 def test_agent_chat_requires_auth(tmp_path: Path) -> None:
     client = TestClient(create_app(repository=create_sqlite_repository(), artifact_root=tmp_path, llm_client=FakeLLMClient([])))
 
@@ -3895,6 +4984,91 @@ def test_allowed_tool_call_runs_after_gates(tmp_path: Path) -> None:
     assert state["strategy_profile"]["source"] == "strategy_spec"
     replay = client.get(f"/v1/runs/{completed['data']['run_id']}/events", headers=AUTH_A).text
     assert "artifact.created" in [frame["event"] for frame in parse_sse(replay)]
+
+
+def test_artifact_evidence_followup_reuses_persisted_validation_review_summary(tmp_path: Path) -> None:
+    llm = FakeLLMClient([LLMClientEvent(type="tool.call", tool_name="generate_pine", arguments={"strategy_spec": valid_spec()})])
+    repository = create_sqlite_repository()
+    client = TestClient(create_app(repository=repository, artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    generated = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={"content": "Please generate Pine v6 for this review-only strategy."},
+    )
+    assert generated.status_code == 200, generated.text
+    generated_events = [frame["event"] for frame in parse_sse(generated.text)]
+    assert "validation.completed" in generated_events
+    assert "review.completed" in generated_events
+    assert "evaluator_optimizer.summary" in generated_events
+
+    followup = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={
+            "content": (
+                "Now explain whether the generated Pine strategy passed static validation "
+                "and review checks. Include any blocker or warning, but do not start paper or live trading."
+            )
+        },
+    )
+
+    assert followup.status_code == 200, followup.text
+    frames = parse_sse(followup.text)
+    event_types = [frame["event"] for frame in frames]
+    assert "provider.started" not in event_types
+    assert "prompt_chain.started" not in event_types
+    assert "validation.completed" in event_types
+    assert "review.completed" in event_types
+    assert "evaluator_optimizer.summary" in event_types
+    replayed = [
+        frame
+        for frame in frames
+        if frame["event"] in {"validation.completed", "review.completed", "evaluator_optimizer.summary"}
+    ]
+    assert all(frame["data"]["payload"]["evidence_source"] == "persisted_conversation_evidence" for frame in replayed)
+    answer = next(
+        frame
+        for frame in frames
+        if frame["event"] == "message.delta" and frame["data"]["payload"].get("source") == "artifact_evidence_followup"
+    )
+    text = answer["data"]["payload"]["text"]
+    assert "static validation" in text
+    assert "review" in text
+    assert "evaluator stop reason" in text
+    assert "paper or live trading" in text
+    assert "Let me" not in text
+
+
+def test_tool_call_preface_is_not_persisted_as_final_answer(tmp_path: Path) -> None:
+    llm = FakeLLMClient(
+        [
+            LLMClientEvent(type="message.delta", text="Let me run both the static validation and the parallel review now."),
+            LLMClientEvent(type="tool.call", tool_name="generate_pine", arguments={"strategy_spec": valid_spec()}),
+        ]
+    )
+    client = TestClient(create_app(repository=create_sqlite_repository(), artifact_root=tmp_path, llm_client=llm))
+    conversation = client.post("/v1/conversations", headers=AUTH_A, json={}).json()
+
+    stream = client.post(
+        f"/v1/conversations/{conversation['id']}/messages?stream=true&mode=agent",
+        headers=AUTH_A,
+        json={"content": "Please generate Pine v6 for this review-only strategy."},
+    )
+
+    assert stream.status_code == 200, stream.text
+    frames = parse_sse(stream.text)
+    fallback = next(
+        frame
+        for frame in frames
+        if frame["event"] == "message.delta" and frame["data"]["payload"].get("source") == "tool_only_success_fallback"
+    )
+    assert "`strategy.pine`" in fallback["data"]["payload"]["text"]
+    messages = client.get(f"/v1/conversations/{conversation['id']}/messages", headers=AUTH_A).json()["items"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert "`strategy.pine`" in messages[1]["content"]
+    assert "Let me run" not in messages[1]["content"]
 
 
 def test_generate_pine_chat_validation_blocks_missing_risk_summary(tmp_path: Path) -> None:

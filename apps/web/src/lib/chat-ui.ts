@@ -69,6 +69,8 @@ export type StrategyChatReasoning = {
   id: string;
   text: string;
   state?: "done" | "streaming";
+  toolId?: string;
+  workflowStep?: string;
 };
 
 export type StrategyChatMessage = {
@@ -216,6 +218,49 @@ export function runEventMetadataByAnchorMessage({
 }
 
 function runEventAnchorMessageId({
+  backendMessages,
+  event,
+}: {
+  backendMessages: BackendMessage[];
+  event: RunEvent;
+}) {
+  const eventTime = Date.parse(event.created_at);
+  if (!Number.isFinite(eventTime)) {
+    return null;
+  }
+  const sortedMessages = [...backendMessages].sort(
+    (left, right) => Date.parse(left.created_at) - Date.parse(right.created_at)
+  );
+  let latestAssistantBeforeEvent: BackendMessage | null = null;
+  let latestUserBeforeEvent: BackendMessage | null = null;
+
+  for (const message of sortedMessages) {
+    const messageTime = Date.parse(message.created_at);
+    if (!Number.isFinite(messageTime)) {
+      continue;
+    }
+    if (messageTime >= eventTime) {
+      return message.role === "assistant" ? message.id : null;
+    }
+    if (message.role === "assistant") {
+      latestAssistantBeforeEvent = message;
+    } else if (message.role === "user") {
+      latestUserBeforeEvent = message;
+    }
+  }
+  if (!latestAssistantBeforeEvent) {
+    return null;
+  }
+  if (!latestUserBeforeEvent) {
+    return latestAssistantBeforeEvent.id;
+  }
+  return Date.parse(latestAssistantBeforeEvent.created_at) >
+    Date.parse(latestUserBeforeEvent.created_at)
+    ? latestAssistantBeforeEvent.id
+    : null;
+}
+
+export function runEventAssistantAnchorMessageId({
   backendMessages,
   event,
 }: {
@@ -383,15 +428,16 @@ export function metadataPatchFromAgUiReasoningEvent(event: {
   if (typeof event.delta !== "string" || !event.delta.trim()) {
     return null;
   }
+  const text = event.delta.replace(/^-\s*/, "").trim();
+  if (!text) {
+    return null;
+  }
   return {
     reasoningSummaries: [
       {
-        id:
-          typeof event.messageId === "string"
-            ? event.messageId
-            : `reasoning-${crypto.randomUUID()}`,
+        id: `reasoning-${stableStringId(text)}`,
         state: "streaming",
-        text: event.delta.replace(/^-\s*/, "").trim(),
+        text,
       },
     ],
   };
@@ -520,6 +566,8 @@ function reasoningSummaryFromCustomValue(
     id: `reasoning-${stableStringId(text)}`,
     state: "streaming",
     text,
+    toolId: sourceText((value as SafeReasoningSummary).tool_id) ?? undefined,
+    workflowStep: sourceText((value as SafeReasoningSummary).workflow_step) ?? undefined,
   };
 }
 
@@ -698,7 +746,9 @@ function mergeReasoningSummaries(
       const existing = merged[existingIndex];
       if (
         existing?.state === reasoning.state &&
-        existing.text === reasoning.text
+        existing.text === reasoning.text &&
+        existing.toolId === reasoning.toolId &&
+        existing.workflowStep === reasoning.workflowStep
       ) {
         continue;
       }

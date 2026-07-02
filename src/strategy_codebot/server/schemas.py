@@ -189,6 +189,31 @@ class WorkflowTaskContinuationState(BaseModel):
     task_template_id: str
     resume_intent: str | None = None
     reason: str | None = None
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class SelectedActionMetadata(BaseModel):
+    action_id: str = Field(min_length=1, max_length=120)
+    tool_id: str = Field(min_length=1, max_length=120)
+    next_state: str | None = Field(default=None, max_length=120)
+    artifact_kind: str | None = Field(default=None, max_length=120)
+    source_message_id: str | None = Field(default=None, max_length=160)
+
+    @field_validator("action_id", "tool_id")
+    @classmethod
+    def normalize_required_selected_action_field(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("selected action field cannot be blank")
+        return normalized
+
+    @field_validator("next_state", "artifact_kind", "source_message_id")
+    @classmethod
+    def normalize_optional_selected_action_field(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class WorkflowTaskContinuationRequest(BaseModel):
@@ -339,6 +364,7 @@ class MessageCreate(BaseModel):
     content: str = Field(min_length=1)
     language: str = "en"
     web_search: str = Field(default="auto", pattern="^(off|auto|on)$")
+    selected_action: SelectedActionMetadata | None = None
 
     @field_validator("content")
     @classmethod

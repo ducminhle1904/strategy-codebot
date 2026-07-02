@@ -131,4 +131,35 @@ describe("ArtifactPreviewContent", () => {
     expect(screen.getByText("Trade count")).toBeVisible();
     expect(screen.getByText("Local preview only.")).toBeVisible();
   });
+
+  it("suppresses the legacy backtest boundary sentence in plan previews", () => {
+    const boundary = [
+      "Local sandbox preview only",
+      "not TradingView proof, broker proof, live trading evidence, or a profitability claim.",
+    ].join("; ");
+
+    render(
+      <ArtifactPreviewContent
+        preview={preview({
+          kind: "backtest_plan",
+          presentation: {
+            dedupe_key: "plan:approval_1",
+            is_primary: true,
+            language_hint: "json",
+            user_kind: "report",
+            viewer_kind: "backtest_plan",
+            visibility: "user",
+          },
+          preview: {
+            approval_id: "approval_1",
+            backtest_config: { symbol: "BTCUSDT", timeframe: "1h" },
+            warnings: [boundary],
+          },
+        })}
+      />
+    );
+
+    expect(screen.getByText("Approval required")).toBeVisible();
+    expect(screen.queryByText(boundary)).not.toBeInTheDocument();
+  });
 });

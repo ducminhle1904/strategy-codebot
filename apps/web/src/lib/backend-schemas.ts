@@ -167,12 +167,27 @@ export const ConversationListResponseSchema = z.object({
 
 export const WebSearchModeSchema = z.enum(["off", "auto", "on"]);
 
+const optionalSelectedActionText = (maxLength: number) =>
+  z.preprocess(
+    (value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+    z.string().trim().min(1).max(maxLength).optional()
+  );
+
+export const SelectedActionMetadataSchema = z.object({
+  action_id: z.string().trim().min(1).max(120),
+  tool_id: z.string().trim().min(1).max(120),
+  next_state: optionalSelectedActionText(120),
+  artifact_kind: optionalSelectedActionText(120),
+  source_message_id: optionalSelectedActionText(160),
+});
+
 export const MessageCreateSchema = z.object({
   content: z.string().min(1).refine((value) => value.trim().length > 0, {
     message: "content must not be blank",
   }),
   language: LanguagePreferenceSchema.optional(),
   web_search: WebSearchModeSchema.default("auto"),
+  selected_action: SelectedActionMetadataSchema.optional(),
 });
 
 export const MessageRoleSchema = z.enum(["user", "assistant", "system", "tool"]);
@@ -386,6 +401,7 @@ export const WorkflowTaskContinuationStateSchema = z.object({
   task_template_id: z.string().min(1),
   resume_intent: z.string().nullable().default(null),
   reason: z.string().nullable().default(null),
+  values: JsonObjectSchema.default({}),
 });
 
 export const WorkflowTaskContinuationRequestSchema = z.object({
@@ -631,6 +647,7 @@ export const PROMPT_CHAIN_RUN_EVENT_TYPES = [
   "prompt_chain.started",
   "prompt_chain.stage_completed",
   "prompt_chain.completed",
+  "prompt_chain.route_timeout",
   "prompt_chain.fallback",
   "prompt_chain.failed",
 ] as const;
@@ -668,6 +685,11 @@ export const KNOWN_RUN_EVENT_TYPES = [
   "classifier.completed",
   "classifier.timeout",
   "classifier.failed",
+  "workflow_prompt_generator.started",
+  "workflow_prompt_generator.route",
+  "workflow_prompt_generator.completed",
+  "workflow_prompt_generator.timeout",
+  "workflow_prompt_generator.failed",
   "model.reasoning.delta",
   "model.usage",
   "tool.started",
@@ -861,6 +883,7 @@ export type ConversationListResponse = z.infer<
   typeof ConversationListResponseSchema
 >;
 export type MessageCreate = z.infer<typeof MessageCreateSchema>;
+export type SelectedActionMetadata = z.infer<typeof SelectedActionMetadataSchema>;
 export type WebSearchMode = z.infer<typeof WebSearchModeSchema>;
 export type MessageRole = z.infer<typeof MessageRoleSchema>;
 export type MessageMode = z.infer<typeof MessageModeSchema>;

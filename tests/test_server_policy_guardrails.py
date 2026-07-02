@@ -51,6 +51,7 @@ def test_agent_output_policy_block_prevents_unsafe_delta_stream(tmp_path: Path) 
         for event in events
         if event not in {"model.reasoning.delta", "provider.started"}
         and not event.startswith("model_action.")
+        and not event.startswith("classifier.")
         and not event.startswith("prompt_chain.")
         and not event.startswith("agent_loop.")
         and event != "evaluator_optimizer.summary"

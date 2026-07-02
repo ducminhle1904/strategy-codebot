@@ -201,6 +201,7 @@ def test_trading_chat_safety_eval_cases_at_api_boundary(tmp_path: Path) -> None:
         for event in unsafe_events
         if event not in {"model.reasoning.delta", "provider.started", "provider.route"}
         and not event.startswith("model_action.")
+        and not event.startswith("classifier.")
         and not event.startswith("prompt_chain.")
         and not event.startswith("agent_loop.")
         and event != "evaluator_optimizer.summary"

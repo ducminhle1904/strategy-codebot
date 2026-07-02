@@ -41,6 +41,16 @@ const IGNORED_ACTIVITY_EVENT_TYPES = new Set<KnownRunEventType>([
   "backtest.data.started",
   "backtest.execution.completed",
   "backtest.queued",
+  "classifier.completed",
+  "classifier.failed",
+  "classifier.route",
+  "classifier.started",
+  "classifier.timeout",
+  "workflow_prompt_generator.completed",
+  "workflow_prompt_generator.failed",
+  "workflow_prompt_generator.route",
+  "workflow_prompt_generator.started",
+  "workflow_prompt_generator.timeout",
   "message.delta",
   ...AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES,
   "model_action.executed",
@@ -424,6 +434,51 @@ export function mapRunEventsToChatActivities(
   return activities.slice(-MAX_ACTIVITIES);
 }
 
+export function mapRunEventsToChatActivitiesByAssistantMessage({
+  activeAssistantMessageId,
+  conversationEvents,
+  language = "en",
+  liveEvents,
+  registry,
+  resolveAnchorMessageId,
+}: {
+  activeAssistantMessageId?: string | null;
+  conversationEvents: RunEvent[];
+  language?: LanguagePreference;
+  liveEvents: RunEvent[];
+  registry?: ActionRegistryLookup;
+  resolveAnchorMessageId: (event: RunEvent) => string | null;
+}): Map<string, ChatActivity[]> {
+  const eventsByMessageId = new Map<string, RunEvent[]>();
+  const durableEventIds = new Set(conversationEvents.map((event) => event.event_id));
+
+  const append = (messageId: string | null | undefined, event: RunEvent) => {
+    if (!messageId) {
+      return;
+    }
+    eventsByMessageId.set(messageId, [...(eventsByMessageId.get(messageId) ?? []), event]);
+  };
+
+  for (const event of conversationEvents) {
+    append(resolveAnchorMessageId(event), event);
+  }
+  for (const event of liveEvents) {
+    if (durableEventIds.has(event.event_id)) {
+      continue;
+    }
+    append(resolveAnchorMessageId(event) ?? activeAssistantMessageId, event);
+  }
+
+  const groupedActivities = new Map<string, ChatActivity[]>();
+  for (const [messageId, events] of eventsByMessageId) {
+    const activities = mapRunEventsToChatActivities(events, language, registry);
+    if (activities.length > 0) {
+      groupedActivities.set(messageId, activities);
+    }
+  }
+  return groupedActivities;
+}
+
 function activityDedupeKey(event: RunEvent): string | null {
   const toolId = payloadValue(event, "tool_id");
   if ((event.type === "tool.started" || event.type === "tool.completed") && toolId) {
@@ -451,6 +506,9 @@ function activityFromRunEvent(
   language: LanguagePreference,
   registry?: ActionRegistryLookup
 ): ChatActivity | null {
+  if (IGNORED_ACTIVITY_EVENT_TYPES.has(event.type as KnownRunEventType)) {
+    return null;
+  }
   const metadataActivity = activityFromEventMetadata(event);
   if (metadataActivity) {
     return { id: event.event_id, ...metadataActivity };

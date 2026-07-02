@@ -50,6 +50,7 @@ from strategy_codebot.server.model_routing import gateway_env_report
 from strategy_codebot.server.model_routing import load_model_registry
 from strategy_codebot.server.model_routing import normalize_user_tier
 from strategy_codebot.server.model_routing import resolve_routes
+from strategy_codebot.server.model_audit import MODEL_ACTION_VALIDATED
 from strategy_codebot.server.model_audit import WORKFLOW_GATE_CONFIRMED
 from strategy_codebot.server.model_audit import WORKFLOW_GATE_REJECTED
 from strategy_codebot.server.model_audit import append_model_audit_event
@@ -168,8 +169,14 @@ from strategy_codebot.server.security_controls import security_error_payload
 from strategy_codebot.server.streaming import DETERMINISTIC_DELTA_CHUNKS
 from strategy_codebot.server.streaming import compact_delta_text
 from strategy_codebot.server.workflow_tasks import WorkflowTaskValidationError
+from strategy_codebot.server.workflow_tasks import STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE
+from strategy_codebot.server.workflow_tasks import STRATEGY_SPEC_NEXT_STEP_TASK_ID
+from strategy_codebot.server.workflow_prompt_generator import generate_workflow_task_prompt_payload
+from strategy_codebot.server.workflow_prompt_generator import workflow_prompt_generator_events
 from strategy_codebot.server.workflow_tasks import validate_workflow_task_response
 from strategy_codebot.server.workflow_tasks import workflow_task_continuation_state
+from strategy_codebot.server.workflow_tasks import workflow_task_effective_values
+from strategy_codebot.server.workflow_tasks import workflow_task_strategy_spec_next_action
 from strategy_codebot.server.workflow_tasks import workflow_task_response_status
 from strategy_codebot.server.workflow_tasks import workflow_task_resume_context
 from strategy_codebot.server.workflow_tasks import workflow_task_state
@@ -184,6 +191,8 @@ logger = logging.getLogger(__name__)
 
 ARTIFACT_PREVIEW_DEFAULT_BYTES = 16 * 1024
 ARTIFACT_PREVIEW_MAX_BYTES = 64 * 1024
+WORKFLOW_CONTINUATION_STALE_SECONDS_ENV = "STRATEGY_CODEBOT_WORKFLOW_CONTINUATION_STALE_SECONDS"
+DEFAULT_WORKFLOW_CONTINUATION_STALE_SECONDS = 120.0
 FEEDBACK_RATING_OPTIONS = (
     ("up", "Up"),
     ("down", "Down"),
@@ -498,6 +507,13 @@ def create_app(
         )
         if updated is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow task not found")
+        if updated.status not in WORKFLOW_TASK_RESOLVED_STATUSES:
+            updated = _refresh_workflow_task_prompt_after_partial_response(
+                conversation_repository,
+                auth,
+                updated,
+                llm_orchestrator.client,
+            ) or updated
         _append_workflow_task_event(
             conversation_repository,
             auth,
@@ -574,13 +590,27 @@ def create_app(
         continuation = workflow_task_continuation_state(task)
         if continuation is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow task is not resumable")
-        continuation_status = _workflow_continuation_event_state(
+        continuation_events = conversation_repository.list_workflow_task_continuation_events(auth, task.id)
+        continuation_items = _workflow_continuation_events_by_task(continuation_events or [])
+        continuation_item = continuation_items.get(task.id, {})
+        continuation_status = continuation_item.get("status")
+        if continuation_status == "started" and not _workflow_continuation_retryable(
             conversation_repository,
             auth,
-            task.id,
-        )
-        if continuation_status in {"started", "completed"}:
+            task,
+            continuation_item,
+        ):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow continuation already started")
+        if continuation_status == "failed" and _workflow_continuation_materialized(
+            conversation_repository,
+            auth,
+            task,
+            continuation_item,
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow continuation already started")
+        if continuation_status == "completed":
+            if _workflow_continuation_materialized(conversation_repository, auth, task, continuation_item):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Workflow continuation already started")
         try:
             llm_orchestrator.ensure_configured()
         except ProviderConfigurationError as exc:
@@ -1840,6 +1870,9 @@ def create_app(
                             message_content=message.content,
                             current_message_id=message.id,
                             request_id=request_id,
+                            selected_action=payload.selected_action.model_dump(mode="json")
+                            if payload.selected_action is not None
+                            else None,
                             trace_id=trace_id,
                             web_search=payload.web_search,
                         ),
@@ -2783,15 +2816,91 @@ def _workflow_task_response(task: WorkflowTaskRecord) -> WorkflowTaskResponse:
     return WorkflowTaskResponse(**workflow_task_state(task))
 
 
-def _workflow_continuation_event_state(
+def _refresh_workflow_task_prompt_after_partial_response(
     repository: ConversationRepository,
     auth: AuthContext,
-    task_id: str,
-) -> str | None:
-    events = repository.list_workflow_task_continuation_events(auth, task_id)
-    if events is None:
-        return None
-    return _workflow_continuation_events_by_task(events).get(task_id, {}).get("status")
+    task: WorkflowTaskRecord,
+    client: LLMClient,
+) -> WorkflowTaskRecord | None:
+    if task.task_template_id != "collect_strategy_inputs":
+        return task
+    values = workflow_task_effective_values(task)
+    result = generate_workflow_task_prompt_payload(
+        client,
+        workflow_id=task.workflow_id,
+        task_payload=task.payload_json or {},
+        language=None,
+        user_prompt=_latest_user_message_content(repository, auth, task.conversation_id),
+        task_values=values,
+        context={"task_status": task.status, "answered_count": len(values)},
+        auth=auth,
+    )
+    if task.run_id:
+        repository.append_run_events(
+            auth,
+            task.run_id,
+            workflow_prompt_generator_events(
+                result,
+                workflow_id=task.workflow_id,
+                task_id=task.id,
+                task_template_id=task.task_template_id,
+            ),
+        )
+    _append_workflow_task_audit_event(
+        repository,
+        auth,
+        task,
+        MODEL_ACTION_VALIDATED,
+        {
+            "actor": "backend",
+            "source": "workflow_prompt_generator",
+            "status": "allowed" if result.status == "generated" else "failed",
+            "reason_code": result.fallback_reason or result.status,
+            "duration_ms": result.duration_ms,
+            "safe_args_summary": {
+                "input_id": result.input_id,
+                "target_input_ids": list(result.target_input_ids),
+                "generated_input_ids": list(result.generated_input_ids),
+                "fallback_input_ids": list(result.fallback_input_ids),
+                "option_count": result.option_count,
+                "generation_status": result.status,
+            },
+        },
+    )
+    if result.payload == (task.payload_json or {}):
+        return task
+    updated = repository.upsert_workflow_task(
+        auth,
+        conversation_id=task.conversation_id,
+        workflow_id=task.workflow_id,
+        task_template_id=task.task_template_id,
+        step_id=task.step_id,
+        kind=task.kind,
+        status=task.status,
+        payload_json=result.payload,
+        run_id=task.run_id,
+    )
+    if updated is not None:
+        _append_workflow_task_event(
+            repository,
+            auth,
+            updated,
+            "workflow.task.updated",
+            {"task_id": updated.id, "task_template_id": updated.task_template_id, "status": updated.status},
+        )
+    return updated or task
+
+
+def _latest_user_message_content(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    conversation_id: str,
+) -> str:
+    messages = repository.list_messages_for_context(auth, conversation_id, limit=20)
+    for message in reversed(messages):
+        if message.role == "user":
+            return message.content
+    return ""
 
 
 def _workflow_continuation_events_by_task(events: list[RunEventRecord]) -> dict[str, dict[str, Any]]:
@@ -2801,15 +2910,134 @@ def _workflow_continuation_events_by_task(events: list[RunEventRecord]) -> dict[
         task_id = payload.get("task_id")
         if not isinstance(task_id, str) or not task_id:
             continue
+        event_state = {
+            "created_at": event.created_at,
+            "payload": payload,
+            "run_id": event.run_id,
+            "sequence": event.sequence,
+        }
         if event.type == "workflow.continuation.required":
-            state_by_task[task_id] = {"payload": payload, "status": "required"}
+            state_by_task[task_id] = {**event_state, "status": "required"}
         elif event.type == "workflow.continuation.started":
-            state_by_task[task_id] = {**state_by_task.get(task_id, {}), "status": "started"}
+            state_by_task[task_id] = {**state_by_task.get(task_id, {}), **event_state, "status": "started"}
         elif event.type == "workflow.continuation.completed":
-            state_by_task[task_id] = {**state_by_task.get(task_id, {}), "status": "completed"}
+            state_by_task[task_id] = {**state_by_task.get(task_id, {}), **event_state, "status": "completed"}
         elif event.type == "workflow.continuation.failed":
-            state_by_task[task_id] = {**state_by_task.get(task_id, {}), "status": "failed"}
+            state_by_task[task_id] = {**state_by_task.get(task_id, {}), **event_state, "status": "failed"}
     return state_by_task
+
+
+def _workflow_continuation_stale_seconds() -> float:
+    raw = os.getenv(WORKFLOW_CONTINUATION_STALE_SECONDS_ENV)
+    if raw is None or raw.strip() == "":
+        return DEFAULT_WORKFLOW_CONTINUATION_STALE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_WORKFLOW_CONTINUATION_STALE_SECONDS
+    return max(0.0, value)
+
+
+def _workflow_continuation_started_is_stale(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    item: dict[str, Any],
+) -> bool:
+    run_id = item.get("run_id")
+    if isinstance(run_id, str) and run_id:
+        run = repository.get_run(auth, run_id)
+        if run is not None and run.status in TERMINAL_RUN_STATUSES:
+            return True
+    created_at = item.get("created_at")
+    if not isinstance(created_at, datetime):
+        return False
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - created_at).total_seconds() >= _workflow_continuation_stale_seconds()
+
+
+def _workflow_continuation_materialized(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    task: WorkflowTaskRecord,
+    item: dict[str, Any],
+    materialization_cache: dict[str, bool] | None = None,
+) -> bool:
+    if task.task_template_id == "collect_strategy_inputs":
+        run_id = item.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            return False
+        if materialization_cache is not None and run_id in materialization_cache:
+            return materialization_cache[run_id]
+        events = repository.list_run_events(auth, run_id)
+        if events is None:
+            if materialization_cache is not None:
+                materialization_cache[run_id] = False
+            return False
+        materialized = False
+        for event in events:
+            if event.type != "chat.workflow.updated":
+                continue
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            completed_steps = payload.get("completed_steps")
+            if isinstance(completed_steps, list) and "draft_strategy_spec" in completed_steps:
+                materialized = True
+                break
+        if materialization_cache is not None:
+            materialization_cache[run_id] = materialized
+        return materialized
+    if task.task_template_id != STRATEGY_SPEC_NEXT_STEP_TASK_ID:
+        return True
+    values = workflow_task_state(task).get("values")
+    next_action = workflow_task_strategy_spec_next_action(
+        {
+            "task_template_id": task.task_template_id,
+            "values": values if isinstance(values, dict) else {},
+        }
+    )
+    if next_action != STRATEGY_SPEC_NEXT_ACTION_GENERATE_PINE:
+        return True
+    run_id = item.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        return False
+    if materialization_cache is not None and run_id in materialization_cache:
+        return materialization_cache[run_id]
+    events = repository.list_run_events(auth, run_id)
+    if events is None:
+        if materialization_cache is not None:
+            materialization_cache[run_id] = False
+        return False
+    materialized = False
+    for event in events:
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if event.type == "tool.completed" and payload.get("tool_id") == "generate_pine":
+            materialized = True
+            break
+        if event.type == "chat.workflow.updated":
+            completed_steps = payload.get("completed_steps")
+            if isinstance(completed_steps, list) and "generate_pine" in completed_steps:
+                materialized = True
+                break
+    if materialization_cache is not None:
+        materialization_cache[run_id] = materialized
+    return materialized
+
+
+def _workflow_continuation_retryable(
+    repository: ConversationRepository,
+    auth: AuthContext,
+    task: WorkflowTaskRecord,
+    item: dict[str, Any],
+    materialization_cache: dict[str, bool] | None = None,
+) -> bool:
+    status_value = item.get("status")
+    if status_value == "failed":
+        return not _workflow_continuation_materialized(repository, auth, task, item, materialization_cache)
+    if status_value != "started":
+        return False
+    if _workflow_continuation_materialized(repository, auth, task, item, materialization_cache):
+        return False
+    return _workflow_continuation_started_is_stale(repository, auth, item)
 
 
 def _pending_workflow_continuation(
@@ -2820,6 +3048,7 @@ def _pending_workflow_continuation(
     tasks = repository.list_workflow_tasks(auth, conversation_id)
     if not tasks:
         return None
+    materialization_cache: dict[str, bool] = {}
     for task in reversed(tasks):
         if workflow_task_continuation_state(task) is None:
             continue
@@ -2827,11 +3056,41 @@ def _pending_workflow_continuation(
         if events is None:
             continue
         item = _workflow_continuation_events_by_task(events).get(task.id, {})
-        if item.get("status") != "required":
-            continue
-        payload = item.get("payload")
-        if isinstance(payload, dict):
-            return payload
+        status = item.get("status")
+        if status == "required":
+            payload = item.get("payload")
+            if isinstance(payload, dict):
+                return payload
+        if status == "failed":
+            continuation = workflow_task_continuation_state(task)
+            if continuation is not None and not _workflow_continuation_materialized(
+                repository,
+                auth,
+                task,
+                item,
+                materialization_cache,
+            ):
+                return {**continuation, "reason": "workflow_continuation_failed"}
+        if status == "started" and _workflow_continuation_retryable(
+            repository,
+            auth,
+            task,
+            item,
+            materialization_cache,
+        ):
+            continuation = workflow_task_continuation_state(task)
+            if continuation is not None:
+                return {**continuation, "reason": "workflow_continuation_stale"}
+        if status == "completed" and not _workflow_continuation_materialized(
+            repository,
+            auth,
+            task,
+            item,
+            materialization_cache,
+        ):
+            continuation = workflow_task_continuation_state(task)
+            if continuation is not None:
+                return {**continuation, "reason": "workflow_continuation_incomplete"}
     return None
 
 

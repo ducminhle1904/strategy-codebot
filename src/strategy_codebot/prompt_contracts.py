@@ -320,13 +320,49 @@ def build_stage_json_contract(stage: str) -> dict[str, Any]:
         return base
     if stage == STAGE_STRATEGY_CODING:
         base["output_schema"] = {
-            "strategy_spec": "non-empty object matching schemas/strategy-spec.schema.json",
+            "strategy_spec": {
+                "type": "object",
+                "required_keys": [
+                    "target_platform",
+                    "script_type",
+                    "market",
+                    "timeframe",
+                    "entry_rules",
+                    "exit_rules",
+                    "risk_rules",
+                ],
+                "optional_keys": [
+                    "symbol",
+                    "position_sizing",
+                    "stop_loss",
+                    "take_profit",
+                    "assumptions",
+                    "constraints",
+                    "user_notes",
+                ],
+                "field_contract": {
+                    "target_platform": "string, use tradingview for Pine output",
+                    "script_type": "string, use strategy for executable review-only Pine strategies",
+                    "market": "string such as crypto, futures, forex, equities",
+                    "symbol": "string when the user provided a symbol",
+                    "timeframe": "string such as 1h, 15m, daily",
+                    "entry_rules": "non-empty array of strings",
+                    "exit_rules": "non-empty array of strings",
+                    "risk_rules": "non-empty array of strings",
+                    "position_sizing": "string when the user provided sizing rules",
+                    "stop_loss": "string when the user provided stop-loss rules",
+                    "take_profit": "string when the user provided take-profit rules",
+                },
+            },
         }
         base["required_output_keys"] = ["strategy_spec"]
         return base
     if stage == STAGE_PINE_CODE_GENERATION:
         base["output_schema"] = {
-            "pine_code": "non-empty Pine Script string starting with //@version=6",
+            "pine_code": (
+                "plain Pine Script string, not markdown, no code fence, non-empty, "
+                "first non-whitespace characters must be //@version=6"
+            ),
         }
         base["required_output_keys"] = ["pine_code"]
         return base

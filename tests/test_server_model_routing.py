@@ -9,6 +9,7 @@ from strategy_codebot.server.llm_clients import ProviderTimeoutError
 from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
 from strategy_codebot.server.model_routing import MODEL_STAGE_PINE_CODE_GENERATION
 from strategy_codebot.server.model_routing import MODEL_STAGE_STRATEGY_CODING
+from strategy_codebot.server.model_routing import PROVIDER_KEEPALIVE_EVENT
 from strategy_codebot.server.model_routing import PROVIDER_ROUTE_EVENT
 from strategy_codebot.server.model_routing import RegistryRoutedLLMClient
 from strategy_codebot.server.model_routing import load_model_registry
@@ -237,13 +238,17 @@ model_tiers:
                 "user_tier": "free",
                 "stage": "classifier",
                 "route_timeout_seconds": 0.01,
+                "route_keepalive_seconds": 0.002,
                 "hard_route_timeout": True,
             },
         )
     )
 
     route_events = [event for event in events if event.type == PROVIDER_ROUTE_EVENT]
+    keepalive_events = [event for event in events if event.type == PROVIDER_KEEPALIVE_EVENT]
     assert route_events[0].arguments["provider_route"] == "openrouter/slow-classifier"
+    assert keepalive_events
+    assert keepalive_events[0].arguments["provider_route"] == "openrouter/slow-classifier"
     assert route_events[1].arguments["provider_route"] == "openrouter/working-classifier"
     assert route_events[1].arguments["fallback_used"] is True
     assert route_events[1].arguments["fallback_attempts"][0]["error"] == "ProviderTimeoutError"

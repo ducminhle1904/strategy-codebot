@@ -1,6 +1,12 @@
 "use client";
 
 import {
+  ChainOfThought,
+  ChainOfThoughtContent,
+  ChainOfThoughtHeader,
+  ChainOfThoughtStep,
+} from "@/components/ai-elements/chain-of-thought";
+import {
   Conversation,
   ConversationContent,
   ConversationScrollButton,
@@ -12,11 +18,6 @@ import {
   MessageContent,
   MessageMarkdown,
 } from "@/components/ai-elements/message";
-import {
-  Reasoning,
-  ReasoningContent,
-  ReasoningTrigger,
-} from "@/components/ai-elements/reasoning";
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import {
   Sources,
@@ -62,16 +63,11 @@ import {
   StrategyComposer,
   StrategyStartPrompt,
 } from "@/components/strategy/start-prompt";
-import { paperBotSubscriptionLabel } from "@/components/strategy/paper-bots-page-helpers";
 import {
   ArtifactPreviewContent,
   artifactPreviewContent,
 } from "@/components/strategy/artifact-preview-content";
-import {
-  BacktestPreviewHitlCard,
-  PaperBotProposalCard,
-} from "@/components/strategy/agent-tools/tool-cards";
-import { WorkflowRail, WorkflowTaskPrompt } from "@/components/strategy/workflow-panel";
+import { WorkflowPanel, WorkflowTaskPrompt } from "@/components/strategy/workflow-panel";
 import { StatusPill } from "@/components/strategy/status-pill";
 import { BacktestReportCard } from "@/components/strategy/backtest-report-card";
 import { BacktestResultInlineCard } from "@/components/strategy/backtest-result-inline-card";
@@ -94,7 +90,6 @@ import {
 } from "@/lib/backend-client";
 import {
   actionRegistryLookup,
-  actionToolLabel,
   actionToolPrompt,
   type ActionRegistryLookup,
 } from "@/lib/action-tool-metadata";
@@ -133,11 +128,11 @@ import {
   type StrategyChatMessage,
   groupArtifactsByAnchorMessage,
   latestAssistantAfterLastUser,
+  runEventAssistantAnchorMessageId,
   runEventMetadataByAnchorMessage,
 } from "@/lib/chat-ui";
 import {
   isChatResponseIntent,
-  shouldSuggestMarketToStrategyForIntent,
 } from "@/lib/chat-intent-registry-contract";
 import {
   accountInitial,
@@ -151,6 +146,7 @@ import {
 } from "@/lib/account-ui";
 import {
   mapRunEventsToChatActivities,
+  mapRunEventsToChatActivitiesByAssistantMessage,
   type ChatActivity,
 } from "@/lib/chat-activity";
 import {
@@ -185,11 +181,10 @@ import type {
   Run,
   RunEvent,
   RunMode,
+  SelectedActionMetadata,
   StrategyProfile,
   StrategySpec,
   WebSearchMode,
-  BotProposal as BackendBotProposal,
-  BotProposalCreateRequest,
   BotProposalConfirmStartRequest,
 } from "@/lib/backend-schemas";
 import { useStrategyUiStore } from "@/lib/ui-store";
@@ -203,10 +198,9 @@ import {
   marketSnapshotFromPayload,
   normalizeWorkflowState,
   runFailureMessage,
-  type PaperBotProposal,
   type WorkflowState,
 } from "@/lib/chat-stream";
-import type { WorkflowAction } from "@/lib/workflow-ui";
+import { getWorkflowDefinition, type WorkflowAction } from "@/lib/workflow-ui";
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -220,6 +214,7 @@ import {
   ChevronsUpDown,
   CircleHelp,
   Clipboard,
+  CornerDownLeft,
   CreditCard,
   Download,
   ExternalLink,
@@ -252,6 +247,7 @@ import { useClerk, useUser } from "@clerk/nextjs";
 import Image from "next/image";
 import { useRouter } from "next/navigation";
 import {
+  Fragment,
   type ReactNode,
   useCallback,
   useEffect,
@@ -259,6 +255,11 @@ import {
   useRef,
   useState,
 } from "react";
+
+type ChatLoadingState = {
+  description: string;
+  title: string;
+};
 
 const starterSpec = `{
   "target_platform": "pine_v6",
@@ -301,6 +302,10 @@ const WEB_SEARCH_MODE_NEXT: Record<WebSearchMode, WebSearchMode> = {
 
 type AccountDialog = "settings" | "language" | "appearance" | "help";
 type SettingsTab = "general" | "provider" | "usage" | "workspace";
+type PromptSubmitPayload = {
+  text: string;
+  selectedAction?: SelectedActionMetadata;
+};
 type PendingInitialPrompt = {
   clientRequestId: string;
   createdAt: number;
@@ -1033,11 +1038,13 @@ export function StrategyWorkspace({
     async ({
       clientRequestId,
       conversationId,
+      selectedAction,
       text,
       webSearch,
     }: {
       clientRequestId: string;
       conversationId: string;
+      selectedAction?: SelectedActionMetadata;
       text: string;
       webSearch: WebSearchMode;
     }) => {
@@ -1063,7 +1070,7 @@ export function StrategyWorkspace({
         await chat.sendMessage(
           { text },
           {
-            body: { clientRequestId, conversationId, webSearch },
+            body: { clientRequestId, conversationId, selectedAction, webSearch },
           }
         );
       } catch (error) {
@@ -1080,7 +1087,7 @@ export function StrategyWorkspace({
   );
 
   const handlePromptSubmit = useCallback(
-    async ({ text }: { text: string }) => {
+    async ({ selectedAction, text }: PromptSubmitPayload) => {
       if (promptSubmitPendingRef.current || chat.status !== "ready") {
         return;
       }
@@ -1121,6 +1128,7 @@ export function StrategyWorkspace({
       await submitPromptToConversation({
         clientRequestId,
         conversationId,
+        selectedAction,
         text: submittedText,
         webSearch: webSearchMode,
       });
@@ -1350,31 +1358,16 @@ export function StrategyWorkspace({
       strategyProfile,
     ]
   );
-  const latestAssistantMessage = useMemo(
-    () => latestAssistantAfterLastUser(chat.messages),
-    [chat.messages]
-  );
-  const copilotSuggestionActions = latestAssistantMessage?.suggestions?.actions ?? [];
+  const focusComposerInput = useCallback(() => {
+    document
+      .querySelector<HTMLTextAreaElement>("[data-strategy-composer-input]")
+      ?.focus();
+  }, []);
+  const copilotSuggestionActions: ChatSuggestionItem[] = [];
   const copilotToolCallbacks = useMemo(
     () => ({
-      focusComposer: () => {
-        document
-          .querySelector<HTMLTextAreaElement>("[data-strategy-composer-input]")
-          ?.focus();
-      },
-      insertStrategyBlock: ({
-        slot,
-        template,
-      }: {
-        slot: "entry" | "exit" | "market" | "risk";
-        template: string;
-      }) => {
-        window.dispatchEvent(
-          new CustomEvent("strategy:insert-composer-block", {
-            detail: { slot, template },
-          })
-        );
-      },
+      focusComposer: focusComposerInput,
+      insertStrategyBlock: focusComposerInput,
       openArtifactWorkspace: openArtifactDrawer,
       openCreateSpec: () => setSpecDialogOpen(true),
       selectArtifact: (artifactId: string | null) => {
@@ -1383,20 +1376,9 @@ export function StrategyWorkspace({
           setArtifactPanelOpen(true);
         }
       },
-      useMarketSnapshotForStrategy: (symbol?: string) => {
-        window.dispatchEvent(
-          new CustomEvent("strategy:insert-composer-block", {
-            detail: {
-              slot: "market",
-              template: symbol
-                ? `Market context: ${symbol}`
-                : "Market context: use latest visible market snapshot",
-            },
-          })
-        );
-      },
+      useMarketSnapshotForStrategy: focusComposerInput,
     }),
-    [openArtifactDrawer, setArtifactPanelOpen, setSelectedArtifactId]
+    [focusComposerInput, openArtifactDrawer, setArtifactPanelOpen, setSelectedArtifactId]
   );
 
   const requestCreateConversation = useCallback(() => {
@@ -1440,7 +1422,7 @@ export function StrategyWorkspace({
         suggestions={copilotSuggestionActions}
         toolsAvailable={copilotCapabilities.frontendTools}
       />
-      <main className="flex h-[100dvh] overflow-hidden bg-background text-foreground">
+      <main className="apple-page-shell flex h-[100dvh] overflow-hidden text-foreground">
       <ConversationSidebar
         accountUsage={accountUsage.data}
         conversations={sidebarItems}
@@ -1465,7 +1447,7 @@ export function StrategyWorkspace({
         isCreating={false}
         isNewChatDisabled={false}
       />
-      <section className="grid min-h-0 min-w-0 flex-1 grid-rows-[auto_1fr] overflow-hidden bg-background">
+      <section className="grid min-h-0 min-w-0 flex-1 grid-rows-[auto_1fr] overflow-hidden bg-transparent">
         <ReadinessStrip
           title={activeConversationTitle}
           conversation={activeConversation}
@@ -1482,6 +1464,7 @@ export function StrategyWorkspace({
             <ChatColumn
               actionRegistry={actionRegistryByToolId}
               artifacts={visibleArtifacts}
+              artifactWorkspaceOpen={showArtifactWorkspace}
               chatStatus={chat.status}
               conversations={sidebarItems}
               hasArtifactWorkspace={hasArtifactWorkspace}
@@ -1716,7 +1699,7 @@ export function ConversationSidebar({
   return (
     <aside
       className={cn(
-        "hidden shrink-0 overflow-hidden border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-[width] duration-300 ease-out md:grid",
+        "apple-frosted hidden shrink-0 overflow-hidden border-r border-sidebar-border text-sidebar-foreground transition-[width] duration-300 ease-out md:grid",
         collapsed ? "w-14" : "w-[288px]"
       )}
     >
@@ -1732,7 +1715,7 @@ export function ConversationSidebar({
         >
           <button
             aria-label={t.expandSidebar}
-            className="group flex size-9 items-center justify-center rounded-[8px] transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+            className="group flex size-9 items-center justify-center rounded-full transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             onClick={onToggleCollapsed}
             title={t.expandSidebar}
             type="button"
@@ -1789,7 +1772,7 @@ export function ConversationSidebar({
           <div className="flex items-center justify-between px-2 py-2">
             <StrategyLogoMark />
             <Button
-              className="text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+                  className="text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
               onClick={onToggleCollapsed}
               size="icon-sm"
               title={t.collapseSidebar}
@@ -1801,7 +1784,7 @@ export function ConversationSidebar({
           </div>
           <div className="mt-4 space-y-1">
             <button
-              className="flex h-11 w-full items-center justify-start gap-2 rounded-[4px] bg-sidebar-primary px-3 text-sm font-medium text-sidebar-primary-foreground transition hover:bg-sidebar-primary/90 disabled:cursor-not-allowed disabled:opacity-60"
+              className="flex h-11 w-full items-center justify-start gap-2 rounded-full bg-sidebar-primary px-4 text-sm font-medium text-sidebar-primary-foreground transition hover:bg-[var(--signal-blue-hover)] disabled:cursor-not-allowed disabled:opacity-60"
               disabled={isCreating || isNewChatDisabled}
               onClick={onCreate}
               title={t.newConversation}
@@ -1812,7 +1795,7 @@ export function ConversationSidebar({
             </button>
             <button
               className={cn(
-                "flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                "flex h-10 w-full items-center justify-start gap-2 rounded-full px-4 text-sm font-medium transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
                 activeView === "artifacts"
                   ? "bg-sidebar-accent text-sidebar-accent-foreground"
                   : "text-sidebar-foreground"
@@ -1826,7 +1809,7 @@ export function ConversationSidebar({
             </button>
             <button
               className={cn(
-                "flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                "flex h-10 w-full items-center justify-start gap-2 rounded-full px-4 text-sm font-medium transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
                 activeView === "paper-bots"
                   ? "bg-sidebar-accent text-sidebar-accent-foreground"
                   : "text-sidebar-foreground"
@@ -1839,7 +1822,7 @@ export function ConversationSidebar({
               {paperBotsLabel}
             </button>
             <button
-              className="flex h-10 w-full items-center justify-start gap-2 rounded-[4px] px-3 text-sm font-medium text-sidebar-foreground transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+              className="flex h-10 w-full items-center justify-start gap-2 rounded-full px-4 text-sm font-medium text-sidebar-foreground transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
               title={t.searchChats}
               type="button"
             >
@@ -1852,7 +1835,7 @@ export function ConversationSidebar({
             {isLoading ? (
               <SidebarSkeleton />
             ) : conversations.length === 0 ? (
-              <div className="rounded-[4px] border border-dashed border-sidebar-border p-3 text-sm text-sidebar-foreground/65">
+              <div className="rounded-[8px] border border-dashed border-sidebar-border p-3 text-sm text-sidebar-foreground/65">
                 {t.noConversations}
               </div>
             ) : (
@@ -1860,7 +1843,7 @@ export function ConversationSidebar({
                 {conversations.map((item) => (
                   <div
                     className={cn(
-                      "group flex items-center rounded-[4px] text-sm text-sidebar-foreground/70 transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-within:bg-sidebar-accent",
+                      "group flex items-center rounded-full text-sm text-sidebar-foreground/70 transition hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-within:bg-sidebar-accent",
                       selectedConversationId === item.conversation.id &&
                         "bg-sidebar-accent text-sidebar-accent-foreground"
                     )}
@@ -2886,7 +2869,7 @@ function StrategyLogoMark({ compact = false }: { compact?: boolean }) {
       aria-label="Strategy Codebot"
       className={cn(
         "flex items-center justify-center overflow-hidden bg-white",
-        compact ? "size-5 rounded-[7px]" : "size-8 rounded-[12px]"
+        compact ? "size-5 rounded-full" : "size-8 rounded-full"
       )}
       title="Strategy Codebot"
     >
@@ -2914,11 +2897,10 @@ function ReadinessStrip({
 }) {
   return (
     <header className="relative flex min-h-16 items-center justify-between gap-3 border-b border-sidebar-border bg-sidebar px-4 text-sidebar-foreground">
-      <div className="together-gradient-ribbon absolute inset-x-0 top-0 h-1" />
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <Bot className="size-4 text-sidebar-foreground/64" />
-          <p className="truncate font-medium text-sm tracking-[-0.01em]">{title}</p>
+          <p className="truncate font-medium text-sm">{title}</p>
           {conversation ? (
             <ConversationActionMenu
               conversation={conversation}
@@ -2936,6 +2918,7 @@ function ReadinessStrip({
 function ChatColumn({
   actionRegistry,
   artifacts,
+  artifactWorkspaceOpen,
   backendMessages,
   chatStatus,
   conversationRunEvents,
@@ -2969,6 +2952,7 @@ function ChatColumn({
 }: {
   actionRegistry: ActionRegistryLookup;
   artifacts: Artifact[];
+  artifactWorkspaceOpen: boolean;
   backendMessages: BackendMessage[];
   chatStatus: string;
   conversationRunEvents: RunEvent[];
@@ -2991,7 +2975,7 @@ function ChatColumn({
   onFeedback: (messageId: string, rating: "up" | "down") => Promise<void>;
   onContinueWorkflowTask: (taskId: string) => Promise<void>;
   onOpenCreateSpec: () => void;
-  onPromptSubmit: (message: { text: string }) => Promise<void>;
+  onPromptSubmit: (message: PromptSubmitPayload) => Promise<void>;
   onWebSearchModeChange: (mode: WebSearchMode) => void;
   pendingUserText: string | null;
   onRegenerate: (messageId: string) => Promise<void>;
@@ -3009,10 +2993,6 @@ function ChatColumn({
   const router = useRouter();
   const [workflowTaskOverrides, setWorkflowTaskOverrides] = useState<Record<string, unknown>>({});
   const [backtestStatusNowMs, setBacktestStatusNowMs] = useState(() => Date.now());
-  const activities = useMemo(
-    () => mapRunEventsToChatActivities(runEvents, language, actionRegistry),
-    [actionRegistry, language, runEvents]
-  );
   const backtestLiveStatus = useMemo(
     () => backtestLiveStatusFromRunEvents(runEvents, backtestStatusNowMs),
     [backtestStatusNowMs, runEvents]
@@ -3077,24 +3057,21 @@ function ChatColumn({
     [pendingUserMessage, renderableMessages]
   );
   const runSources = useMemo(() => knowledgeSourcesFromRunEvents(runEvents), [runEvents]);
-  const latestRunIntent = useMemo(() => responseIntentFromRunEvents(runEvents), [runEvents]);
   const latestMarketSnapshot = useMemo(
     () => marketSnapshotFromRunEvents(runEvents),
     [runEvents]
   );
   const latestRunWorkflow = useMemo(
-    () => strategyWorkflowFromRunEvents(runEvents),
-    [runEvents]
+    () =>
+      strategyWorkflowFromRunEvents(runEvents) ??
+      strategyWorkflowFromRunEvents(conversationRunEvents),
+    [conversationRunEvents, runEvents]
   );
   const preferredDrawerArtifactKind = useMemo(
     () => preferredArtifactKindFromRunEvents(conversationRunEvents),
     [conversationRunEvents]
   );
   const waitingElapsedSeconds = useElapsedSeconds(isChatWorking || isStartingChat);
-  const waitingSlowState = useMemo(
-    () => slowProviderState(waitingElapsedSeconds, language),
-    [language, waitingElapsedSeconds]
-  );
   const turnAssistantMessage = useMemo(
     () => latestAssistantAfterLastUser(baseDisplayMessages),
     [baseDisplayMessages]
@@ -3127,6 +3104,41 @@ function ChatColumn({
   );
   const activeAssistantMessageId = (turnAssistantMessage ?? pendingAssistantMessage)?.id;
   const hasStreamingAssistantText = isChatWorking && hasAssistantText(messages);
+  const activitiesByMessageId = useMemo(
+    () =>
+      mapRunEventsToChatActivitiesByAssistantMessage({
+        activeAssistantMessageId,
+        conversationEvents: conversationRunEvents,
+        language,
+        liveEvents: runEvents,
+        registry: actionRegistry,
+        resolveAnchorMessageId: (event) =>
+          runEventAssistantAnchorMessageId({ backendMessages, event }),
+      }),
+    [
+      actionRegistry,
+      activeAssistantMessageId,
+      backendMessages,
+      conversationRunEvents,
+      language,
+      runEvents,
+    ]
+  );
+  const anchoredActivityCount = useMemo(
+    () =>
+      Array.from(activitiesByMessageId.values()).reduce(
+        (total, activities) => total + activities.length,
+        0
+      ),
+    [activitiesByMessageId]
+  );
+  const fallbackActivities = useMemo(
+    () =>
+      anchoredActivityCount === 0 && (isChatWorking || isStartingChat)
+        ? mapRunEventsToChatActivities(runEvents, language, actionRegistry)
+        : [],
+    [actionRegistry, anchoredActivityCount, isChatWorking, isStartingChat, language, runEvents]
+  );
   const artifactGroups = useMemo(
     () => groupArtifactsByAnchorMessage({ artifacts, backendMessages }),
     [artifacts, backendMessages]
@@ -3151,24 +3163,15 @@ function ChatColumn({
       }),
     [backendMessages, conversationRunEvents]
   );
-  const activeWorkflow = useMemo(() => {
+  const activeWorkflow = useMemo<WorkflowState | null>(() => {
     const assistantMessage = turnAssistantMessage ?? pendingAssistantMessage;
     if (!assistantMessage) {
-      return isChatWorking || isStartingChat ? latestRunWorkflow : null;
+      return latestRunWorkflow;
     }
     const anchoredWorkflow =
       persistedRunMetadata.get(assistantMessage.id)?.workflow ?? assistantMessage.workflow ?? null;
-    if (anchoredWorkflow) {
-      return anchoredWorkflow;
-    }
-    const isStreamingAssistant =
-      assistantMessage.id === "pending-assistant-message" || isChatWorking || isStartingChat;
-    return (
-      isStreamingAssistant ? latestRunWorkflow : null
-    );
+    return latestRunWorkflow ?? anchoredWorkflow;
   }, [
-    isChatWorking,
-    isStartingChat,
     latestRunWorkflow,
     pendingAssistantMessage,
     persistedRunMetadata,
@@ -3186,7 +3189,7 @@ function ChatColumn({
       Object.keys(current).length > 0 ? {} : current
     ));
   }, [activeWorkflowTaskIdentity]);
-  const activeWorkflowWithTaskOverrides = useMemo(() => {
+  const activeWorkflowWithTaskOverrides = useMemo<WorkflowState | null>(() => {
     if (!activeWorkflow || Object.keys(workflowTaskOverrides).length === 0) {
       return activeWorkflow;
     }
@@ -3202,6 +3205,10 @@ function ChatColumn({
       }) ?? activeWorkflow
     );
   }, [activeWorkflow, workflowTaskOverrides]);
+  const waitingSlowState = useMemo(
+    () => workflowAwareSlowProviderState(waitingElapsedSeconds, language, activeWorkflowWithTaskOverrides),
+    [activeWorkflowWithTaskOverrides, language, waitingElapsedSeconds]
+  );
   const handleWorkflowTaskSubmit = useCallback(
     async (taskId: string, values: Record<string, unknown>) => {
       const task = await client.submitWorkflowTaskResponse(taskId, { values, status: "completed" });
@@ -3265,23 +3272,15 @@ function ChatColumn({
     [activeWorkflowWithTaskOverrides, client, queryClient, router, selectedConversationId]
   );
   const staticSuggestions = useMemo(() => getChatSuggestions(language), [language]);
-  const fallbackSuggestionPayload = useMemo(
-    () =>
-      buildFallbackSuggestionPayload({
-        artifactAvailable: artifacts.length > 0,
-        intent: latestRunIntent,
-        language,
-        strategyProfile,
-      }),
-    [artifacts.length, language, latestRunIntent, strategyProfile]
-  );
-  const streamedComposerBlocks = turnAssistantMessage?.suggestions?.composer_blocks ?? null;
-  const composerBlocks =
-    streamedComposerBlocks && streamedComposerBlocks.length > 0
-      ? streamedComposerBlocks
-      : fallbackSuggestionPayload.composer_blocks;
   const isEmptyChat = !isLoadingConversation && displayMessages.length === 0;
   const shouldHideComposerForWorkflowTask = hasBlockingWorkflowTask(activeWorkflowWithTaskOverrides);
+  const shouldHideComposerForBacktestApproval = Boolean(pendingBacktestApproval && selectedConversationId);
+  const visibleBacktestRailStatus =
+    backtestLiveStatus?.status === "completed" ? null : backtestLiveStatus;
+  const hasRightRail = !artifactWorkspaceOpen && Boolean(activeWorkflowWithTaskOverrides || visibleBacktestRailStatus);
+  const chatRailOffsetClass = hasRightRail
+    ? "min-[1440px]:-translate-x-40 min-[1536px]:-translate-x-44"
+    : "";
 
   return (
     <section
@@ -3298,17 +3297,20 @@ function ChatColumn({
         onSelect={onSelectConversation}
         selectedConversationId={selectedConversationId}
       />
-      {activeWorkflowWithTaskOverrides ? (
-        <WorkflowRail
-          activities={activities}
-          onSelectArtifact={onSelectArtifact}
-          onSubmitTask={handleWorkflowTaskSubmit}
-          onTaskAction={handleWorkflowTaskAction}
+      {!artifactWorkspaceOpen ? (
+        <WorkspaceRightRail
+          backtestStatus={visibleBacktestRailStatus}
+          isWorking={isChatWorking || isStartingChat}
           workflow={activeWorkflowWithTaskOverrides}
         />
       ) : null}
       <Conversation className="min-h-0 overflow-hidden">
-        <ConversationContent className="mx-auto w-full max-w-3xl px-4 py-8">
+        <ConversationContent
+          className={cn(
+            "mx-auto w-full max-w-3xl px-4 py-8 transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none",
+            chatRailOffsetClass
+          )}
+        >
           <div className="min-w-0 space-y-4">
           {isLoadingConversation ? (
             <ConversationLoadingState language={language} />
@@ -3361,77 +3363,74 @@ function ChatColumn({
                   : summaryRunId
                     ? backtestResultArtifacts.get(summaryRunId) ?? []
                     : [];
+              const messageActivities =
+                renderedMessage.role === "assistant"
+                  ? activitiesByMessageId.get(renderedMessage.id) ?? []
+                  : [];
               return (
-                <StrategyMessage
-                  actionRegistry={actionRegistry}
-                  artifact={getBestArtifactForDrawer(messageArtifacts, {
-                    preferredKind: summaryRunId ? "backtest_dashboard" : preferredDrawerArtifactKind,
-                  })}
-                  artifactCount={messageArtifacts.length}
-                  fallbackSources={
-                    renderedMessage.sources.length > 0
-                      ? []
-                      : renderedMessage.id === activeAssistantMessageId ? runSources : []
-                  }
-                  isTransient={renderedMessage.id === "pending-assistant-message"}
-                  key={renderedMessage.id}
-                  language={language}
-                  message={renderedMessage}
-                  onFeedback={onFeedback}
-                  onOpenCreateSpec={onOpenCreateSpec}
-                  onRegenerate={onRegenerate}
-                  onSuggestionSubmit={onPromptSubmit}
-                  onViewArtifactWorkspace={onViewArtifactWorkspace}
-                  suppressActionSuggestions={renderedMessage.id === activeAssistantMessageId && isChatWorking}
-                  fallbackSuggestions={
-                    renderedMessage.id === activeAssistantMessageId
-                      ? fallbackSuggestionPayload.actions
-                      : persistedMetadata?.suggestions?.actions ?? []
-                  }
-                  fallbackMarketSnapshot={
-                    renderedMessage.marketSnapshot ??
-                    persistedMetadata?.marketSnapshot ??
-                    (renderedMessage.id === activeAssistantMessageId ? latestMarketSnapshot : null)
-                  }
-                  waitingSlowState={waitingSlowState}
-                />
+                <Fragment key={renderedMessage.id}>
+                  <StrategyMessage
+                    actionRegistry={actionRegistry}
+                    artifact={getBestArtifactForDrawer(messageArtifacts, {
+                      preferredKind: summaryRunId ? "backtest_dashboard" : preferredDrawerArtifactKind,
+                    })}
+                    artifactCount={messageArtifacts.length}
+                    fallbackSources={
+                      renderedMessage.sources.length > 0
+                        ? []
+                        : renderedMessage.id === activeAssistantMessageId ? runSources : []
+                    }
+                    isTransient={renderedMessage.id === "pending-assistant-message"}
+                    language={language}
+                    message={renderedMessage}
+                    onFeedback={onFeedback}
+                    onOpenCreateSpec={onOpenCreateSpec}
+                    onRegenerate={onRegenerate}
+                    onSuggestionSubmit={onPromptSubmit}
+                    onViewArtifactWorkspace={onViewArtifactWorkspace}
+                    fallbackMarketSnapshot={
+                      renderedMessage.marketSnapshot ??
+                      persistedMetadata?.marketSnapshot ??
+                      (renderedMessage.id === activeAssistantMessageId ? latestMarketSnapshot : null)
+                    }
+                    waitingSlowState={waitingSlowState}
+                  />
+                  {messageActivities.length > 0 ? (
+                    <AssistantActivity
+                      activities={messageActivities}
+                      isWorking={renderedMessage.id === activeAssistantMessageId && (isChatWorking || isStartingChat)}
+                      language={language}
+                      onSelectArtifact={onSelectArtifact}
+                    />
+                  ) : null}
+                </Fragment>
               );
             })
           )}
           <AssistantActivity
-            activities={activities}
-            isWorking={(isChatWorking || isStartingChat) && !hasStreamingAssistantText && !pendingAssistantMessage}
+            activities={fallbackActivities}
+            isWorking={
+              (isChatWorking || isStartingChat) &&
+              !hasStreamingAssistantText &&
+              !pendingAssistantMessage &&
+              anchoredActivityCount === 0
+            }
             language={language}
             onSelectArtifact={onSelectArtifact}
           />
-          {activeWorkflowWithTaskOverrides ? (
-            <WorkflowTaskPrompt
-              onSubmitTask={handleWorkflowTaskSubmit}
-              workflow={activeWorkflowWithTaskOverrides}
-            />
-          ) : null}
-          {pendingBacktestApproval && selectedConversationId ? (
-            <BacktestApprovalPanel
-              approval={pendingBacktestApproval}
-              disabled={isBacktestApprovalSubmitting}
-              onDecision={(decision) =>
-                onBacktestApprovalDecision({
-                  approvalId: pendingBacktestApproval.approvalId,
-                  conversationId: selectedConversationId,
-                  decision,
-                })
-              }
-            />
-          ) : null}
-          <BacktestRunStatusPanel status={backtestLiveStatus} />
           </div>
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
       <div
         className={cn(
-          "mx-auto w-full max-w-3xl shrink-0 px-4 pb-[max(1rem,env(safe-area-inset-bottom))]",
-          (isEmptyChat || shouldHideComposerForWorkflowTask) && !error && "hidden"
+          "mx-auto w-full max-w-3xl shrink-0 px-4 pb-[max(1rem,env(safe-area-inset-bottom))] transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none",
+          chatRailOffsetClass,
+          isEmptyChat &&
+            !shouldHideComposerForWorkflowTask &&
+            !shouldHideComposerForBacktestApproval &&
+            !error &&
+            "hidden"
         )}
       >
         {error && (
@@ -3440,7 +3439,23 @@ function ChatColumn({
             <span>{error}</span>
           </div>
         )}
-        {!shouldHideComposerForWorkflowTask ? (
+        {shouldHideComposerForWorkflowTask && activeWorkflowWithTaskOverrides ? (
+          <WorkflowTaskPrompt
+            onSubmitTask={handleWorkflowTaskSubmit}
+            workflow={activeWorkflowWithTaskOverrides}
+          />
+        ) : shouldHideComposerForBacktestApproval && pendingBacktestApproval && selectedConversationId ? (
+          <BacktestApprovalPrompt
+            disabled={isBacktestApprovalSubmitting}
+            onDecision={(decision) =>
+              onBacktestApprovalDecision({
+                approvalId: pendingBacktestApproval.approvalId,
+                conversationId: selectedConversationId,
+                decision,
+              })
+            }
+          />
+        ) : (
           <div className={cn(isEmptyChat && "pointer-events-auto")}>
             <ChatPromptComposer
               chatStatus={chatStatus}
@@ -3449,11 +3464,10 @@ function ChatColumn({
               onPromptSubmit={onPromptSubmit}
               onWebSearchModeChange={onWebSearchModeChange}
               onStop={onStop}
-              suggestionBlocks={composerBlocks}
               webSearchMode={webSearchMode}
             />
           </div>
-        ) : null}
+        )}
       </div>
     </section>
   );
@@ -3526,7 +3540,7 @@ function EmptyChatStart({
   disabled: boolean;
   isStartingChat: boolean;
   language: UiLanguagePreference;
-  onPromptSubmit: (message: { text: string }) => Promise<void>;
+  onPromptSubmit: (message: PromptSubmitPayload) => Promise<void>;
   onWebSearchModeChange: (mode: WebSearchMode) => void;
   suggestions: ReturnType<typeof getChatSuggestions>;
   webSearchMode: WebSearchMode;
@@ -3579,177 +3593,68 @@ function ChatPromptComposer({
   onPromptSubmit,
   onWebSearchModeChange,
   onStop,
-  suggestionBlocks,
   webSearchMode,
 }: {
   chatStatus: string;
   disabled: boolean;
   language: UiLanguagePreference;
-  onPromptSubmit: (message: { text: string }) => Promise<void>;
+  onPromptSubmit: (message: PromptSubmitPayload) => Promise<void>;
   onWebSearchModeChange: (mode: WebSearchMode) => void;
   onStop: () => void;
-  suggestionBlocks: ChatSuggestionItem[];
   webSearchMode: WebSearchMode;
 }) {
   const t = getUiCopy(language);
   const [value, setValue] = useState("");
   const isChatWorking = chatStatus === "streaming" || chatStatus === "submitted";
-  useEffect(() => {
-    const listener = (event: Event) => {
-      const detail = (event as CustomEvent).detail;
-      if (!detail || typeof detail !== "object") {
-        return;
-      }
-      const record = detail as Record<string, unknown>;
-      const slot = record.slot;
-      const template = record.template;
-      if (
-        (slot === "entry" || slot === "exit" || slot === "market" || slot === "risk") &&
-        typeof template === "string" &&
-        template.trim()
-      ) {
-        setValue((previous) => insertOrUpdateStrategyBlock(previous, slot, template));
-      }
-    };
-    window.addEventListener("strategy:insert-composer-block", listener);
-    return () => window.removeEventListener("strategy:insert-composer-block", listener);
-  }, []);
   return (
-    <>
-      <SmartStrategyBlocks
-        composerValue={value}
-        onComposerValueChange={setValue}
-        disabled={disabled}
-        language={language}
-        blocks={suggestionBlocks}
-      />
-      <StrategyComposer
-        disabled={disabled}
-        endAction={({ submitDisabled }) => (
-          <>
-            {isChatWorking ? (
-              <Button
-                className="rounded-full"
-                onClick={onStop}
-                size="icon-sm"
-                type="button"
-                variant="outline"
-                title={t.stop}
-              >
-                <Square className="size-3" />
-                <span className="sr-only">{t.stop}</span>
-              </Button>
-            ) : (
-              <Button
-                aria-label={t.send}
-                className="rounded-full"
-                disabled={submitDisabled}
-                size="icon-sm"
-                title={t.send}
-                type="submit"
-              >
-                <ArrowUp className="size-4" />
-                <span className="sr-only">{t.send}</span>
-              </Button>
-            )}
-          </>
-        )}
-        onSubmit={async (text) => {
-          setValue("");
-          await onPromptSubmit({ text });
-        }}
-        onValueChange={setValue}
-        placeholder={t.signedOutPlaceholder}
-        requireText
-        startAction={
-          <WebSearchToggle
-            disabled={disabled}
-            language={language}
-            mode={webSearchMode}
-            onChange={onWebSearchModeChange}
-          />
-        }
-        value={value}
-      />
-    </>
-  );
-}
-
-function SmartStrategyBlocks({
-  blocks,
-  composerValue,
-  disabled,
-  language,
-  onComposerValueChange,
-}: {
-  blocks: ChatSuggestionItem[];
-  composerValue: string;
-  disabled: boolean;
-  language: UiLanguagePreference;
-  onComposerValueChange: (value: string) => void;
-}) {
-  const t = getUiCopy(language);
-  const [feedback, setFeedback] = useState<{ label: string; previous: string } | null>(null);
-  const chips = blocks;
-
-  if (chips.length === 0) {
-    return null;
-  }
-
-  const applyBlock = (block: ChatSuggestionItem, template: string, label: string) => {
-    const previous = composerValue;
-    onComposerValueChange(insertOrUpdateStrategyBlock(previous, block.slot, template));
-    setFeedback({ label, previous });
-  };
-
-  return (
-    <div className="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
-      <span className="mr-1 text-muted-foreground">{t.signalGrammarHint}</span>
-      {chips.map((block) => (
-        <DropdownMenu key={block.id}>
-          <DropdownMenuTrigger asChild>
+    <StrategyComposer
+      disabled={disabled}
+      endAction={({ submitDisabled }) => (
+        <>
+          {isChatWorking ? (
             <Button
-              className={cn(
-                "h-7 rounded-[4px] px-2 text-xs normal-case",
-                block.emphasized && "border-[var(--together-accent-blue)] text-[var(--together-accent-blue)]"
-              )}
-              disabled={disabled || block.enabled === false}
+              className="rounded-full"
+              onClick={onStop}
+              size="icon-sm"
               type="button"
               variant="outline"
+              title={t.stop}
             >
-              {block.label}
-              <ChevronDown className="ml-1 size-3" />
+              <Square className="size-3" />
+              <span className="sr-only">{t.stop}</span>
             </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-56 border-border bg-popover">
-            {(block.variants ?? []).map((variant) => (
-              <DropdownMenuItem
-                className="rounded-[4px] text-xs"
-                key={variant.id}
-                onSelect={() => applyBlock(block, variant.insert_template, variant.label)}
-              >
-                {variant.label}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      ))}
-      {feedback && (
-        <span className="ml-1 flex items-center gap-1 text-muted-foreground">
-          {localizedSuggestionCopy(language, "Đã thêm", "Inserted")} {feedback.label}
-          <button
-            className="text-[var(--together-accent-blue)] hover:underline"
-            onClick={() => {
-              onComposerValueChange(feedback.previous);
-              setFeedback(null);
-            }}
-            type="button"
-          >
-            Undo
-          </button>
-        </span>
+          ) : (
+            <Button
+              aria-label={t.send}
+              className="rounded-full"
+              disabled={submitDisabled}
+              size="icon-sm"
+              title={t.send}
+              type="submit"
+            >
+              <ArrowUp className="size-4" />
+              <span className="sr-only">{t.send}</span>
+            </Button>
+          )}
+        </>
       )}
-    </div>
+      onSubmit={async (text) => {
+        setValue("");
+        await onPromptSubmit({ text });
+      }}
+      onValueChange={setValue}
+      placeholder={t.signedOutPlaceholder}
+      requireText
+      startAction={
+        <WebSearchToggle
+          disabled={disabled}
+          language={language}
+          mode={webSearchMode}
+          onChange={onWebSearchModeChange}
+        />
+      }
+      value={value}
+    />
   );
 }
 
@@ -3767,8 +3672,6 @@ function StrategyMessage({
   onRegenerate,
   onSuggestionSubmit,
   onViewArtifactWorkspace,
-  fallbackSuggestions = [],
-  suppressActionSuggestions = false,
   waitingSlowState,
 }: {
   actionRegistry: ActionRegistryLookup;
@@ -3782,11 +3685,9 @@ function StrategyMessage({
   onFeedback: (messageId: string, rating: "up" | "down") => Promise<void>;
   onOpenCreateSpec: () => void;
   onRegenerate: (messageId: string) => Promise<void>;
-  onSuggestionSubmit: (message: { text: string }) => Promise<void>;
+  onSuggestionSubmit: (message: PromptSubmitPayload) => Promise<void>;
   onViewArtifactWorkspace: () => void;
-  fallbackSuggestions?: ChatSuggestionItem[];
-  suppressActionSuggestions?: boolean;
-  waitingSlowState?: ReturnType<typeof slowProviderState>;
+  waitingSlowState?: ChatLoadingState;
 }) {
   const [actionState, setActionState] = useState<{
     kind: "idle" | "loading" | "success" | "error";
@@ -3798,15 +3699,8 @@ function StrategyMessage({
   const marketSnapshot = message.marketSnapshot ?? fallbackMarketSnapshot;
   const backtestReport = message.backtestReport;
   const inlineTables = message.inlineTables;
-  const suggestionPayload = message.suggestions;
   const hasDashboardArtifact = artifact?.presentation.viewer_kind === "backtest_dashboard";
   const dashboardPreviewSummary = hasDashboardArtifact ? artifact?.preview_summary ?? null : null;
-  const suggestions =
-    suppressActionSuggestions
-      ? []
-      : suggestionPayload?.actions && suggestionPayload.actions.length > 0
-      ? suggestionPayload.actions
-      : fallbackSuggestions;
   const t = getUiCopy(language);
   const { showToast } = useToast();
 
@@ -3887,27 +3781,43 @@ function StrategyMessage({
       </Dialog>
     );
   };
-  const reasoningNodes = message.reasoningSummaries.map((reasoning) => {
-    const isStreaming = reasoning.state === "streaming";
-    return (
-      <Reasoning
-        className="mb-2"
-        defaultOpen={false}
-        isStreaming={isStreaming}
-        key={reasoning.id}
-      >
-        <ReasoningTrigger
-          className="inline-flex h-8 max-w-full items-center gap-2 rounded-[4px] border border-border/70 bg-muted/20 px-3 text-muted-foreground text-sm"
-          getThinkingMessage={() => (
-            <span>{isStreaming ? t.slowProviderInitialTitle : t.modelReasoningTitle}</span>
-          )}
-        />
-        <ReasoningContent className="mt-2 text-muted-foreground text-sm">
-          {reasoning.text}
-        </ReasoningContent>
-      </Reasoning>
-    );
-  });
+  const reasoningWorkflowStep =
+    [...message.reasoningSummaries].reverse().find((reasoning) => reasoning.workflowStep)
+      ?.workflowStep ?? null;
+  const workflowCurrentStepId = reasoningWorkflowStep ?? message.workflow?.current_step ?? null;
+  const workflowCurrentStepLabel =
+    message.workflow && workflowCurrentStepId
+      ? getWorkflowDefinition(message.workflow.workflow_id)?.steps.find(
+          (step) => step.id === workflowCurrentStepId
+        )?.label
+      : null;
+  const reasoningNodes =
+    message.reasoningSummaries.length > 0 ? (
+      <ChainOfThought className="mb-2" defaultOpen>
+        <ChainOfThoughtHeader className="h-8 px-3">
+          <Shimmer as="span" className="max-w-full truncate" duration={1.8}>
+            {t.modelReasoningTitle}
+          </Shimmer>
+        </ChainOfThoughtHeader>
+        <ChainOfThoughtContent>
+          {message.reasoningSummaries.map((reasoning, index) => (
+            <ChainOfThoughtStep
+              key={reasoning.id}
+              {...chainOfThoughtStepCopy(reasoning.text)}
+              status={
+                reasoning.state === "streaming" &&
+                index === message.reasoningSummaries.length - 1
+                  ? "active"
+                  : "complete"
+              }
+            />
+          ))}
+          {workflowCurrentStepLabel && !reasoningWorkflowStep ? (
+            <ChainOfThoughtStep label={workflowCurrentStepLabel} status="pending" />
+          ) : null}
+        </ChainOfThoughtContent>
+      </ChainOfThought>
+    ) : null;
   const normalBacktestReport = backtestReport?.kind === "report" ? backtestReport : null;
   const backtestResultNode =
     message.role === "assistant" && (normalBacktestReport || (hasDashboardArtifact && inlineTables.length === 0)) ? (
@@ -4011,8 +3921,8 @@ function StrategyMessage({
         </MessageContent>
       ) : (
         <>
-          {isTransient && waitingSlowState && (
-          <FirstTokenLoader slowState={waitingSlowState} />
+          {!reasoningNodes && isTransient && waitingSlowState && (
+            <FirstTokenLoader slowState={waitingSlowState} />
           )}
           {reasoningNodes}
           {message.role === "assistant" && marketSnapshot && (
@@ -4029,16 +3939,6 @@ function StrategyMessage({
           artifactCount={artifactCount}
           language={language}
           onOpen={onViewArtifactWorkspace}
-        />
-      )}
-      {!isTransient && message.role === "assistant" && suggestions.length > 0 && (
-        <SuggestionRail
-          actionRegistry={actionRegistry}
-          disabled={actionState.kind === "loading"}
-          onOpenCreateSpec={onOpenCreateSpec}
-          onSubmit={onSuggestionSubmit}
-          onViewArtifactWorkspace={onViewArtifactWorkspace}
-          suggestions={suggestions}
         />
       )}
       {!isTransient && message.role === "assistant" && (
@@ -4269,335 +4169,6 @@ function formatCompactTimestamp(value: unknown) {
   }).format(parsed);
 }
 
-function SuggestionRail({
-  actionRegistry,
-  disabled,
-  onOpenCreateSpec,
-  onSubmit,
-  onViewArtifactWorkspace,
-  suggestions,
-}: {
-  actionRegistry: ActionRegistryLookup;
-  disabled: boolean;
-  onOpenCreateSpec: () => void;
-  onSubmit: (message: { text: string }) => Promise<void>;
-  onViewArtifactWorkspace: () => void;
-  suggestions: ChatSuggestionItem[];
-}) {
-  const client = useBrowserBackendClient();
-  const router = useRouter();
-  const queryClient = useQueryClient();
-  const [pendingSuggestionId, setPendingSuggestionId] = useState<string | null>(null);
-  const [preparedBotProposals, setPreparedBotProposals] = useState<Record<string, BackendBotProposal>>({});
-  const [actionFeedback, setActionFeedback] = useState<string | null>(null);
-  const visibleSuggestions = suggestions
-    .filter((suggestion) => suggestion.kind !== "composer_block")
-    .sort((left, right) => left.priority - right.priority)
-    .slice(0, 3);
-  const visiblePaperBotKeys = visibleSuggestions.flatMap((suggestion) => {
-    const proposal = paperBotProposalFromSuggestion(suggestion);
-    return proposal ? [paperBotSuggestionKey(suggestion, proposal)] : [];
-  });
-  const visiblePaperBotCacheKey = visiblePaperBotKeys.join("\n");
-
-  useEffect(() => {
-    const visiblePaperBotKeySet = new Set(
-      visiblePaperBotCacheKey ? visiblePaperBotCacheKey.split("\n") : []
-    );
-    setPreparedBotProposals((current) => {
-      const next = Object.fromEntries(
-        Object.entries(current).filter(([key]) => visiblePaperBotKeySet.has(key))
-      );
-      return Object.keys(next).length === Object.keys(current).length ? current : next;
-    });
-  }, [visiblePaperBotCacheKey]);
-
-  if (visibleSuggestions.length === 0) {
-    return null;
-  }
-
-  const runSuggestion = async (suggestion: ChatSuggestionItem) => {
-    const paperBotProposal = paperBotProposalFromSuggestion(suggestion);
-    const suggestionKey = paperBotProposal
-      ? paperBotSuggestionKey(suggestion, paperBotProposal)
-      : suggestion.id;
-    if (disabled || pendingSuggestionId) {
-      return;
-    }
-    setPendingSuggestionId(suggestionKey);
-    setActionFeedback(null);
-    if (paperBotProposal) {
-      try {
-        let prepared = preparedBotProposals[suggestionKey] ?? null;
-        if (!prepared) {
-          prepared = paperBotProposal.proposal_id
-            ? await client.getBotProposal(paperBotProposal.proposal_id)
-            : await client.createBotProposal(botProposalPayload(paperBotProposal));
-          setPreparedBotProposals((current) => ({ ...current, [suggestionKey]: prepared }));
-          setActionFeedback(
-            prepared.missing_inputs.length > 0
-              ? `Bot setup needs: ${prepared.missing_inputs.map(readableKey).join(", ")}.`
-              : "Bot setup ready for review. No broker execution."
-          );
-          return;
-        }
-        if (prepared.missing_inputs.length > 0) {
-          setActionFeedback(`Bot setup needs: ${prepared.missing_inputs.map(readableKey).join(", ")}.`);
-          return;
-        }
-        const result = await client.confirmStartBotProposal(prepared.id);
-        await queryClient.invalidateQueries({ queryKey: ["paper-bot-runtimes"] });
-        setPreparedBotProposals((current) => ({ ...current, [suggestionKey]: result.proposal }));
-        setActionFeedback("Simulation started. No broker execution.");
-        router.push(`/paper-bots?runtime=${encodeURIComponent(result.runtime.id)}`);
-      } catch (error) {
-        setActionFeedback(errorMessageFromUnknown(error));
-      } finally {
-        setPendingSuggestionId(null);
-      }
-      return;
-    }
-    if (isSuggestionUnavailable(suggestion, actionRegistry)) {
-      setActionFeedback(suggestion.disabled_reason ?? "This action needs more context first.");
-      setPendingSuggestionId(null);
-      return;
-    }
-    if (suggestion.action === "open_artifact") {
-      try {
-        onViewArtifactWorkspace();
-        setActionFeedback("Artifact workspace opened.");
-      } finally {
-        setPendingSuggestionId(null);
-      }
-      return;
-    }
-    if (suggestion.action === "open_create_spec") {
-      try {
-        onOpenCreateSpec();
-        setActionFeedback("Create review artifact opened.");
-      } finally {
-        setPendingSuggestionId(null);
-      }
-      return;
-    }
-    if (suggestion.action === "insert_or_update_block" && suggestion.slot && suggestion.insert_template) {
-      try {
-        window.dispatchEvent(
-          new CustomEvent("strategy:insert-composer-block", {
-            detail: { slot: suggestion.slot, template: suggestion.insert_template },
-          })
-        );
-        setActionFeedback(`Added ${readableKey(suggestion.slot)} block.`);
-      } finally {
-        setPendingSuggestionId(null);
-      }
-      return;
-    }
-    const prompt = suggestionPromptText(suggestion, actionRegistry);
-    if (suggestion.action === "send_prompt" && prompt) {
-      try {
-        await onSubmit({ text: prompt });
-        setActionFeedback(`${suggestion.label} started.`);
-      } finally {
-        setPendingSuggestionId(null);
-      }
-      return;
-    }
-    setActionFeedback(suggestion.disabled_reason ?? "This action needs more context first.");
-    setPendingSuggestionId(null);
-  };
-
-  return (
-    <div className="space-y-2 pt-1">
-      <div className="flex flex-wrap gap-2">
-        {visibleSuggestions.map((suggestion) => {
-          const paperBotProposal = paperBotProposalFromSuggestion(suggestion);
-          const suggestionKey = paperBotProposal
-            ? paperBotSuggestionKey(suggestion, paperBotProposal)
-            : suggestion.id;
-          return paperBotProposal ? (
-            <PaperBotSuggestionCard
-              disabled={disabled}
-              key={suggestionKey}
-              onRun={() => runSuggestion(suggestion)}
-              pending={pendingSuggestionId === suggestionKey}
-              preparedProposal={preparedBotProposals[suggestionKey] ?? null}
-              proposal={paperBotProposal}
-              suggestion={suggestion}
-            />
-          ) : isActionAwareSuggestion(suggestion) ? (
-            <ActionAwarenessCard
-              actionRegistry={actionRegistry}
-              disabled={disabled}
-              key={suggestion.id}
-              onRun={runSuggestion}
-              pending={pendingSuggestionId === suggestion.id}
-              suggestion={suggestion}
-            />
-          ) : (
-            <Button
-              className="h-8 rounded-[4px] text-xs normal-case"
-              disabled={disabled || pendingSuggestionId !== null || isSuggestionUnavailable(suggestion, actionRegistry)}
-              key={suggestion.id}
-              onClick={() => void runSuggestion(suggestion)}
-              title={suggestionTitle(suggestion, actionRegistry)}
-              type="button"
-              variant="outline"
-            >
-              {pendingSuggestionId === suggestion.id ? "Starting..." : suggestion.label}
-            </Button>
-          );
-        })}
-      </div>
-      {actionFeedback ? (
-        <p className="text-muted-foreground text-xs">{actionFeedback}</p>
-      ) : null}
-    </div>
-  );
-}
-
-function ActionAwarenessCard({
-  actionRegistry,
-  disabled,
-  onRun,
-  pending,
-  suggestion,
-}: {
-  actionRegistry: ActionRegistryLookup;
-  disabled: boolean;
-  onRun: (suggestion: ChatSuggestionItem) => Promise<void>;
-  pending: boolean;
-  suggestion: ChatSuggestionItem;
-}) {
-  const requiredInputs = suggestion.required_inputs ?? [];
-  const displayLabel =
-    suggestion.label || actionToolLabel(suggestion.tool_id, actionRegistry) || "Action";
-  const blocked =
-    suggestion.enabled === false ||
-    suggestion.risk_level === "blocked" ||
-    isSuggestionUnavailable(suggestion, actionRegistry);
-  return (
-    <button
-      className={cn(
-        "min-w-[220px] max-w-sm flex-1 rounded-[6px] border border-border bg-background p-3 text-left transition hover:border-foreground/30",
-        !(disabled || blocked || pending) && "cursor-pointer",
-        (disabled || blocked || pending) && "cursor-not-allowed opacity-65 hover:border-border"
-      )}
-      disabled={disabled || blocked || pending}
-      onClick={() => void onRun(suggestion)}
-      title={suggestionTitle(suggestion, actionRegistry)}
-      type="button"
-    >
-      <div className="flex items-start gap-2">
-        <span className="mt-0.5 rounded-[4px] border border-border bg-muted p-1 text-muted-foreground">
-          {renderSuggestionIcon(suggestion)}
-        </span>
-        <span className="min-w-0 flex-1">
-          <span className="flex min-w-0 items-center gap-2">
-            <span className="min-w-0 flex-1 truncate font-medium text-sm">{displayLabel}</span>
-            {suggestion.risk_level && (
-              <span className={cn("shrink-0 rounded-full px-2 py-0.5 text-[10px] uppercase tracking-wide", riskBadgeClass(suggestion.risk_level))}>
-                {riskLabel(suggestion.risk_level)}
-              </span>
-            )}
-            {pending && (
-              <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
-                Working...
-              </span>
-            )}
-          </span>
-          {suggestion.reason && (
-            <span className="mt-1 block text-muted-foreground text-xs leading-5">
-              {suggestion.reason}
-            </span>
-          )}
-          {requiredInputs.length > 0 && (
-            <span className="mt-2 flex flex-wrap gap-1">
-              {requiredInputs.map((input) => (
-                <span
-                  className="rounded-full bg-muted px-2 py-0.5 text-[11px] text-muted-foreground"
-                  key={input}
-                >
-                  {readableKey(input)}
-                </span>
-              ))}
-            </span>
-          )}
-        </span>
-      </div>
-    </button>
-  );
-}
-
-function PaperBotSuggestionCard({
-  disabled,
-  onRun,
-  pending,
-  preparedProposal,
-  proposal,
-  suggestion,
-}: {
-  disabled: boolean;
-  onRun: () => Promise<void>;
-  pending: boolean;
-  preparedProposal: BackendBotProposal | null;
-  proposal: PaperBotProposal | null;
-  suggestion: ChatSuggestionItem;
-}) {
-  if (!proposal) {
-    return null;
-  }
-  const missingFields = preparedProposal?.missing_inputs ?? [];
-  const readiness = preparedProposal?.readiness_checks ?? proposal.readiness;
-  const subscriptions = preparedProposal?.data_subscriptions ?? proposal.data_subscriptions;
-  return (
-    <div className="min-w-[260px] max-w-xl flex-1">
-      <PaperBotProposalCard
-        actionLabel={preparedProposal && missingFields.length === 0 ? "Start paper simulation" : "Prepare bot"}
-        disabled={disabled || suggestion.enabled === false}
-        missingFields={missingFields.map(readableKey)}
-        onStart={() => void onRun()}
-        pending={pending}
-        readiness={readiness}
-        status={suggestion.enabled === false ? "skipped" : pending ? "executing" : "inProgress"}
-        strategyName={preparedProposal?.strategy_name ?? proposal.strategy_name ?? suggestion.label}
-        subscriptions={paperBotSubscriptionLabels({ ...proposal, data_subscriptions: subscriptions })}
-      />
-    </div>
-  );
-}
-
-function paperBotProposalFromSuggestion(suggestion: ChatSuggestionItem): PaperBotProposal | null {
-  return suggestion.bot_proposal ?? suggestion.paper_bot ?? null;
-}
-
-function paperBotSuggestionKey(suggestion: ChatSuggestionItem, proposal: PaperBotProposal) {
-  return [
-    proposal.proposal_id,
-    proposal.source_run_id,
-    proposal.strategy_id,
-    proposal.source_artifact_ids?.join(","),
-    suggestion.id,
-  ].find((value) => typeof value === "string" && value.trim().length > 0) ?? suggestion.id;
-}
-
-function botProposalPayload(proposal: PaperBotProposal): BotProposalCreateRequest {
-  return {
-    account_id: proposal.account_id ?? "",
-    broker_connection_id: proposal.broker_connection_id ?? "",
-    data_subscriptions: proposal.data_subscriptions ?? [],
-    manifest: {
-      ...(proposal.manifest ?? {}),
-      name: proposal.manifest?.name ?? proposal.strategy_name ?? proposal.strategy_id ?? "Bot",
-    },
-    risk_policy_id: proposal.risk_policy_id ?? "",
-    run_id: proposal.source_run_id,
-    strategy_artifact_id: proposal.source_artifact_ids?.[0],
-    strategy_id: proposal.strategy_id ?? "",
-    strategy_name: proposal.strategy_name,
-  };
-}
-
 function botProposalConfirmStartPayloadFromWorkflowValues(
   values: Record<string, unknown>
 ): BotProposalConfirmStartRequest {
@@ -4612,136 +4183,14 @@ function workflowStringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function paperBotSubscriptionLabels(proposal: PaperBotProposal) {
-  return (proposal.data_subscriptions ?? []).flatMap((subscription) => paperBotSubscriptionLabel(subscription) ?? []);
-}
-
-function isSuggestionUnavailable(
-  suggestion: ChatSuggestionItem,
-  actionRegistry?: ActionRegistryLookup
-) {
-  if (suggestion.enabled === false) {
-    return true;
+function chainOfThoughtStepCopy(text: string): { label: string; description?: string } {
+  const normalized = text.trim();
+  if (normalized.length <= 72) {
+    return { label: normalized };
   }
-  if (suggestion.action === "send_prompt") {
-    return !suggestionPromptText(suggestion, actionRegistry);
-  }
-  if (suggestion.action === "insert_or_update_block") {
-    return !suggestion.slot || !suggestion.insert_template;
-  }
-  return false;
-}
-
-function isCodeArtifact(artifact: Artifact) {
-  return artifact.presentation.user_kind === "code";
-}
-
-function suggestionTitle(suggestion: ChatSuggestionItem, actionRegistry?: ActionRegistryLookup) {
-  if (suggestion.disabled_reason) {
-    return suggestion.disabled_reason;
-  }
-  if (suggestion.action === "send_prompt" && suggestion.prompt === "[REDACTED]") {
-    return toolActionPrompt(suggestion, actionRegistry) ?? suggestion.label;
-  }
-  return suggestion.reason ?? suggestion.label;
-}
-
-function suggestionPromptText(
-  suggestion: ChatSuggestionItem,
-  actionRegistry?: ActionRegistryLookup
-) {
-  if (suggestion.action !== "send_prompt") {
-    return null;
-  }
-  if (suggestion.prompt && suggestion.prompt !== "[REDACTED]") {
-    return suggestion.prompt;
-  }
-  return toolActionPrompt(suggestion, actionRegistry);
-}
-
-function toolActionPrompt(
-  suggestion: ChatSuggestionItem,
-  actionRegistry?: ActionRegistryLookup
-) {
-  return actionToolPrompt(suggestion.tool_id, actionRegistry);
-}
-
-function isActionAwareSuggestion(suggestion: ChatSuggestionItem) {
-  return Boolean(
-    suggestion.reason ||
-      suggestion.risk_level ||
-      suggestion.tool_id ||
-      suggestion.artifact_kind ||
-      suggestion.next_state ||
-      suggestion.required_inputs?.length
-  );
-}
-
-function renderSuggestionIcon(suggestion: ChatSuggestionItem) {
-  const iconKey = suggestion.presentation?.icon_key;
-  if (iconKey === "search") {
-    return <Search className="size-3.5" />;
-  }
-  if (iconKey === "play") {
-    return <Play className="size-3.5" />;
-  }
-  if (iconKey === "gauge") {
-    return <Gauge className="size-3.5" />;
-  }
-  if (iconKey === "bot") {
-    return <Bot className="size-3.5" />;
-  }
-  if (iconKey === "checklist" || iconKey === "list") {
-    return <ListChecks className="size-3.5" />;
-  }
-  if (iconKey === "file_code") {
-    return <FileCode2 className="size-3.5" />;
-  }
-  if (iconKey === "globe") {
-    return <Globe2 className="size-3.5" />;
-  }
-  if (suggestion.tool_id === "market_research") {
-    return <Search className="size-3.5" />;
-  }
-  if (suggestion.tool_id === "run_backtest_preview" || suggestion.tool_id === "run_backtest_variant_lab") {
-    return <Play className="size-3.5" />;
-  }
-  if (suggestion.tool_id === "run_risk_gate" || suggestion.tool_id === "create_proposed_intent") {
-    return <Gauge className="size-3.5" />;
-  }
-  if (suggestion.tool_id === "build_robustness_report") {
-    return <ListChecks className="size-3.5" />;
-  }
-  if (suggestion.category === "code") {
-    return <FileCode2 className="size-3.5" />;
-  }
-  if (suggestion.category === "market") {
-    return <Globe2 className="size-3.5" />;
-  }
-  if (suggestion.category === "risk") {
-    return <Gauge className="size-3.5" />;
-  }
-  return <ListChecks className="size-3.5" />;
-}
-
-function riskBadgeClass(riskLevel: NonNullable<ChatSuggestionItem["risk_level"]>) {
-  if (riskLevel === "blocked") {
-    return "bg-red-500/10 text-red-700 dark:text-red-300";
-  }
-  if (riskLevel === "review_required") {
-    return "bg-amber-500/10 text-amber-700 dark:text-amber-300";
-  }
-  return "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
-}
-
-function riskLabel(riskLevel: NonNullable<ChatSuggestionItem["risk_level"]>) {
-  if (riskLevel === "read_only") {
-    return "read only";
-  }
-  if (riskLevel === "review_required") {
-    return "review";
-  }
-  return "blocked";
+  const firstLine = normalized.split(/\n+/)[0]?.trim() ?? normalized;
+  const label = firstLine.length <= 72 ? firstLine : `${firstLine.slice(0, 69).trimEnd()}...`;
+  return { label, description: normalized };
 }
 
 function StrategyBriefCard({
@@ -4834,7 +4283,7 @@ function MarketSnapshotCard({
               )}
             </div>
           </div>
-          <div className="h-px w-full bg-gradient-to-r from-[var(--together-accent-blue)]/35 via-border to-transparent" />
+          <div className="h-px w-full bg-border" />
         </div>
 
         <div
@@ -4843,7 +4292,7 @@ function MarketSnapshotCard({
             hasPrice ? accentClass : "border-border/70 bg-muted/20"
           )}
         >
-          <p className="text-muted-foreground text-[10px] uppercase tracking-[0.12em]">
+          <p className="text-muted-foreground text-[10px] font-medium">
             {t.currentPrice}
           </p>
           <p
@@ -5258,7 +4707,7 @@ function AssistantActivity({
 
   return (
     <div className="space-y-3">
-      {isWorking && (
+      {isWorking && activities.length === 0 && (
         <FirstTokenLoader
           slowState={slowProviderState(elapsedSeconds, language)}
         />
@@ -5324,7 +4773,7 @@ function AssistantActivity({
                       <div className="flex flex-wrap gap-2">
                         {activity.artifactLinks.map((link) => (
                           <Button
-                            className="h-7 rounded-[4px] px-2 text-[11px] uppercase tracking-[0.08em]"
+                            className="h-7 rounded-[4px] px-2 text-[11px] font-medium"
                             key={`${activity.id}-${link.artifactId}`}
                             onClick={() => onSelectArtifact?.(link.artifactId)}
                             size="sm"
@@ -5350,7 +4799,7 @@ function AssistantActivity({
 function FirstTokenLoader({
   slowState,
 }: {
-  slowState: ReturnType<typeof slowProviderState>;
+  slowState: ChatLoadingState;
 }) {
   return (
     <div className="rounded-[4px] border border-border bg-background px-3 py-2">
@@ -5416,43 +4865,113 @@ type PendingBacktestApproval = {
   timeframe: string | null;
 };
 
-function BacktestApprovalPanel({
-  approval,
-  disabled,
-  onDecision,
+function WorkspaceRightRail({
+  backtestStatus,
+  isWorking,
+  workflow,
 }: {
-  approval: PendingBacktestApproval;
-  disabled: boolean;
-  onDecision: (decision: "approved" | "rejected") => Promise<void>;
+  backtestStatus: BacktestLiveStatus | null;
+  isWorking: boolean;
+  workflow: WorkflowState | null;
 }) {
+  const visibleBacktestStatus =
+    backtestStatus?.status === "completed" ? null : backtestStatus;
+  if (!workflow && !visibleBacktestStatus) {
+    return null;
+  }
   return (
-    <div className="space-y-2">
-      <BacktestPreviewHitlCard
-        approveLabel="Approve & run"
-        disabled={disabled}
-        onRespond={(response) => {
-          const approved =
-            response &&
-            typeof response === "object" &&
-            "approved" in response &&
-            (response as { approved?: unknown }).approved === true;
-          void onDecision(approved ? "approved" : "rejected");
-        }}
-        rejectLabel="Skip preview"
-        status="inProgress"
-        symbol={approval.symbol ?? undefined}
-        timeframe={approval.timeframe ?? undefined}
-      />
-      <p className="px-1 text-muted-foreground text-xs">
-        {approval.boundary ??
-          "Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, or a profitability claim."}
-      </p>
-    </div>
+    <aside className="pointer-events-auto hidden min-[1440px]:absolute min-[1440px]:left-[calc(50%+24rem+1rem)] min-[1440px]:top-8 min-[1440px]:z-10 min-[1440px]:block min-[1440px]:max-h-[calc(100vh-4rem)] min-[1440px]:w-72 min-[1440px]:overflow-y-auto min-[1536px]:left-[calc(50%+24rem+1.5rem)] min-[1536px]:w-80">
+      <div className="space-y-3">
+        {workflow ? (
+          <WorkflowPanel
+            isWorking={isWorking}
+            showTaskControls={false}
+            workflow={workflow}
+          />
+        ) : null}
+        <BacktestPreviewRail status={visibleBacktestStatus} />
+      </div>
+    </aside>
   );
 }
 
-function BacktestRunStatusPanel({ status }: { status: BacktestLiveStatus | null }) {
-  if (!status || status.status === "completed") {
+function BacktestApprovalPrompt({
+  disabled,
+  onDecision,
+}: {
+  disabled: boolean;
+  onDecision: (decision: "approved" | "rejected") => Promise<void>;
+}) {
+  const [selection, setSelection] = useState<"approved" | "rejected">("approved");
+  const options: Array<{ decision: "approved" | "rejected"; label: string }> = [
+    { decision: "approved", label: "Approve & run" },
+    { decision: "rejected", label: "Skip preview" },
+  ];
+  return (
+    <section
+      aria-label="Backtest approval prompt"
+      className="apple-frosted rounded-[8px] border p-3 text-foreground shadow-sm"
+    >
+      <div className="mb-3 flex items-start justify-between gap-4">
+        <h2 className="min-w-0 text-pretty font-semibold text-sm leading-snug">
+          Run the review-only backtest preview?
+        </h2>
+        <div className="flex shrink-0 items-center gap-1.5 text-muted-foreground text-xs">
+          <span>1 of 1</span>
+        </div>
+      </div>
+
+      <div className="grid gap-2">
+        {options.map((option, index) => {
+          const selected = selection === option.decision;
+          return (
+            <button
+              className={cn(
+                "grid grid-cols-[2rem_minmax(0,1fr)] items-center gap-3 rounded-[8px] border px-2.5 py-2 text-left text-sm transition-colors",
+                selected
+                  ? "border-border/70 bg-muted/70 text-foreground"
+                  : "border-transparent text-muted-foreground hover:bg-muted/35 hover:text-foreground"
+              )}
+              disabled={disabled}
+              key={option.decision}
+              onClick={() => setSelection(option.decision)}
+              type="button"
+            >
+              <span
+                className={cn(
+                  "flex size-5 items-center justify-center rounded-full border text-[11px]",
+                  selected
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border text-muted-foreground"
+                )}
+              >
+                {index + 1}
+              </span>
+              <span className={cn("font-medium", selected ? "text-foreground" : "text-foreground/90")}>
+                {option.label}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-3 flex items-center justify-end">
+        <button
+          className="inline-flex items-center gap-1.5 rounded-full bg-primary px-3 py-1.5 font-medium text-primary-foreground text-xs disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={disabled}
+          onClick={() => void onDecision(selection)}
+          type="button"
+        >
+          Submit
+          <CornerDownLeft className="size-4" />
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function BacktestPreviewRail({ status }: { status: BacktestLiveStatus | null }) {
+  if (!status) {
     return null;
   }
   const progress = Math.max(0, Math.min(100, status.progressPct));
@@ -5463,15 +4982,19 @@ function BacktestRunStatusPanel({ status }: { status: BacktestLiveStatus | null 
       ? `${status.fetchWindowsCompleted}/${status.fetchWindowsTotal} windows`
       : null;
   return (
-    <section className="rounded-[6px] border border-border/70 bg-background/70 p-3 text-sm">
+    <section className="rounded-[8px] border border-border bg-background/95 p-3 text-sm shadow-sm">
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="font-medium text-foreground">{backtestLiveStageLabel(status)}</p>
+          <p className="flex items-center gap-2 font-semibold text-foreground">
+            <Play className="size-3.5 text-muted-foreground" />
+            Backtest Preview
+          </p>
+          <p className="mt-1 text-muted-foreground text-xs">{backtestLiveStageLabel(status)}</p>
           <p className="mt-1 text-muted-foreground text-xs">{status.message}</p>
         </div>
         <span
           className={cn(
-            "shrink-0 rounded-[4px] border px-2 py-1 text-[10px] font-medium uppercase tracking-[0.08em]",
+            "shrink-0 rounded-[4px] border px-2 py-1 text-[10px] font-medium",
             status.status === "failed" && "border-red-500/40 bg-red-500/10 text-red-300",
             status.status !== "failed" && "border-border bg-secondary text-muted-foreground"
           )}
@@ -5492,9 +5015,6 @@ function BacktestRunStatusPanel({ status }: { status: BacktestLiveStatus | null 
         {windowProgress && <span>{windowProgress}</span>}
         {status.isStale && <span className="text-amber-300">Status heartbeat delayed</span>}
       </div>
-      <p className="mt-2 border-border/70 border-t pt-2 text-muted-foreground text-xs">
-        Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, or a profitability claim.
-      </p>
     </section>
   );
 }
@@ -5562,30 +5082,6 @@ function backtestSummaryRunIdsByAnchorMessage({
     }
   }
   return grouped;
-}
-
-function runEventAssistantAnchorMessageId({
-  backendMessages,
-  event,
-}: {
-  backendMessages: BackendMessage[];
-  event: RunEvent;
-}) {
-  const eventTime = Date.parse(event.created_at);
-  if (!Number.isFinite(eventTime)) {
-    return null;
-  }
-  const sortedMessages = [...backendMessages].sort(
-    (left, right) => Date.parse(left.created_at) - Date.parse(right.created_at)
-  );
-  for (const message of sortedMessages) {
-    const messageTime = Date.parse(message.created_at);
-    if (!Number.isFinite(messageTime) || messageTime < eventTime) {
-      continue;
-    }
-    return message.role === "assistant" ? message.id : null;
-  }
-  return null;
 }
 
 function backtestResultArtifactsByRunId(artifacts: Artifact[]) {
@@ -5818,7 +5314,7 @@ function ArtifactDrawerPanel({
   return (
     <aside
       className={cn(
-        "fixed inset-0 z-40 h-[100dvh] min-h-0 min-w-0 overflow-hidden border-l border-border bg-background shadow-2xl transition-[opacity,transform] duration-300 ease-out will-change-transform lg:relative lg:inset-auto lg:z-auto lg:h-full lg:shadow-none",
+        "apple-product-tile fixed inset-0 z-40 h-[100dvh] min-h-0 min-w-0 overflow-hidden border-l border-border shadow-2xl transition-[opacity,transform] duration-300 ease-out will-change-transform lg:relative lg:inset-auto lg:z-auto lg:h-full lg:shadow-none",
         open
           ? "translate-x-0 opacity-100"
           : "pointer-events-none translate-x-4 opacity-0 lg:translate-x-2"
@@ -5830,7 +5326,7 @@ function ArtifactDrawerPanel({
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
-                  className="pointer-events-auto bg-background/80 shadow-sm backdrop-blur hover:bg-muted"
+                  className="apple-frosted pointer-events-auto shadow-sm hover:bg-muted"
                   size="icon-sm"
                   type="button"
                   variant="ghost"
@@ -5877,7 +5373,7 @@ function ArtifactDrawerPanel({
           )}
           <div className="flex shrink-0 items-center gap-2">
             <Button
-              className="pointer-events-auto bg-background/80 shadow-sm backdrop-blur hover:bg-muted"
+              className="apple-frosted pointer-events-auto shadow-sm hover:bg-muted"
               disabled={!content}
               onClick={() => void handleCopy()}
               size="sm"
@@ -5887,7 +5383,7 @@ function ArtifactDrawerPanel({
               {t.copy}
             </Button>
             <Button
-              className="pointer-events-auto bg-background/80 shadow-sm backdrop-blur hover:bg-muted"
+              className="apple-frosted pointer-events-auto shadow-sm hover:bg-muted"
               onClick={onClose}
               size="icon-sm"
               type="button"
@@ -5927,7 +5423,7 @@ function ArtifactDrawerPanel({
 
 function PreviewLoading({ label }: { label: string }) {
   return (
-    <div className="rounded-[4px] border border-border bg-background p-3 text-sm">
+    <div className="apple-utility-card p-3 text-sm">
       <Shimmer className="text-muted-foreground" duration={1.8}>
         {label}
       </Shimmer>
@@ -6038,266 +5534,6 @@ function CreateFromSpecDialog({
   );
 }
 
-function buildFallbackSuggestionPayload({
-  artifactAvailable,
-  intent,
-  language,
-  strategyProfile,
-}: {
-  artifactAvailable: boolean;
-  intent: ResponseIntent | null;
-  language: UiLanguagePreference;
-  strategyProfile: StrategyProfile | null;
-}) {
-  const t = getUiCopy(language);
-  const strategyRelevant =
-    shouldShowStrategyProfile(intent) ||
-    (intent === null && Boolean(strategyProfile));
-  const composerBlocks = strategyRelevant ? fallbackComposerBlocks(language, strategyProfile) : [];
-  const actions: ChatSuggestionItem[] = [];
-  const ready = strategyProfile?.snapshot.completeness === "ready_for_artifact";
-
-  if (!artifactAvailable && shouldSuggestMarketToStrategyForIntent(intent)) {
-    actions.push({
-      action: "send_prompt",
-      category: "strategy",
-      enabled: true,
-      id: "fallback-market-to-strategy",
-      kind: "chat_action",
-      label: localizedSuggestionCopy(language, "Dùng cho strategy", "Use for strategy"),
-      priority: 1,
-      prompt:
-        isVietnameseUi(language)
-          ? "Dùng market context này để bắt đầu xây strategy review-only."
-          : "Use this market context to start a review-only strategy.",
-    });
-  } else if (
-    !ready &&
-    shouldShowStrategyProfile(intent) &&
-    strategyProfile?.snapshot.missing_fields?.length
-  ) {
-    actions.push(
-      ...strategyProfile.snapshot.missing_fields
-        .slice(0, 2)
-        .map((field, index) => fallbackMissingFieldAction(field, language, index + 1))
-    );
-  } else if (ready && strategyRelevant) {
-    actions.push(
-      {
-        action: "send_prompt",
-        category: "code",
-        enabled: true,
-        id: "fallback-generate-pine",
-        kind: "chat_action",
-        label: localizedSuggestionCopy(language, "Tạo Pine v6", "Generate Pine v6"),
-        priority: 1,
-        prompt:
-          isVietnameseUi(language)
-            ? "Tạo artifact Pine v6 review-only từ strategy context hiện tại."
-            : "Generate a review-only Pine v6 artifact from the current strategy context.",
-      },
-      {
-        action: "send_prompt",
-        category: "risk",
-        enabled: true,
-        id: "fallback-review-risk",
-        kind: "chat_action",
-        label: localizedSuggestionCopy(language, "Review risk", "Review risk"),
-        priority: 2,
-        prompt:
-          isVietnameseUi(language)
-            ? "Review risk rules trong strategy context hiện tại."
-            : "Review the risk rules in the current strategy context.",
-      }
-    );
-  }
-
-  return { actions, composer_blocks: composerBlocks, version: 1 as const };
-}
-
-function fallbackMissingFieldAction(
-  field: string,
-  language: UiLanguagePreference,
-  priority: number
-): ChatSuggestionItem {
-  const normalized = field.toLowerCase();
-  const category = suggestionCategoryForMissingField(normalized);
-  const label = localizedSuggestionCopy(
-    language,
-    `Thêm ${readableKey(field).toLowerCase()}`,
-    `Add ${readableKey(field).toLowerCase()}`
-  );
-  return {
-    action: "send_prompt",
-    category,
-    enabled: true,
-    id: `fallback-add-${normalized.replace(/[^a-z0-9]+/g, "-")}`,
-    kind: "chat_action",
-    label,
-    priority,
-    prompt: localizedSuggestionCopy(
-      language,
-      `Thêm ${readableKey(field).toLowerCase()} rõ ràng cho strategy context hiện tại.`,
-      `Add clear ${readableKey(field).toLowerCase()} to the current strategy context.`
-    ),
-  };
-}
-
-function suggestionCategoryForMissingField(field: string): ChatSuggestionItem["category"] {
-  if (field.includes("entry")) {
-    return "entry";
-  }
-  if (field.includes("exit")) {
-    return "exit";
-  }
-  if (field.includes("risk")) {
-    return "risk";
-  }
-  if (field.includes("market") || field.includes("symbol") || field.includes("timeframe")) {
-    return "market";
-  }
-  return "strategy";
-}
-
-function fallbackComposerBlocks(
-  language: UiLanguagePreference,
-  profile: StrategyProfile | null
-): ChatSuggestionItem[] {
-  const t = getUiCopy(language);
-  const symbol = profile?.brief.symbol || "ETHUSDT";
-  const timeframe = profile?.brief.timeframe || "1h";
-  return [
-    composerBlock("market", t.signalGrammarMarketLabel, [
-      {
-        id: "detected-market",
-        insert_template: t.signalGrammarMarketTemplate
-          .replace("{symbol}", symbol)
-          .replace("{timeframe}", timeframe),
-        label: `${symbol} / ${timeframe}`,
-      },
-      {
-        id: "btc-4h",
-        insert_template: t.signalGrammarMarketTemplate
-          .replace("{symbol}", "BTCUSDT")
-          .replace("{timeframe}", "4h"),
-        label: "BTC / 4h",
-      },
-    ]),
-    composerBlock("entry", t.signalGrammarEntryLabel, [
-      {
-        id: "ema-crossover",
-        insert_template:
-          isVietnameseUi(language)
-            ? "Entry rules:\n- Long khi EMA 20 cắt lên EMA 50\n- Xác nhận RSI trên 50"
-            : "Entry rules:\n- Long when EMA 20 crosses above EMA 50\n- Confirm RSI is above 50",
-        label: "EMA crossover",
-      },
-      {
-        id: "breakout",
-        insert_template:
-          isVietnameseUi(language)
-            ? "Entry rules:\n- Long khi giá phá vùng kháng cự gần nhất\n- Xác nhận bằng volume tăng"
-            : "Entry rules:\n- Long when price breaks the nearest resistance\n- Confirm with rising volume",
-        label: "Breakout",
-      },
-    ]),
-    composerBlock("exit", t.signalGrammarExitLabel, [
-      {
-        id: "atr-stop",
-        insert_template:
-          isVietnameseUi(language)
-            ? "Exit rules:\n- Stop-loss: 2 ATR\n- Take-profit: 2R\n- Thoát khi tín hiệu đảo chiều"
-            : "Exit rules:\n- Stop-loss: 2 ATR\n- Take-profit: 2R\n- Exit on opposite signal",
-        label: "ATR stop",
-      },
-      {
-        id: "trailing-stop",
-        insert_template:
-          isVietnameseUi(language)
-            ? "Exit rules:\n- Dùng trailing stop theo swing low/high\n- Chốt một phần ở 1R"
-            : "Exit rules:\n- Use a trailing stop by swing low/high\n- Take partial profit at 1R",
-        label: "Trailing stop",
-      },
-    ]),
-    composerBlock("risk", t.signalGrammarRiskLabel, [
-      {
-        id: "balanced-risk",
-        insert_template:
-          isVietnameseUi(language)
-            ? "Risk rules:\n- Risk 1% equity mỗi lệnh\n- Max 1 vị thế mở\n- Không vào lệnh khi biến động bất thường"
-            : "Risk rules:\n- Risk 1% equity per trade\n- Max 1 open position\n- Avoid entries during abnormal volatility",
-        label: "Balanced",
-      },
-      {
-        id: "conservative-risk",
-        insert_template:
-          isVietnameseUi(language)
-            ? "Risk rules:\n- Risk 0.5% equity mỗi lệnh\n- Stop-loss bắt buộc\n- Bỏ qua setup nếu R:R dưới 1.5"
-            : "Risk rules:\n- Risk 0.5% equity per trade\n- Stop-loss is required\n- Skip setups below 1.5R",
-        label: "Conservative",
-      },
-    ]),
-  ];
-}
-
-function composerBlock(
-  slot: NonNullable<ChatSuggestionItem["slot"]>,
-  label: string,
-  variants: NonNullable<ChatSuggestionItem["variants"]>
-): ChatSuggestionItem {
-  return {
-    action: "insert_or_update_block",
-    category: slot,
-    enabled: true,
-    id: `fallback-block-${slot}`,
-    kind: "composer_block",
-    label,
-    priority: ["market", "entry", "exit", "risk"].indexOf(slot),
-    slot,
-    variants,
-  };
-}
-
-function insertOrUpdateStrategyBlock(
-  currentValue: string,
-  slot: ChatSuggestionItem["slot"],
-  template: string
-) {
-  const trimmedTemplate = template.trim();
-  if (!slot) {
-    return appendPromptBlock(currentValue, trimmedTemplate);
-  }
-  const pattern = strategyBlockPattern(slot);
-  if (pattern.test(currentValue)) {
-    return currentValue.replace(pattern, trimmedTemplate);
-  }
-  return appendPromptBlock(currentValue, trimmedTemplate);
-}
-
-function appendPromptBlock(currentValue: string, block: string) {
-  const trimmed = currentValue.trimEnd();
-  return trimmed ? `${trimmed}\n\n${block}` : block;
-}
-
-function strategyBlockPattern(slot: ChatSuggestionItem["slot"]) {
-  const headers: Record<NonNullable<ChatSuggestionItem["slot"]>, string> = {
-    entry: "(?:Entry rules|Vào lệnh)",
-    exit: "(?:Exit rules|Thoát lệnh)",
-    market: "(?:Market|Thị trường)",
-    risk: "(?:Risk rules|Risk)",
-  };
-  const header = slot ? headers[slot] : "";
-  return new RegExp(`(^${header}:?[\\s\\S]*?)(?=\\n\\n(?:Market|Thị trường|Entry rules|Vào lệnh|Exit rules|Thoát lệnh|Risk rules|Risk):?|$)`, "im");
-}
-
-function localizedSuggestionCopy(language: UiLanguagePreference, vi: string, en: string) {
-  return isVietnameseUi(language) ? vi : en;
-}
-
-function isVietnameseUi(language: UiLanguagePreference) {
-  return languageLocale(language).startsWith("vi");
-}
-
 function artifactTabLabel(tab: ArtifactWorkspaceTab, language: UiLanguagePreference) {
   const t = getUiCopy(language);
   const labels: Record<ArtifactWorkspaceTab, string> = {
@@ -6369,7 +5605,10 @@ function useElapsedSeconds(active: boolean) {
   return active ? elapsedSeconds : 0;
 }
 
-function slowProviderState(elapsedSeconds: number, language: UiLanguagePreference = "en") {
+function slowProviderState(
+  elapsedSeconds: number,
+  language: UiLanguagePreference = "en"
+): ChatLoadingState {
   const t = getUiCopy(language);
   if (elapsedSeconds >= 45) {
     return {
@@ -6392,6 +5631,43 @@ function slowProviderState(elapsedSeconds: number, language: UiLanguagePreferenc
   return {
     description: t.slowProviderInitialDescription,
     title: t.slowProviderInitialTitle,
+  };
+}
+
+function workflowAwareSlowProviderState(
+  elapsedSeconds: number,
+  language: UiLanguagePreference,
+  workflow: WorkflowState | null
+) {
+  const fallback = slowProviderState(elapsedSeconds, language);
+  const workflowState = workflowStepWorkingState(workflow, language);
+  if (!workflowState) {
+    return fallback;
+  }
+  return {
+    description: elapsedSeconds >= 8 ? fallback.description : workflowState.description,
+    title: workflowState.title,
+  };
+}
+
+function workflowStepWorkingState(workflow: WorkflowState | null, language: UiLanguagePreference) {
+  if (!workflow?.current_step) {
+    return null;
+  }
+  const definition = getWorkflowDefinition(workflow.workflow_id);
+  const currentStep = definition?.steps.find((step) => step.id === workflow.current_step);
+  if (!currentStep) {
+    return null;
+  }
+  return {
+    description:
+      language === "vi"
+        ? "Model đang xử lý bước workflow hiện tại. Rail bên phải đang hiển thị cùng trạng thái."
+        : "The model is working through the active workflow step. The rail shows the same state.",
+    title:
+      language === "vi"
+        ? `Đang xử lý: ${currentStep.label}`
+        : `Working on ${currentStep.label.toLowerCase()}...`,
   };
 }
 

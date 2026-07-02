@@ -16,6 +16,7 @@ import { backtestTradesTableFromToolOutput } from "@/lib/backtest-trades-inline-
 import {
   AGENT_WORKFLOW_OBSERVABILITY_EVENT_TYPES,
   MessageModeSchema,
+  SelectedActionMetadataSchema,
   WebSearchModeSchema,
   WORKFLOW_CONTINUATION_EVENT_TYPES,
 } from "@/lib/backend-schemas";
@@ -186,6 +187,7 @@ export async function POST(request: Request) {
   const mode = modeValue(forwardedProps.mode);
   const workflowTaskId = stringValue(forwardedProps.workflowTaskId);
   const webSearch = webSearchValue(forwardedProps.webSearch);
+  const selectedAction = selectedActionValue(forwardedProps.selectedAction);
   const clientRequestId = stringValue(forwardedProps.clientRequestId);
   const headerTraceId = stringValue(request.headers.get("X-Trace-Id"));
   const headerRequestId = stringValue(request.headers.get("X-Request-Id"));
@@ -223,6 +225,8 @@ export async function POST(request: Request) {
     trace_id: traceId,
     workflow_task_id: workflowTaskId ?? null,
     mode,
+    selected_action_id: selectedAction?.action_id ?? null,
+    selected_action_tool_id: selectedAction?.tool_id ?? null,
     web_search: webSearch,
   });
 
@@ -323,7 +327,7 @@ export async function POST(request: Request) {
               )
             : await client.streamMessage(
                 conversationId,
-                { content, language, web_search: webSearch },
+                { content, language, selected_action: selectedAction ?? undefined, web_search: webSearch },
                 {
                   idempotencyKey,
                   mode,
@@ -1250,6 +1254,10 @@ function readTimeoutMs(name: string, fallback: number) {
 
 function webSearchValue(value: unknown) {
   return WebSearchModeSchema.safeParse(value).data ?? "auto";
+}
+
+function selectedActionValue(value: unknown) {
+  return SelectedActionMetadataSchema.safeParse(value).data ?? null;
 }
 
 function modeValue(value: unknown) {

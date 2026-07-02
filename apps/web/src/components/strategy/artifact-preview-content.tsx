@@ -28,11 +28,25 @@ type BacktestPlanApprovalPreview = {
   conversationId: string;
   symbol?: string;
   timeframe?: string;
-  boundary: string;
+  boundary?: string | null;
   backtestConfig?: Record<string, unknown>;
   warnings: string[];
   assumptions: string[];
 };
+
+const SUPPRESSED_BACKTEST_BOUNDARY =
+  [
+    "Local sandbox preview only",
+    "not TradingView proof, broker proof, live trading evidence, or a profitability claim.",
+  ].join("; ");
+
+function visibleBacktestBoundary(value: string | null | undefined) {
+  const text = value?.trim();
+  if (!text || text === SUPPRESSED_BACKTEST_BOUNDARY) {
+    return null;
+  }
+  return text;
+}
 
 const artifactPreviewMarkdownComponents = {
   table: ({ className, ...props }: ComponentProps<"table">) => (
@@ -124,7 +138,7 @@ export function ArtifactPreviewContent({
     return (
       <article className="mx-auto max-w-3xl">
         <MessageResponse
-          className="text-base leading-7"
+          className="apple-utility-card p-5 text-base leading-7"
           components={
             artifactPreviewMarkdownComponents as MessageResponseProps["components"]
           }
@@ -138,7 +152,7 @@ export function ArtifactPreviewContent({
 
   return (
     <CodeBlock
-      className="mx-auto max-w-5xl rounded-none border-0 bg-transparent shadow-none [&>div]:overflow-x-auto [&>div]:overflow-y-visible [&_pre]:!bg-transparent [&_pre]:px-0 [&_pre]:py-0"
+      className="apple-dark-tile mx-auto max-w-5xl border-0 p-5 shadow-none [&>div]:overflow-x-auto [&>div]:overflow-y-visible [&_pre]:!bg-transparent [&_pre]:px-0 [&_pre]:py-0"
       code={content}
       language={codeLanguage}
       showLineNumbers
@@ -186,7 +200,7 @@ function BacktestPlanApprovalArtifact({
         symbol={approval.symbol}
         timeframe={approval.timeframe}
       />
-      <section className="rounded-[4px] border border-border bg-[rgba(255,255,255,0.02)] p-4">
+      <section className="apple-utility-card p-4">
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span className="rounded-[4px] border border-border px-2 py-1 font-mono">
             {approval.symbol ?? "Symbol pending"}
@@ -204,7 +218,9 @@ function BacktestPlanApprovalArtifact({
                   : "Approval required"}
           </span>
         </div>
-        <p className="mt-3 text-muted-foreground text-sm">{approval.boundary}</p>
+        {approval.boundary ? (
+          <p className="mt-3 text-muted-foreground text-sm">{approval.boundary}</p>
+        ) : null}
         {approval.backtestConfig ? (
           <dl className="mt-4 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
             {Object.entries(approval.backtestConfig).slice(0, 8).map(([key, value]) => (
@@ -244,13 +260,13 @@ function BacktestTradesPreview({ trades }: { trades: unknown[] }) {
   const rows = trades.filter(isRecord).slice(0, 20);
   if (rows.length === 0) {
     return (
-      <p className="mx-auto max-w-3xl rounded-[4px] border border-border bg-background p-3 text-muted-foreground text-sm">
+          <p className="apple-utility-card mx-auto max-w-3xl p-3 text-muted-foreground text-sm">
         No trades recorded in this preview.
       </p>
     );
   }
   return (
-    <div className="mx-auto max-w-5xl overflow-x-auto rounded-[6px] border border-border bg-background">
+    <div className="apple-utility-card mx-auto max-w-5xl overflow-x-auto">
       <table className="w-full min-w-[680px] text-left text-sm">
         <thead className="border-border border-b text-muted-foreground text-xs">
           <tr>
@@ -295,9 +311,10 @@ function backtestPlanApprovalFromPreview(
   const config = isRecord(preview.preview.backtest_config)
     ? preview.preview.backtest_config
     : undefined;
-  const warnings = Array.isArray(preview.preview.warnings)
+  const rawWarnings = Array.isArray(preview.preview.warnings)
     ? preview.preview.warnings.filter((item): item is string => typeof item === "string")
     : [];
+  const warnings = rawWarnings.filter((warning) => visibleBacktestBoundary(warning));
   const assumptions = Array.isArray(preview.preview.assumptions)
     ? preview.preview.assumptions.filter((item): item is string => typeof item === "string")
     : [];
@@ -305,9 +322,7 @@ function backtestPlanApprovalFromPreview(
     approvalId,
     assumptions,
     backtestConfig: config,
-    boundary:
-      warnings[0] ??
-      "Local sandbox preview only; not TradingView proof, broker proof, live trading evidence, or a profitability claim.",
+    boundary: visibleBacktestBoundary(rawWarnings[0]),
     conversationId: preview.conversation_id ?? "",
     status: approvalStatusFromEvents(approvalId, events, preview.preview.approval_status),
     symbol: typeof config?.symbol === "string" ? config.symbol : undefined,

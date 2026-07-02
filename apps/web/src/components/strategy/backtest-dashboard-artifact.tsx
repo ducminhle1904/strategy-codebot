@@ -38,8 +38,8 @@ const AXIS_COLOR = "rgba(226, 232, 240, 0.55)";
 export function BacktestDashboardArtifact({ dashboard }: { dashboard: BacktestDashboardModel }) {
   const [tab, setTab] = useState<DashboardTab>("performance");
   return (
-    <div className="mx-auto w-full max-w-7xl overflow-hidden rounded-[6px] border border-border bg-[#111416] text-foreground">
-      <header className="border-border border-b px-4 pt-4">
+    <div className="apple-dark-tile mx-auto w-full max-w-7xl overflow-hidden text-[var(--apple-on-dark)]">
+      <header className="border-white/10 border-b px-4 pt-4">
         <div className="flex flex-wrap items-center gap-2">
           <span className="rounded-full bg-emerald-500/15 px-2 py-1 font-medium text-emerald-200 text-xs">
             {dashboard.summary.symbol}
@@ -93,7 +93,7 @@ function PerformanceTab({ dashboard }: { dashboard: BacktestDashboardModel }) {
           </AreaChart>
         </ResponsiveContainer>
       </ChartPanel>
-      <div className="grid gap-2 rounded-[6px] border border-border bg-background/35 p-3 sm:grid-cols-2 lg:grid-cols-5">
+      <div className="grid gap-2 rounded-[8px] border border-white/10 bg-white/5 p-3 sm:grid-cols-2 lg:grid-cols-5">
         <Kpi label="Net Profit" value={formatCurrency(numberValue(kpis.net_profit))} tone="profit" />
         <Kpi label="Trades" value={formatNumber(numberValue(kpis.trades))} />
         <Kpi
@@ -291,7 +291,7 @@ function ChartBlock({
 }
 
 function ChartPanel({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn("h-[260px] min-h-[220px] rounded-[6px] border border-border bg-background/35 p-3", className)}>{children}</div>;
+  return <div className={cn("h-[260px] min-h-[220px] rounded-[8px] border border-white/10 bg-white/5 p-3", className)}>{children}</div>;
 }
 
 function BarSeriesChart({ data, xKey }: { data: Array<Record<string, unknown>>; xKey: string }) {
@@ -430,10 +430,10 @@ function toneClass(value: number | null) {
 }
 
 const tooltipStyle = {
-  backgroundColor: "#111416",
-  border: "1px solid rgba(148, 163, 184, 0.2)",
-  borderRadius: 6,
-  color: "#f8fafc",
+  backgroundColor: "var(--apple-tile-1)",
+  border: "1px solid rgba(245, 245, 247, 0.16)",
+  borderRadius: 8,
+  color: "var(--apple-on-dark)",
 };
 
 function currencyTooltip(value: unknown) {

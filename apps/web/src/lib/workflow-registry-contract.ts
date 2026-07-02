@@ -109,7 +109,8 @@ export const WORKFLOW_DEFINITIONS = {
       "account_id",
       "risk_policy_id",
       "strategy_id",
-      "data_subscriptions"
+      "data_subscriptions",
+      "next_after_strategy_spec"
     ],
     "required_input_fields": [
       "market",
@@ -252,6 +253,23 @@ export const WORKFLOW_DEFINITIONS = {
           "id": "draft_only",
           "value": "draft_only",
           "label": "Draft only"
+        }
+      ],
+      "strategy_spec_next_actions": [
+        {
+          "id": "generate_pine",
+          "value": "generate_pine",
+          "label": "Generate Pine Script"
+        },
+        {
+          "id": "revise_strategy_spec",
+          "value": "revise_strategy_spec",
+          "label": "Revise strategy spec"
+        },
+        {
+          "id": "skip_pine",
+          "value": "skip_pine",
+          "label": "Skip Pine"
         }
       ]
     },
@@ -424,6 +442,18 @@ export const WORKFLOW_DEFINITIONS = {
         "required": false,
         "option_set_id": "draft_only_choices",
         "recommended_option_id": "run_preview"
+      },
+      {
+        "id": "next_after_strategy_spec",
+        "field": "next_after_strategy_spec",
+        "label": "Next step",
+        "question": "Strategy spec is ready. What should we do next?",
+        "kind": "select_or_text",
+        "required": true,
+        "option_set_id": "strategy_spec_next_actions",
+        "allow_custom": true,
+        "recommended_option_id": "generate_pine",
+        "custom_option_label": "Tell the model what to do differently"
       }
     ],
     "task_templates": [
@@ -451,12 +481,26 @@ export const WORKFLOW_DEFINITIONS = {
         "step_id": "backtest_preview",
         "kind": "choice_request",
         "title": "Backtest preview choice",
-        "blocking": false,
+        "blocking": true,
         "input_request_ids": [
           "draft_only_choice"
         ],
         "action_ids": [],
         "default_status": "pending_user"
+      },
+      {
+        "id": "review_strategy_spec_next_step",
+        "step_id": "generate_pine",
+        "kind": "choice_request",
+        "title": "Review strategy spec next step",
+        "blocking": true,
+        "input_request_ids": [
+          "next_after_strategy_spec"
+        ],
+        "action_ids": [],
+        "default_status": "pending_user",
+        "resume_on_complete": true,
+        "resume_intent": "strategy_building"
       },
       {
         "id": "complete_paper_setup",

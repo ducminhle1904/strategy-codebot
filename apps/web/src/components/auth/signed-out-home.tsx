@@ -21,12 +21,12 @@ export function SignedOutHome() {
   };
 
   return (
-    <main className="relative grid min-h-dvh overflow-hidden bg-background text-foreground">
-      <header className="absolute top-0 right-0 left-0 z-10 flex items-center justify-between px-5 py-4">
+    <main className="apple-page-shell relative grid min-h-dvh overflow-hidden text-foreground">
+      <header className="apple-frosted absolute top-4 right-4 left-4 z-10 flex items-center justify-between rounded-full border px-4 py-2">
         <div className="flex items-center gap-2">
-          <span className="flex size-8 items-center justify-center overflow-hidden rounded-[10px] bg-white">
+          <span className="flex size-8 items-center justify-center overflow-hidden rounded-full bg-white">
             <Image
-              alt=""
+              alt="Strategy Codebot"
               className="size-full object-cover"
               height={32}
               src="/brand/strategy-codebot-icon-192.png"
@@ -50,7 +50,7 @@ export function SignedOutHome() {
       </header>
 
       <StrategyStartPrompt
-        className="min-h-dvh py-24"
+        className="relative z-[1] min-h-dvh pt-24 pb-16"
         onSubmit={navigateToSignIn}
         placeholder={t.signedOutPlaceholder}
         submitLabel={t.logIn}
@@ -61,7 +61,7 @@ export function SignedOutHome() {
         title={t.signedOutTitle}
       />
 
-      <p className="absolute right-4 bottom-3 left-4 text-center text-muted-foreground text-xs">
+      <p className="absolute right-4 bottom-3 left-4 z-[1] text-center text-muted-foreground text-xs">
         {t.signedOutDisclaimer}
       </p>
     </main>
