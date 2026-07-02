@@ -9,12 +9,12 @@ import re
 import time
 from typing import Any
 
-from strategy_codebot.server.action_registry import action_registry_payload
-from strategy_codebot.server.action_registry import ActionRegistryEvaluation
-from strategy_codebot.server.action_registry import ActionRegistryRequestCache
-from strategy_codebot.server.action_registry import evaluate_action_registry
-from strategy_codebot.server.action_registry import available_registry_tool_ids
-from strategy_codebot.server.action_registry import registry_entry_for_tool
+from strategy_codebot.server.contracts.action_registry import action_registry_payload
+from strategy_codebot.server.contracts.action_registry import ActionRegistryEvaluation
+from strategy_codebot.server.contracts.action_registry import ActionRegistryRequestCache
+from strategy_codebot.server.contracts.action_registry import evaluate_action_registry
+from strategy_codebot.server.contracts.action_registry import available_registry_tool_ids
+from strategy_codebot.server.contracts.action_registry import registry_entry_for_tool
 from strategy_codebot.server.agent_loop import AgentLoopBudget
 from strategy_codebot.server.agent_loop import BoundedScoutRunner
 from strategy_codebot.server.agent_logging import agent_log
@@ -72,6 +72,7 @@ from strategy_codebot.server.intent_evidence import collect_chat_regex_evidence
 from strategy_codebot.server.intent_evidence import current_context_signal
 from strategy_codebot.server.market_data import MarketDataGateway
 from strategy_codebot.server.market_data import market_data_context
+from strategy_codebot.server.modules.chat.orchestrator_services import OrchestratorServicePorts
 from strategy_codebot.server.model_routing import DEFAULT_MODEL_STAGE
 from strategy_codebot.server.model_routing import MODEL_STAGE_BALANCED_REVIEW
 from strategy_codebot.server.model_routing import MODEL_STAGE_CLASSIFIER
@@ -122,13 +123,13 @@ from strategy_codebot.server.streaming import sse_frame
 from strategy_codebot.server.streaming import transient_delta_event
 from strategy_codebot.server.streaming import transient_reasoning_event
 from strategy_codebot.server.token_estimation import estimate_tokens as _token_estimate
-from strategy_codebot.server.workflow_registry import STRATEGY_BOT_OPTIONAL_STEPS
-from strategy_codebot.server.workflow_registry import STRATEGY_BOT_REQUIRED_INPUT_FIELDS
-from strategy_codebot.server.workflow_registry import STRATEGY_BOT_SETUP_FIELDS
-from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_ID
-from strategy_codebot.server.workflow_registry import STRATEGY_BOT_WORKFLOW_STEPS
-from strategy_codebot.server.workflow_registry import validate_workflow_payload
-from strategy_codebot.server.workflow_registry import workflow_catalog_guidance
+from strategy_codebot.server.contracts.workflow_registry import STRATEGY_BOT_OPTIONAL_STEPS
+from strategy_codebot.server.contracts.workflow_registry import STRATEGY_BOT_REQUIRED_INPUT_FIELDS
+from strategy_codebot.server.contracts.workflow_registry import STRATEGY_BOT_SETUP_FIELDS
+from strategy_codebot.server.contracts.workflow_registry import STRATEGY_BOT_WORKFLOW_ID
+from strategy_codebot.server.contracts.workflow_registry import STRATEGY_BOT_WORKFLOW_STEPS
+from strategy_codebot.server.contracts.workflow_registry import validate_workflow_payload
+from strategy_codebot.server.contracts.workflow_registry import workflow_catalog_guidance
 from strategy_codebot.server.workflow_task_status import WORKFLOW_TASK_RESOLVED_STATUSES
 from strategy_codebot.server.workflow_prompt_generator import generate_workflow_task_prompt_payload
 from strategy_codebot.server.workflow_prompt_generator import workflow_prompt_generator_events
@@ -1038,6 +1039,17 @@ class LLMOrchestrator:
     security_controls: SecurityControls = field(default_factory=SecurityControls)
     budget_config: RunBudgetConfig = field(default_factory=RunBudgetConfig)
     market_data_gateway: MarketDataGateway | None = None
+
+    @property
+    def services(self) -> OrchestratorServicePorts:
+        return OrchestratorServicePorts(
+            repository=self.repository,
+            artifact_store=self.artifact_store,
+            client=self.client,
+            security_controls=self.security_controls,
+            budget_config=self.budget_config,
+            market_data_gateway=self.market_data_gateway,
+        )
 
     def ensure_configured(self) -> None:
         self.client.ensure_configured()

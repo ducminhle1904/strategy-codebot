@@ -26,7 +26,7 @@ from strategy_codebot.schemas import write_json
 from strategy_codebot.paths import repo_root
 from strategy_codebot.tool_runtime import POLICY_OBSERVE
 from strategy_codebot.tool_runtime import load_tool_registry
-from strategy_codebot.server.action_registry import action_registry_backend_tool_ids
+from strategy_codebot.server.contracts.action_registry import action_registry_backend_tool_ids
 from strategy_codebot.server.artifact_kinds import ROBUSTNESS_REPORT_ARTIFACT_KIND
 from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
@@ -36,6 +36,8 @@ from strategy_codebot.server.bot_proposals import BotProposalSourceNotFoundError
 from strategy_codebot.server.bot_proposals import build_bot_proposal_create_input
 from strategy_codebot.server.ids import opaque_id
 from strategy_codebot.server.knowledge_learning import KnowledgeLearningService
+from strategy_codebot.server.modules import tool_module_coverage_errors
+from strategy_codebot.server.modules.tools import tool_handlers_for_module
 from strategy_codebot.server.policy import evaluate_agent_loop_tool_policy
 from strategy_codebot.server.redaction import redact_value
 from strategy_codebot.server.repository import AssistantRunRecord
@@ -1930,7 +1932,7 @@ def _persist_json_artifact(
     return artifact
 
 
-TOOL_HANDLERS: dict[str, ToolHandler] = {
+_TOOL_HANDLER_FUNCTIONS: dict[str, ToolHandler] = {
     "generate_pine": _generate_pine_tool,
     "create_mql5_design": _create_mql5_design_tool,
     "static_validate": _static_validate_tool,
@@ -1948,6 +1950,13 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "get_bot_status": _get_bot_status_tool,
     "list_bots": _list_bots_tool,
     "list_bot_events": _list_bot_events_tool,
+}
+
+TOOL_HANDLERS: dict[str, ToolHandler] = {
+    **tool_handlers_for_module("generation", _TOOL_HANDLER_FUNCTIONS),
+    **tool_handlers_for_module("knowledge", _TOOL_HANDLER_FUNCTIONS),
+    **tool_handlers_for_module("backtest", _TOOL_HANDLER_FUNCTIONS),
+    **tool_handlers_for_module("bots", _TOOL_HANDLER_FUNCTIONS),
 }
 
 
@@ -1979,6 +1988,7 @@ def tool_catalog_consistency_errors() -> list[str]:
     missing_handler_registry = sorted(handler_names - registry_provider_names)
     if missing_handler_registry:
         errors.append(f"Tool handlers missing from tool registry: {', '.join(missing_handler_registry)}")
+    errors.extend(tool_module_coverage_errors(handler_names))
     return errors
 
 

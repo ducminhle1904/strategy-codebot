@@ -17,7 +17,6 @@ from strategy_codebot.nautilus_runtime import RuntimeKey
 from strategy_codebot.nautilus_runtime import runtime_state_after_event
 from strategy_codebot.pine import validate_pineforge_pine
 from strategy_codebot.schemas import validate_payload as validate_schema_payload
-from strategy_codebot.server.action_registry import ACTION_REGISTRY
 from strategy_codebot.server.agent_logging import agent_log
 from strategy_codebot.server.artifact_kinds import BACKTEST_DASHBOARD_ARTIFACT_KIND
 from strategy_codebot.server.artifact_kinds import BACKTEST_PLAN_ARTIFACT_KIND
@@ -50,6 +49,13 @@ from strategy_codebot.server.model_routing import gateway_env_report
 from strategy_codebot.server.model_routing import load_model_registry
 from strategy_codebot.server.model_routing import normalize_user_tier
 from strategy_codebot.server.model_routing import resolve_routes
+from strategy_codebot.server.modules import apply_module_route_tags
+from strategy_codebot.server.modules import module_openapi_tags
+from strategy_codebot.server.modules.account.router import AccountRouterDeps
+from strategy_codebot.server.modules.account.router import build_account_router
+from strategy_codebot.server.modules.actions.router import router as action_registry_router
+from strategy_codebot.server.modules.platform.router import PlatformRouterDeps
+from strategy_codebot.server.modules.platform.router import build_platform_router
 from strategy_codebot.server.model_audit import MODEL_ACTION_VALIDATED
 from strategy_codebot.server.model_audit import WORKFLOW_GATE_CONFIRMED
 from strategy_codebot.server.model_audit import WORKFLOW_GATE_REJECTED
@@ -68,7 +74,6 @@ from strategy_codebot.server.policy import evaluate_policy
 from strategy_codebot.server.policy import policy_finding_payload
 from strategy_codebot.server.provider_errors import log_provider_exception
 from strategy_codebot.server.provider_errors import provider_error_payload
-from strategy_codebot.server.readiness import build_readiness_payload
 from strategy_codebot.server.redaction import redact_text
 from strategy_codebot.server.redaction import redact_value
 from strategy_codebot.server.bot_proposals import BotProposalArtifactUnreadableError
@@ -103,7 +108,6 @@ from strategy_codebot.server.schemas import ArtifactResponse
 from strategy_codebot.server.schemas import ArtifactPreviewResponse
 from strategy_codebot.server.schemas import BacktestApprovalDecisionRequest
 from strategy_codebot.server.schemas import BacktestApprovalDecisionResponse
-from strategy_codebot.server.schemas import AccountUsageResponse
 from strategy_codebot.server.schemas import BotProposalConfirmStartRequest
 from strategy_codebot.server.schemas import BotProposalConfirmStartResponse
 from strategy_codebot.server.schemas import BotProposalCreateRequest
@@ -129,7 +133,6 @@ from strategy_codebot.server.schemas import KnowledgeLearningResponse
 from strategy_codebot.server.schemas import MessageCreate
 from strategy_codebot.server.schemas import MessageListResponse
 from strategy_codebot.server.schemas import MessageResponse
-from strategy_codebot.server.schemas import MeResponse
 from strategy_codebot.server.schemas import NautilusRuntimeEventCreate
 from strategy_codebot.server.schemas import NautilusRuntimeEventIngestResponse
 from strategy_codebot.server.schemas import NautilusRuntimeEventResponse
@@ -138,7 +141,6 @@ from strategy_codebot.server.schemas import NautilusRuntimeKillSwitchRequest
 from strategy_codebot.server.schemas import NautilusRuntimeListResponse
 from strategy_codebot.server.schemas import NautilusRuntimeResponse
 from strategy_codebot.server.schemas import NautilusRuntimeStartRequest
-from strategy_codebot.server.schemas import ProviderStatusResponse
 from strategy_codebot.server.schemas import RunCreate
 from strategy_codebot.server.schemas import RunCreateResponse
 from strategy_codebot.server.schemas import RunEventResponse
@@ -367,7 +369,7 @@ def create_app(
         artifact_store,
         llm_client=llm_orchestrator.client,
     )
-    api = FastAPI(title="Strategy Codebot API", version=__version__)
+    api = FastAPI(title="Strategy Codebot API", version=__version__, openapi_tags=module_openapi_tags())
     if cors_origins:
         api.add_middleware(
             CORSMiddleware,
@@ -376,83 +378,30 @@ def create_app(
             allow_methods=["*"],
             allow_headers=["*"],
         )
-
-    @api.get("/health")
-    def health() -> dict[str, str]:
-        return {
-            "status": "ok",
-            "service": "strategy-codebot-api",
-            "version": __version__,
-        }
-
-    @api.get("/ready")
-    def ready() -> JSONResponse:
-        payload = build_readiness_payload(
-            repository=conversation_repository,
-            artifact_store=artifact_store,
-            controls=controls,
-            llm_orchestrator=llm_orchestrator,
-            run_worker=run_worker,
+    api.include_router(
+        build_platform_router(
+            PlatformRouterDeps(
+                version=__version__,
+                repository=conversation_repository,
+                artifact_store=artifact_store,
+                controls=controls,
+                llm_orchestrator=llm_orchestrator,
+                run_worker=run_worker,
+                workspace_capability=_workspace_capability,
+                user_safe_model_routing_status=_user_safe_model_routing_status,
+            )
         )
-        status_code = status.HTTP_200_OK if payload["status"] == "ok" else status.HTTP_503_SERVICE_UNAVAILABLE
-        return JSONResponse(payload, status_code=status_code)
-
-    @api.get("/v1/me", response_model=MeResponse)
-    def get_me(
-        auth: AuthContext = Depends(require_auth_context),
-    ) -> MeResponse:
-        capability = _workspace_capability(auth)
-        return MeResponse(
-            user={"id": auth.user_id},
-            workspace={"id": auth.workspace_id, "role": auth.role},
-            capability=capability,
+    )
+    api.include_router(
+        build_account_router(
+            AccountRouterDeps(
+                repository=conversation_repository,
+                workspace_capability=_workspace_capability,
+                current_usage_period=_current_usage_period,
+            )
         )
-
-    @api.get("/v1/provider/status", response_model=ProviderStatusResponse)
-    def get_provider_status(
-        auth: AuthContext = Depends(require_auth_context),
-    ) -> ProviderStatusResponse:
-        capability = _workspace_capability(auth)
-        configured = True
-        reason = None
-        try:
-            llm_orchestrator.ensure_configured()
-        except Exception as exc:
-            configured = False
-            reason = exc.__class__.__name__
-        routing_status = _user_safe_model_routing_status(auth, configured)
-        return ProviderStatusResponse(
-            configured=configured,
-            available=configured and "agent" in capability.allowed_message_modes,
-            tier=capability.tier,
-            tier_label=capability.tier_label,
-            allowed_message_modes=capability.allowed_message_modes,
-            allowed_run_modes=capability.allowed_run_modes,
-            capability_matrix=capability.capability_matrix,
-            fallback_mode="deterministic",
-            model_routing_mode=routing_status["model_routing_mode"],
-            model_tier=routing_status["model_tier"],
-            selected_stage_defaults=routing_status["selected_stage_defaults"],
-            available_gateways=routing_status["available_gateways"],
-            route_ready=routing_status["route_ready"],
-            fallback_enabled=routing_status["fallback_enabled"],
-            user_message=routing_status["user_message"],
-            status="ready" if configured else "not_configured",
-            reason=reason,
-        )
-
-    @api.get("/v1/action-registry")
-    def get_action_registry(
-        auth: AuthContext = Depends(require_auth_context),
-    ) -> dict[str, Any]:
-        _ = auth
-        return {
-            "version": 1,
-            "actions": [
-                entry.payload(available=True)
-                for entry in ACTION_REGISTRY
-            ],
-        }
+    )
+    api.include_router(action_registry_router)
 
     @api.get("/v1/conversations/{conversation_id}/workflow-tasks", response_model=WorkflowTaskListResponse)
     def list_workflow_tasks(
@@ -1325,27 +1274,6 @@ def create_app(
         response = KnowledgeLearningResponse(**report)
         return _complete_idempotent_response(controls, idempotency, response, status.HTTP_200_OK)
 
-    @api.get("/v1/account/usage", response_model=AccountUsageResponse)
-    def get_account_usage(
-        auth: AuthContext = Depends(require_auth_context),
-    ) -> AccountUsageResponse:
-        capability = _workspace_capability(auth)
-        usage = conversation_repository.summarize_account_usage(auth)
-        period_start, period_end = _current_usage_period()
-        return AccountUsageResponse(
-            tier=capability.tier,
-            tier_label=capability.tier_label,
-            period_start=period_start,
-            period_end=period_end,
-            messages=usage.messages,
-            runs=usage.runs,
-            artifacts=usage.artifacts,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            total_tokens=usage.total_tokens,
-            estimated_cost_usd=usage.estimated_cost_usd,
-        )
-
     @api.post(
         "/v1/conversations",
         response_model=ConversationResponse,
@@ -2104,6 +2032,7 @@ def create_app(
             content=redact_value(content),
         )
 
+    apply_module_route_tags(api)
     return api
 
 

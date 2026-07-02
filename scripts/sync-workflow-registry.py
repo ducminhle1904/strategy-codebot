@@ -503,7 +503,7 @@ def render_typescript(contract: dict[str, Any]) -> str:
 def generated_files(contract: dict[str, Any]) -> dict[Path, str]:
     return {
         ROOT / "src" / "strategy_codebot" / "server" / "workflow_registry_contract.py": render_python(contract),
-        ROOT / "apps" / "web" / "src" / "lib" / "workflow-registry-contract.ts": render_typescript(contract),
+        ROOT / "apps" / "web" / "src" / "shared" / "contracts" / "workflow-registry-contract.ts": render_typescript(contract),
     }
 
 

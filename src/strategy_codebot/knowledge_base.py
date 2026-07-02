@@ -634,7 +634,7 @@ def search_knowledge(
 
 
 def build_retrieved_knowledge_context(prompt: str, *, index_path: Path | None = None, database_url: str | None = None) -> dict[str, Any]:
-    result = search_knowledge(prompt, index_path=index_path, database_url=ensure_database_url(database_url))
+    result = search_knowledge(prompt, index_path=index_path, database_url=database_url)
     retrieved_chunks = result["retrieved_chunks"]
     stage_relevance: dict[str, list[str]] = {}
     for chunk in retrieved_chunks:

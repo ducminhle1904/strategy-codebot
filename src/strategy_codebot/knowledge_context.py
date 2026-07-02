@@ -9,7 +9,7 @@ from typing import Any
 import yaml
 
 from strategy_codebot.paths import repo_root, resolve_repo_path
-from strategy_codebot.knowledge_base import build_retrieved_knowledge_context, default_index_path, ensure_database_url
+from strategy_codebot.knowledge_base import build_retrieved_knowledge_context, default_index_path, ensure_database_url, ensure_index_env
 
 KNOWLEDGE_CONTEXT_PATH = "knowledge-context.json"
 KNOWLEDGE_CONTEXT_AUTO = "auto"
@@ -102,10 +102,12 @@ def build_knowledge_context(
     source_registry_path: Path | None = None,
     selection_signals: KnowledgeSelectionSignals | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    explicit_index = ensure_index_env()
     index_path = default_index_path()
-    if ensure_database_url() or index_path.exists():
+    database_url = None if explicit_index and index_path.exists() else ensure_database_url()
+    if database_url or index_path.exists():
         try:
-            retrieved = build_retrieved_knowledge_context(prompt, index_path=index_path)
+            retrieved = build_retrieved_knowledge_context(prompt, index_path=index_path, database_url=database_url)
             return _merge_static_floor(prompt, retrieved, selection_signals=selection_signals)
         except Exception as exc:
             fallback = _build_static_knowledge_context(prompt, source_registry_path=source_registry_path, selection_signals=selection_signals)

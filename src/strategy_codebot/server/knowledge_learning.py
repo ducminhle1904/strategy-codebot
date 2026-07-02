@@ -20,6 +20,7 @@ from strategy_codebot.server.artifact_store import LocalArtifactStore
 from strategy_codebot.server.auth import AuthContext
 from strategy_codebot.server.llm_clients import LLMClient
 from strategy_codebot.server.llm_clients import LLM_EVENT_MESSAGE_DELTA
+from strategy_codebot.server.llm_clients import ResponsesClient
 from strategy_codebot.server.llm_json import extract_json_object
 from strategy_codebot.server.model_routing import MODEL_STAGE_KNOWLEDGE_LEARNING_REVIEW
 from strategy_codebot.server.redaction import redact_value
@@ -29,6 +30,7 @@ from strategy_codebot.server.repository import ConversationRepository
 KNOWLEDGE_INDEX_ENV = "STRATEGY_CODEBOT_KNOWLEDGE_INDEX"
 KNOWLEDGE_CANDIDATES_ENV = "STRATEGY_CODEBOT_KNOWLEDGE_CANDIDATES_PATH"
 KNOWLEDGE_AUTO_CANDIDATES_ENV = "STRATEGY_CODEBOT_KNOWLEDGE_AUTO_CANDIDATES_ENABLED"
+KNOWLEDGE_LLM_JUDGE_ENABLED_ENV = "STRATEGY_CODEBOT_KNOWLEDGE_LLM_JUDGE_ENABLED"
 KNOWLEDGE_ADMIN_ROLES = {"owner", "admin"}
 RUN_EVIDENCE_RE = re.compile(r"\brun[:/](run[-_][A-Za-z0-9_-]+)\b")
 LEARNING_ARTIFACT_NAMES = {
@@ -46,6 +48,11 @@ def knowledge_auto_candidates_enabled() -> bool:
     if raw is None:
         return True
     return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def knowledge_llm_judge_enabled() -> bool:
+    raw = os.getenv(KNOWLEDGE_LLM_JUDGE_ENABLED_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def sanitize_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -319,6 +326,8 @@ class KnowledgeLearningService:
 
     def _llm_judge_for_auth(self, auth: AuthContext):
         if self.llm_client is None:
+            return None
+        if isinstance(self.llm_client, ResponsesClient) and not knowledge_llm_judge_enabled():
             return None
         try:
             self.llm_client.ensure_configured()
