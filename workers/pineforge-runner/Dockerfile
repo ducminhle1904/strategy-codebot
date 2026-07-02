@@ -8,7 +8,7 @@ RUN npm run build && npm prune --omit=dev
 
 FROM debian:bookworm-slim AS pineforge-engine
 
-ARG PINEFORGE_ENGINE_REF=v0.10.10
+ARG PINEFORGE_ENGINE_REF=v0.10.13
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -41,8 +41,8 @@ RUN set -eux; \
 FROM node:22-bookworm-slim
 
 WORKDIR /app
-ARG PINEFORGE_CODEGEN_VERSION=0.7.5
-ARG PINEFORGE_ENGINE_VERSION=0.10.10
+ARG PINEFORGE_CODEGEN_VERSION=0.8.0
+ARG PINEFORGE_ENGINE_VERSION=0.10.13
 ENV NODE_ENV=production \
     PINEFORGE_PREFIX=/opt/pineforge \
     PINEFORGE_INCLUDE_DIR=/opt/pineforge/include \

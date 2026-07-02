@@ -108,12 +108,12 @@ def test_compose_defines_backend_stack_without_public_db_or_redis_ports() -> Non
     assert "./docker/litellm/config.yaml:/app/config.yaml:ro" in services["litellm-proxy"]["volumes"]
     assert services["migration"]["command"] == ["strategy-codebot-migrate"]
     assert services["pineforge-runner"]["build"]["context"] == "./workers/pineforge-runner"
-    assert services["pineforge-runner"]["build"]["args"]["PINEFORGE_ENGINE_REF"] == "${PINEFORGE_ENGINE_REF:-v0.10.10}"
-    assert services["pineforge-runner"]["build"]["args"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.7.5}"
+    assert services["pineforge-runner"]["build"]["args"]["PINEFORGE_ENGINE_REF"] == "${PINEFORGE_ENGINE_REF:-v0.10.13}"
+    assert services["pineforge-runner"]["build"]["args"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.8.0}"
     assert services["pineforge-runner"]["environment"]["PINEFORGE_RUNNER_MODE"] == "${PINEFORGE_RUNNER_MODE:-native}"
     assert "PINEFORGE_NATIVE_COMMAND" not in services["pineforge-runner"]["environment"]
     assert "PINEFORGE_NATIVE_ARGS" not in services["pineforge-runner"]["environment"]
-    assert services["pineforge-runner"]["environment"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.7.5}"
+    assert services["pineforge-runner"]["environment"]["PINEFORGE_CODEGEN_VERSION"] == "${PINEFORGE_CODEGEN_VERSION:-0.8.0}"
     assert services["backtest-worker"]["depends_on"]["pineforge-runner"]["condition"] == "service_healthy"
     assert services["market-data-collector"]["depends_on"]["redis"]["condition"] == "service_healthy"
     assert services["market-data-collector"]["command"] == ["python", "-m", "strategy_codebot.server.market_data_collector"]

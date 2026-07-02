@@ -192,8 +192,8 @@ smokes without intentionally supplying provider credentials and accepting cost.
 
 Production `compose.yml` builds `pineforge-runner` as a self-contained native
 image. The image builds `pineforge-engine` from `PINEFORGE_ENGINE_REF` (default
-`v0.10.10`), installs `pineforge-codegen` from `PINEFORGE_CODEGEN_VERSION`
-(default `0.7.5`), and exposes readiness fields for `engine_version`,
+`v0.10.13`), installs `pineforge-codegen` from `PINEFORGE_CODEGEN_VERSION`
+(default `0.8.0`), and exposes readiness fields for `engine_version`,
 `codegen_version`, and `native_ready`.
 
 Do not pass a host `PINEFORGE_NATIVE_COMMAND` in production. The worker talks to

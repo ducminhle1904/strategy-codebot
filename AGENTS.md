@@ -12,16 +12,33 @@ This repo uses a repository harness. Keep this file short: it is a map, not the 
 
 ## Stable Rules
 
-- Phase 0 is docs, schemas, configs, and planning records only.
-- Do not add live-trading automation unless a future decision explicitly approves it.
-- Pine Script validation is static/manual-proof first because TradingView is the authoritative runtime.
-- MQL5 validation will require a Windows/MetaTrader runner in a later phase.
 - Record durable decisions in `docs/decisions/`.
 - Record planned work in `docs/stories/`.
 - Before non-trivial scout, investigation, implementation, or review work, run or account for `strategy-codebot harness agent-start --summary ...`; read only its bounded `context_brief`, not raw trace rows or full reports.
 - If `agent-start` is unavailable, run both `strategy-codebot harness preflight --latest 10` and `strategy-codebot harness session-start --summary ...`, then record `--preflight-applied` in `dev-trace`.
 - For non-trivial research, investigation, implementation, verification, or blocker sessions, record a repository trace with `strategy-codebot harness dev-trace` before the final response.
 - After non-trivial trace-related work, run `strategy-codebot harness audit-traces --latest 1`.
+
+## Frontend Source Rules
+
+- Treat `apps/web/src/app` as thin Next.js routing/auth/composition only; keep feature behavior in `apps/web/src/features/*`.
+- Use the feature-sliced direction already started: `features/<domain>/{api,model,ui}` for domain code, `shared/contracts` for generated/shared contracts, and `server/*` for Next/server adapters.
+- Prefer the import flow `app -> features -> shared`; do not import client components from server adapters or add domain behavior back into broad `lib`/`components` buckets.
+- Treat `apps/web/src/components/strategy/*` and `apps/web/src/lib/*` files that only re-export feature modules as compatibility wrappers. New source should import from the owning feature or shared leaf module.
+- Avoid cross-feature barrel imports when a barrel exports heavy pages or workspace modules; use leaf imports such as `@/features/workspace/ui/conversation-sidebar` or `@/features/artifacts/model/artifact-workspace` to prevent cycles.
+- Keep generated workflow registry TypeScript in `apps/web/src/shared/contracts/workflow-registry-contract.ts`; `apps/web/src/lib/workflow-registry-contract.ts` is a compatibility wrapper.
+- Verify frontend changes with `npm --prefix apps/web run build`, `npm --prefix apps/web test -- --run`, and `npm --prefix apps/web run lint`; for structural refactors, also check for feature import cycles before claiming completion.
+
+## Backend Source Rules
+
+- Treat `src/strategy_codebot/server/app.py` as FastAPI composition and legacy orchestration only. Do not add new domain endpoints inline there when an owning `server/modules/<domain>/router.py` can hold them.
+- Keep backend module ownership in `src/strategy_codebot/server/modules/catalog.py`: add path prefixes, OpenAPI tags, and tool ownership there before adding route/tag/tool heuristics elsewhere.
+- Put extracted API routes in `server/modules/<domain>/router.py`; pass dependencies through a small `<Domain>RouterDeps` dataclass instead of growing long router factory parameter lists.
+- Keep stable cross-module facades in `src/strategy_codebot/server/contracts/`. Import registry/workflow contracts from there when code crosses module boundaries.
+- Keep concrete tool handlers and `TOOL_DEFINITIONS` in `llm_tools.py`; compose `TOOL_HANDLERS` through `modules/tools.py` and catalog ownership. Do not recreate per-domain string-to-`globals()` handler maps.
+- Keep `ConversationRepository` as the precise static Protocol in `repository.py`. Use `contracts/repository_ports.py` descriptors for boundary coverage, not runtime `isinstance` repository validation.
+- Treat `LLMOrchestrator.services` as a derived service-port view. Do not cache duplicate mutable dependencies unless all call sites use that cache as the single source of truth.
+- Verify backend structural changes with `uv run pytest tests/test_server_module_boundaries.py -q`, relevant server tests, `uv run strategy-codebot tools check`, and full `uv run pytest -q` before claiming completion.
 
 ## Product Trace Lessons
 
